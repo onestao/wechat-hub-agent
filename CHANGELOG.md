@@ -12,6 +12,7 @@
 ### Changed
 - Auto replies reuse the verified WeChat UI sender: switch to target group, paste, validate input, then send.
 - WeChat UI operations stay serialized while scoring and message scanning can cover multiple groups.
+- Consecutive replies to the same group reuse the current WeChat chat instead of searching again, with forced reopen fallback on verification mismatch.
 
 ## v0.1.0 - 2026-06-15
 

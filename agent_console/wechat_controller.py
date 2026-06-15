@@ -310,6 +310,12 @@ def submit_active(send_delay: float) -> dict:
     return {"window": window, "sent": True, "send_delay_seconds": send_delay}
 
 
+def focus_active() -> dict:
+    window = find_main_window()
+    activate(window)
+    return {"window": window, "focused": True}
+
+
 def clear_active() -> dict:
     window = find_main_window()
     activate(window)
@@ -323,7 +329,7 @@ def clear_active() -> dict:
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("action", choices=["open", "paste", "submit", "clear"])
+    parser.add_argument("action", choices=["open", "paste", "submit", "focus", "clear"])
     parser.add_argument("--chat-name-b64", default="")
     parser.add_argument("--text-b64", default="")
     parser.add_argument("--send", action="store_true")
@@ -337,6 +343,8 @@ def main() -> int:
             payload = paste_active(b64_decode(args.text_b64), args.send, args.send_delay)
         elif args.action == "submit":
             payload = submit_active(args.send_delay)
+        elif args.action == "focus":
+            payload = focus_active()
         else:
             payload = clear_active()
         print(json.dumps({"ok": True, **payload}, ensure_ascii=False))

@@ -1251,7 +1251,12 @@ def verify_reply_draft_owner(reply_text: str, chat_username: str, timeout_second
     }
 
 
-def prepare_verified_wechat_chat(chat_display_name: str, chat_username: str, delays: dict | None = None) -> dict:
+def prepare_verified_wechat_chat(
+    chat_display_name: str,
+    chat_username: str,
+    delays: dict | None = None,
+    allow_cached_active: bool = True,
+) -> dict:
     chat_username = str(chat_username or "").strip()
     target_name = preferred_chat_display_name(chat_username, chat_display_name) or clean_contact_text(chat_username)
     if not chat_username:
@@ -1264,6 +1269,32 @@ def prepare_verified_wechat_chat(chat_display_name: str, chat_username: str, del
             "error": f"目标群不在微信最近会话 SessionTable 中：{target_name}",
             "details": {"refresh": initial_refresh, "target_chat": target_name, "chat_username": chat_username},
         }
+    cached = sender_state()
+    if allow_cached_active and cached.get("active_chat_username") == chat_username:
+        window = run_wechat_controller(["focus"], timeout=15)
+        if window.get("ok"):
+            return {
+                "ok": True,
+                "details": {
+                    "method": "cached_active_chat",
+                    "target_chat": target_name,
+                    "chat_username": chat_username,
+                    "before_position": before_position,
+                    "initial_refresh": initial_refresh,
+                    "controller": window,
+                    "skipped_switch": True,
+                    "cached_sender": cached,
+                    "note": "目标群与上次成功发送群一致，跳过微信搜索切群，直接复用当前聊天窗口。",
+                },
+            }
+        write_sender_state(
+            {
+                "active_chat_username": "",
+                "active_chat_display_name": "",
+                "invalidated_at": now_iso(),
+                "invalidate_reason": window.get("error") or "cached active chat clear failed",
+            }
+        )
     switch_delay = float((delays or {}).get("switch_delay_seconds") or 1.0)
     opened = run_wechat_controller(
         ["open", "--chat-name-b64", b64_arg(target_name), "--switch-delay", str(switch_delay)],
@@ -1286,6 +1317,14 @@ def prepare_verified_wechat_chat(chat_display_name: str, chat_username: str, del
     after_position = recent_session_position(chat_username)
     before_sort = int((before_position.get("row") or {}).get("sort_timestamp") or 0)
     after_sort = int(((after_position or {}).get("row") or {}).get("sort_timestamp") or 0)
+    write_sender_state(
+        {
+            "active_chat_username": chat_username,
+            "active_chat_display_name": target_name,
+            "last_switched_at": now_iso(),
+            "last_switch_method": "wechat_controller_open",
+        }
+    )
     return {
         "ok": True,
         "details": {
@@ -1323,16 +1362,35 @@ def paste_reply_to_wechat(
     delays = dict(delays or reply_sender_delays())
     if not send:
         delays["send_delay_seconds"] = 0
-    verified = prepare_verified_wechat_chat(target_name, chat_username, delays=delays)
+    verified = prepare_verified_wechat_chat(target_name, chat_username, delays=delays, allow_cached_active=True)
     if not verified.get("ok"):
         return verified
     paste_attempts = []
     result = None
     draft_verify = None
     input_verify = None
+    needs_forced_reopen = False
     for attempt in range(2):
         if attempt:
-            reopened = prepare_verified_wechat_chat(target_name, chat_username, delays={"switch_delay_seconds": 0.35})
+            previous_open = verified.get("details", {}) if isinstance(verified.get("details"), dict) else {}
+            force_reopen = needs_forced_reopen or bool(previous_open.get("skipped_switch"))
+            reopened = prepare_verified_wechat_chat(
+                target_name,
+                chat_username,
+                delays={"switch_delay_seconds": 0.35},
+                allow_cached_active=not force_reopen,
+            )
+            if force_reopen:
+                write_sender_state(
+                    {
+                        "active_chat_username": chat_username if reopened.get("ok") else "",
+                        "active_chat_display_name": target_name if reopened.get("ok") else "",
+                        "invalidated_at": now_iso(),
+                        "invalidate_reason": "cached paste verification failed; forced reopen",
+                    }
+                )
+            if reopened.get("ok"):
+                verified = reopened
             paste_attempts.append({"attempt": attempt + 1, "reopen": reopened})
             if not reopened.get("ok"):
                 break
@@ -1353,7 +1411,20 @@ def paste_reply_to_wechat(
         draft_verify = verify_reply_draft_owner(reply_text, chat_username, timeout_seconds=0.8)
         paste_attempts[-1]["input_verify"] = input_verify
         paste_attempts[-1]["draft_verify"] = draft_verify
+        open_details = verified.get("details", {}) if isinstance(verified.get("details"), dict) else {}
+        if input_verify.get("ok") and open_details.get("skipped_switch") and not draft_verify.get("ok"):
+            needs_forced_reopen = True
+            write_sender_state(
+                {
+                    "active_chat_username": "",
+                    "active_chat_display_name": "",
+                    "invalidated_at": now_iso(),
+                    "invalidate_reason": "cached active chat draft owner mismatch",
+                }
+            )
+            continue
         if input_verify.get("ok"):
+            needs_forced_reopen = False
             break
     if not result or not result.get("ok"):
         return {
@@ -1368,10 +1439,10 @@ def paste_reply_to_wechat(
                 "delays": delays,
             },
         }
-    if not input_verify or not input_verify.get("ok"):
+    if not input_verify or not input_verify.get("ok") or needs_forced_reopen:
         return {
             "ok": False,
-            "error": (input_verify or {}).get("error") or "微信输入框内容校验失败",
+            "error": (draft_verify or {}).get("error") if needs_forced_reopen else (input_verify or {}).get("error") or "微信输入框内容校验失败",
             "details": {
                 "target_chat": target_name,
                 "chat_username": chat_username,
@@ -1405,6 +1476,15 @@ def paste_reply_to_wechat(
                     "delays": delays,
                 },
             }
+    write_sender_state(
+        {
+            "active_chat_username": chat_username,
+            "active_chat_display_name": target_name,
+            "last_used_at": now_iso(),
+            "last_sent_at": now_iso() if send else sender_state().get("last_sent_at", ""),
+            "last_delivery_mode": "send" if send else "draft",
+        }
+    )
     return {
         "ok": True,
         "sent": bool(send),
@@ -1635,6 +1715,19 @@ def write_auto_reply_state(payload: dict) -> None:
         write_json(AUTO_REPLY_STATE_FILE, current)
 
 
+def sender_state() -> dict:
+    state = auto_reply_state()
+    sender = state.get("sender") if isinstance(state.get("sender"), dict) else {}
+    return sender
+
+
+def write_sender_state(payload: dict) -> None:
+    state = auto_reply_state()
+    sender = state.get("sender") if isinstance(state.get("sender"), dict) else {}
+    sender.update(payload)
+    write_auto_reply_state({"sender": sender})
+
+
 def add_auto_reply_event(kind: str, message: str, details: dict | None = None) -> None:
     with AUTO_REPLY_STATE_LOCK:
         state = auto_reply_state()
@@ -1669,6 +1762,7 @@ def auto_reply_public_state(config: dict | None = None) -> dict:
         "mode": sender.get("mode") or "draft_only",
         "poll_interval_seconds": sender.get("poll_interval_seconds", 5),
         "allowed_chats": sender.get("allowed_chats") or [],
+        "sender": state.get("sender") if isinstance(state.get("sender"), dict) else {},
     }
 
 

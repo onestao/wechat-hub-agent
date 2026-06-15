@@ -557,6 +557,7 @@ function renderAutoReplyStatus() {
     `已发 ${fmtNumber(auto.sent_count || 0)}`,
     `失败 ${fmtNumber(auto.failed_count || 0)}`,
     `跳过 ${fmtNumber(auto.skipped_count || 0)}`,
+    auto.sender?.active_chat_display_name ? `当前窗口 ${auto.sender.active_chat_display_name}` : "",
     auto.last_chat_display_name ? `最近 ${auto.last_chat_display_name}` : "",
     auto.last_decision ? `判定 ${auto.last_decision} ${fmtNumber(auto.last_score || 0)}/${fmtNumber(auto.last_threshold || 0)}` : "",
     auto.last_skip_reason ? `状态 ${auto.last_skip_reason}` : "",

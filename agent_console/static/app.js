@@ -12,6 +12,7 @@ const state = {
   lastMessages: [],
   suite: null,
   semanticRuns: null,
+  autoReply: null,
   debug: null,
   preview: null,
   lastOutbox: null,
@@ -299,6 +300,8 @@ function mergeRuntimeStatus(payload) {
   state.memory = payload.memory;
   state.semantic = payload.semantic_memory;
   state.semanticRuns = payload.semantic_runs || state.semanticRuns;
+  state.autoReply = payload.auto_reply || state.autoReply;
+  renderAutoReplyStatus();
   renderMemoryChatSelects();
 }
 
@@ -485,6 +488,90 @@ function syncTalkFromForm() {
   if (select) state.config.agent.reply_mode = select.value || state.config.agent.reply_mode || "normal";
   state.config.talk_scoring.free_task_ttl_seconds = Number($("freeTaskTtl").value || 0);
   renderTalkModePicker();
+}
+
+function fillReplySenderForm() {
+  const sender = state.config?.reply_sender || {};
+  if (!$("replySenderEnabled")) return;
+  $("replySenderEnabled").checked = Boolean(sender.enabled);
+  $("replySenderMode").value = sender.mode || "draft_only";
+  $("replyPollInterval").value = sender.poll_interval_seconds ?? 5;
+  $("replyMaxPerCycle").value = sender.max_messages_per_cycle ?? 8;
+  $("switchDelayMin").value = sender.switch_delay_min_seconds ?? 1;
+  $("switchDelayMax").value = sender.switch_delay_max_seconds ?? 2.2;
+  $("sendDelayMin").value = sender.send_delay_min_seconds ?? 1.2;
+  $("sendDelayMax").value = sender.send_delay_max_seconds ?? 4.8;
+  renderReplyAllowedChats();
+}
+
+function renderReplyAllowedChats() {
+  const select = $("replyAllowedChats");
+  if (!select || !state.config) return;
+  const selected = new Set(state.config.reply_sender?.allowed_chats || []);
+  const groupChats = (state.chats || []).filter((chat) => String(chat.username || "").includes("@chatroom") || chat.is_group);
+  select.innerHTML = groupChats.map((chat) => {
+    const label = chat.display_name || chat.username;
+    return `<option value="${escapeAttr(chat.username)}" ${selected.has(chat.username) || selected.has(label) ? "selected" : ""}>${escapeHtml(label)}</option>`;
+  }).join("");
+  if (!select.innerHTML) {
+    select.innerHTML = `<option value="" disabled>等待同步群聊列表</option>`;
+  }
+}
+
+function syncReplySenderFromForm() {
+  if (!$("replySenderEnabled") || !state.config) return;
+  const selected = Array.from($("replyAllowedChats").selectedOptions || [])
+    .map((option) => option.value)
+    .filter(Boolean);
+  state.config.reply_sender = {
+    ...(state.config.reply_sender || {}),
+    enabled: $("replySenderEnabled").checked,
+    mode: $("replySenderMode").value || "draft_only",
+    allowed_chats: selected,
+    send_to_active_chat_only: false,
+    require_manual_approval: $("replySenderMode").value !== "auto_send",
+    poll_interval_seconds: Number($("replyPollInterval").value || 5),
+    max_messages_per_cycle: Number($("replyMaxPerCycle").value || 8),
+    retry_failed_attempts: Number(state.config.reply_sender?.retry_failed_attempts ?? 2),
+    min_interval_seconds: Number(state.config.reply_sender?.min_interval_seconds ?? 0),
+    hourly_limit: Number(state.config.reply_sender?.hourly_limit ?? 0),
+    streak_limit: Number(state.config.reply_sender?.streak_limit ?? 0),
+    switch_delay_min_seconds: Number($("switchDelayMin").value || 0),
+    switch_delay_max_seconds: Number($("switchDelayMax").value || 0),
+    send_delay_min_seconds: Number($("sendDelayMin").value || 0),
+    send_delay_max_seconds: Number($("sendDelayMax").value || 0),
+  };
+}
+
+function renderAutoReplyStatus() {
+  const root = $("autoReplyStatus");
+  if (!root) return;
+  const auto = state.autoReply || {};
+  const active = Boolean(auto.active);
+  const statusClass = active ? "ok" : auto.ok === false ? "bad" : "warn";
+  const statusText = active ? "自动发送运行中" : auto.ok === false ? "自动发送异常" : "自动发送未生效";
+  const events = (auto.recent_events || []).slice(0, 4);
+  const lastBits = [
+    `模式 ${auto.mode || "--"}`,
+    `轮询 ${fmtNumber(auto.poll_interval_seconds ?? 5)} 秒`,
+    `已发 ${fmtNumber(auto.sent_count || 0)}`,
+    `失败 ${fmtNumber(auto.failed_count || 0)}`,
+    `跳过 ${fmtNumber(auto.skipped_count || 0)}`,
+    auto.last_chat_display_name ? `最近 ${auto.last_chat_display_name}` : "",
+    auto.last_decision ? `判定 ${auto.last_decision} ${fmtNumber(auto.last_score || 0)}/${fmtNumber(auto.last_threshold || 0)}` : "",
+    auto.last_skip_reason ? `状态 ${auto.last_skip_reason}` : "",
+    auto.last_error ? `错误 ${auto.last_error}` : "",
+  ].filter(Boolean);
+  root.innerHTML = `
+    <div class="auto-orb ${statusClass}"></div>
+    <div>
+      <strong>${escapeHtml(statusText)}</strong>
+      <span>${escapeHtml(lastBits.join(" · "))}</span>
+      <div class="auto-reply-events">
+        ${events.length ? events.map((event) => `<em>${escapeHtml(event.at || "")} · ${escapeHtml(event.message || event.kind || "")}</em>`).join("") : "<em>暂无自动发送事件</em>"}
+      </div>
+    </div>
+  `;
 }
 
 function replyDelayText(details) {
@@ -2227,17 +2314,20 @@ async function load() {
   state.memory = payload.memory;
   state.semantic = payload.semantic_memory;
   state.semanticRuns = payload.semantic_runs;
+  state.autoReply = payload.auto_reply;
   state.activeProfileId = payload.config.active_llm_profile_id;
   renderProfiles();
   fillProfileForm(activeProfile());
   fillAgent();
   renderTalkModes();
+  fillReplySenderForm();
   renderLayers();
   renderLastTest(payload.last_test || {});
   updateTop();
   await Promise.allSettled([loadChats(), loadSuiteStatus()]);
   renderDebugModeOptions();
   renderSemanticRuns();
+  renderAutoReplyStatus();
   renderMemoryChatSelects();
 }
 
@@ -2264,6 +2354,7 @@ async function loadChats(refreshMessages = false) {
   renderTypeFilter();
   renderChatStats();
   renderChatList();
+  renderReplyAllowedChats();
   renderMemoryChatSelects();
   if (!state.selectedChat && state.chats.length) await selectChat(state.chats[0].username);
   else if (refreshMessages && state.selectedChat) await loadCurrentMessages();
@@ -2559,6 +2650,7 @@ async function saveAll(button, label = "保存") {
     fillProfileForm(activeProfile());
     fillAgent();
     renderTalkModes();
+    fillReplySenderForm();
     updateTop();
     button.textContent = "已保存";
   } catch (error) {
@@ -2576,6 +2668,7 @@ function collectConfig() {
   syncProfileFromForm();
   syncAgentFromForm();
   syncTalkFromForm();
+  syncReplySenderFromForm();
   syncLayersFromForm();
   return state.config;
 }
@@ -2995,6 +3088,7 @@ function bindEvents() {
   $("saveModelsBtn").addEventListener("click", () => saveAll($("saveModelsBtn"), "保存模型"));
   $("savePersonaBtn").addEventListener("click", () => saveAll($("savePersonaBtn"), "保存人格"));
   $("saveTalkBtn").addEventListener("click", () => saveAll($("saveTalkBtn"), "保存接话设置"));
+  $("saveAutoReplyBtn")?.addEventListener("click", () => saveAll($("saveAutoReplyBtn"), "保存自动发送"));
   $("saveMemoryBtn").addEventListener("click", () => saveAll($("saveMemoryBtn"), "保存记忆设置"));
   $("modelsBtn").addEventListener("click", fetchModels);
   $("checkBtn").addEventListener("click", checkLLM);

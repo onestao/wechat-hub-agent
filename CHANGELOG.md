@@ -1,5 +1,18 @@
 # Changelog
 
+## v0.2.0 - 2026-06-15
+
+### Added
+- Added automatic free-talk reply worker for group messages.
+- Added threshold-based auto send mode using the existing talk scoring rules.
+- Added per-chat watermarks so enabling auto reply does not reply to old history.
+- Added automatic outbox metadata for score, threshold, decision, trigger, and send confirmation.
+- Added auto reply status API and console controls for auto-send mode, allowed groups, poll interval, and random delays.
+
+### Changed
+- Auto replies reuse the verified WeChat UI sender: switch to target group, paste, validate input, then send.
+- WeChat UI operations stay serialized while scoring and message scanning can cover multiple groups.
+
 ## v0.1.0 - 2026-06-15
 
 ### Added

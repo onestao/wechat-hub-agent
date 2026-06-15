@@ -2338,6 +2338,48 @@ textarea { resize: vertical; }
 .talk-mode-card strong { font-size: 30px; line-height: 1; }
 .talk-mode-card span { color: var(--muted-2); }
 .talk-mode-card em { color: var(--muted); font-style: normal; font-size: 12px; }
+.auto-reply-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 12px;
+  align-items: end;
+}
+.auto-reply-grid .span-2 { grid-column: span 2; }
+.auto-reply-grid select[multiple] {
+  min-height: 118px;
+  padding: 8px;
+}
+.auto-reply-status {
+  margin-top: 12px;
+  min-height: 74px;
+  display: grid;
+  grid-template-columns: 34px minmax(0, 1fr);
+  gap: 10px;
+  align-items: start;
+  padding: 12px;
+  border-radius: 14px;
+  border: 1px solid rgba(255,255,255,.08);
+  background: rgba(255,255,255,.04);
+}
+.auto-reply-status strong,
+.auto-reply-status span,
+.auto-reply-status em {
+  display: block;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.auto-reply-status strong { color: var(--text); }
+.auto-reply-status span { color: var(--muted-2); margin-top: 3px; font-size: 12px; }
+.auto-reply-events {
+  display: grid;
+  gap: 4px;
+  margin-top: 8px;
+}
+.auto-reply-events em {
+  color: var(--muted);
+  font-style: normal;
+  font-size: 12px;
+}
 .talk-modes { display: grid; gap: 10px; }
 .talk-mode-row { display: grid; grid-template-columns: 80px repeat(4, minmax(0, 1fr)); gap: 10px; align-items: end; padding: 12px; border-radius: 14px; background: rgba(255,255,255,.042); border: 1px solid var(--line); }
 .talk-mode-row.active { border-color: rgba(155,244,210,.45); background: rgba(155,244,210,.08); }

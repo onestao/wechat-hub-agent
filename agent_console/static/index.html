@@ -272,6 +272,27 @@
               </div>
               <div id="talkModePicker" class="talk-mode-picker"></div>
             </article>
+            <article class="card panel span-2">
+              <div class="panel-head">
+                <div>
+                  <h3>自由接话自动发送</h3>
+                  <p>达到阈值后自动切到目标群，随机等待，粘贴并发送。</p>
+                </div>
+                <button id="saveAutoReplyBtn" class="btn primary" type="button">保存自动发送</button>
+              </div>
+              <div class="auto-reply-grid">
+                <label class="switch-label"><input id="replySenderEnabled" type="checkbox" /><span>启用自动发送器</span></label>
+                <label><span>发送模式</span><select id="replySenderMode"><option value="draft_only">只粘贴草稿</option><option value="manual_send">手动按钮发送</option><option value="auto_send">阈值通过自动发送</option></select></label>
+                <label><span>轮询间隔</span><input id="replyPollInterval" type="number" min="1" step="1" /></label>
+                <label><span>每轮最多处理</span><input id="replyMaxPerCycle" type="number" min="1" step="1" /></label>
+                <label><span>切群延迟最小</span><input id="switchDelayMin" type="number" min="0" step="0.1" /></label>
+                <label><span>切群延迟最大</span><input id="switchDelayMax" type="number" min="0" step="0.1" /></label>
+                <label><span>发送延迟最小</span><input id="sendDelayMin" type="number" min="0" step="0.1" /></label>
+                <label><span>发送延迟最大</span><input id="sendDelayMax" type="number" min="0" step="0.1" /></label>
+                <label class="span-2"><span>允许群聊</span><select id="replyAllowedChats" multiple size="4"></select></label>
+              </div>
+              <div id="autoReplyStatus" class="auto-reply-status">等待自动接话状态</div>
+            </article>
             <article class="card panel">
               <div class="panel-head">
                 <h3>模式参数</h3>

@@ -38,6 +38,7 @@ RUNTIME_DIR = ROOT / "runtime/agent-console"
 CONFIG_FILE = RUNTIME_DIR / "config.json"
 STATUS_FILE = RUNTIME_DIR / "status.json"
 SEMANTIC_STATE_FILE = RUNTIME_DIR / "semantic_extract_state.json"
+AUTO_REPLY_STATE_FILE = RUNTIME_DIR / "auto_reply_state.json"
 AI_DB = ROOT / "runtime/ai-memory/ai_memory.sqlite"
 MEMORY_DB = ROOT / "runtime/memory/wechat_memory.sqlite"
 MEDIA_DIR = ROOT / "runtime/media"
@@ -95,6 +96,9 @@ DEFAULT_CONFIG = {
         "min_interval_seconds": 0,
         "hourly_limit": 0,
         "streak_limit": 0,
+        "poll_interval_seconds": 5,
+        "max_messages_per_cycle": 8,
+        "retry_failed_attempts": 2,
         "switch_delay_min_seconds": 1.0,
         "switch_delay_max_seconds": 2.2,
         "send_delay_min_seconds": 1.2,
@@ -158,6 +162,7 @@ DEFAULT_CONFIG = {
 HEALTH_CACHE: dict[str, dict] = {}
 HEALTH_LOCK = threading.Lock()
 SEMANTIC_LOCK = threading.Lock()
+AUTO_REPLY_STATE_LOCK = threading.RLock()
 WECHAT_SEND_LOCK = threading.Lock()
 
 MEMORY_EXTRACT_SYSTEM_PROMPT = (
@@ -326,6 +331,15 @@ def normalize_config(config: dict) -> dict:
         "min_interval_seconds": sender_min_interval,
         "hourly_limit": sender_hourly_limit,
         "streak_limit": sender_streak_limit,
+        "poll_interval_seconds": clamp_float(
+            sender.get("poll_interval_seconds"), sender_defaults["poll_interval_seconds"], 1.0, 300.0
+        ),
+        "max_messages_per_cycle": clamp_int(
+            sender.get("max_messages_per_cycle"), sender_defaults["max_messages_per_cycle"], 1, 100
+        ),
+        "retry_failed_attempts": clamp_int(
+            sender.get("retry_failed_attempts"), sender_defaults["retry_failed_attempts"], 0, 10
+        ),
         "switch_delay_min_seconds": clamp_float(
             sender.get("switch_delay_min_seconds"), sender_defaults["switch_delay_min_seconds"], 0.0, 30.0
         ),
@@ -496,6 +510,24 @@ def sanitize_config(payload: dict, current: dict) -> dict:
             ),
             "hourly_limit": clamp_int(raw.get("hourly_limit"), current_sender.get("hourly_limit", 0), 0, 1000),
             "streak_limit": clamp_int(raw.get("streak_limit"), current_sender.get("streak_limit", 0), 0, 1000),
+            "poll_interval_seconds": clamp_float(
+                raw.get("poll_interval_seconds"),
+                current_sender.get("poll_interval_seconds", 5),
+                1.0,
+                300.0,
+            ),
+            "max_messages_per_cycle": clamp_int(
+                raw.get("max_messages_per_cycle"),
+                current_sender.get("max_messages_per_cycle", 8),
+                1,
+                100,
+            ),
+            "retry_failed_attempts": clamp_int(
+                raw.get("retry_failed_attempts"),
+                current_sender.get("retry_failed_attempts", 2),
+                0,
+                10,
+            ),
             "switch_delay_min_seconds": clamp_float(
                 raw.get("switch_delay_min_seconds"),
                 current_sender.get("switch_delay_min_seconds", 1.0),
@@ -703,6 +735,11 @@ def init_semantic_memory() -> None:
                 status TEXT NOT NULL,
                 error TEXT,
                 attempt_count INTEGER NOT NULL DEFAULT 0,
+                score INTEGER NOT NULL DEFAULT 0,
+                threshold INTEGER NOT NULL DEFAULT 0,
+                decision TEXT NOT NULL DEFAULT '',
+                trigger TEXT NOT NULL DEFAULT '',
+                sent_confirmed INTEGER NOT NULL DEFAULT 0,
                 details_json TEXT NOT NULL DEFAULT '{}'
             );
             """
@@ -723,11 +760,17 @@ def init_semantic_memory() -> None:
                 "chat_display_name": "TEXT",
                 "error": "TEXT",
                 "attempt_count": "INTEGER NOT NULL DEFAULT 0",
+                "score": "INTEGER NOT NULL DEFAULT 0",
+                "threshold": "INTEGER NOT NULL DEFAULT 0",
+                "decision": "TEXT NOT NULL DEFAULT ''",
+                "trigger": "TEXT NOT NULL DEFAULT ''",
+                "sent_confirmed": "INTEGER NOT NULL DEFAULT 0",
                 "details_json": "TEXT NOT NULL DEFAULT '{}'",
             },
         )
         conn.execute("CREATE INDEX IF NOT EXISTS idx_reply_outbox_created ON reply_outbox(created_at DESC)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_reply_outbox_status ON reply_outbox(status, updated_at DESC)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_reply_outbox_message ON reply_outbox(message_uid, mode)")
 
 
 def memory_status() -> dict:
@@ -1429,6 +1472,8 @@ def create_reply_outbox(payload: dict, mode: str, status: str = "pending") -> di
     reply_text = str(payload.get("reply_text") or payload.get("reply") or "").strip()
     if not reply_text:
         raise ValueError("回复内容为空，请先生成回复预览")
+    scoring = payload.get("scoring") if isinstance(payload.get("scoring"), dict) else {}
+    trigger = str(payload.get("trigger") or ("manual" if mode in {"draft_only", "manual_send"} else "auto")).strip()
     now = now_iso()
     row = {
         "outbox_id": uuid.uuid4().hex,
@@ -1443,10 +1488,16 @@ def create_reply_outbox(payload: dict, mode: str, status: str = "pending") -> di
         "status": status,
         "error": None,
         "attempt_count": 0,
+        "score": clamp_int(scoring.get("score"), 0, -1000, 1000),
+        "threshold": clamp_int(scoring.get("threshold"), 0, 0, 1000),
+        "decision": str(scoring.get("decision") or "").strip(),
+        "trigger": trigger,
+        "sent_confirmed": 0,
         "details_json": json.dumps(
             {
-                "scoring": payload.get("scoring") if isinstance(payload.get("scoring"), dict) else {},
-                "manual": True,
+                "scoring": scoring,
+                "manual": trigger == "manual",
+                "trigger": trigger,
             },
             ensure_ascii=False,
         ),
@@ -1457,11 +1508,13 @@ def create_reply_outbox(payload: dict, mode: str, status: str = "pending") -> di
             INSERT INTO reply_outbox (
                 outbox_id, created_at, updated_at, chat_username, chat_display_name,
                 message_uid, source_text, reply_text, mode, status, error,
-                attempt_count, details_json
+                attempt_count, score, threshold, decision, trigger, sent_confirmed,
+                details_json
             ) VALUES (
                 :outbox_id, :created_at, :updated_at, :chat_username, :chat_display_name,
                 :message_uid, :source_text, :reply_text, :mode, :status, :error,
-                :attempt_count, :details_json
+                :attempt_count, :score, :threshold, :decision, :trigger,
+                :sent_confirmed, :details_json
             )
             """,
             row,
@@ -1470,17 +1523,52 @@ def create_reply_outbox(payload: dict, mode: str, status: str = "pending") -> di
     return row
 
 
-def update_reply_outbox(outbox_id: str, status: str, error: str | None = None, details: dict | None = None) -> dict:
+def auto_outbox_for_message(message_uid: str) -> dict | None:
+    init_semantic_memory()
+    message_uid = str(message_uid or "").strip()
+    if not message_uid:
+        return None
+    with db_connect(AI_DB, readonly=True) as conn:
+        row = conn.execute(
+            """
+            SELECT *
+            FROM reply_outbox
+            WHERE message_uid=? AND mode='auto_send'
+            ORDER BY created_at DESC
+            LIMIT 1
+            """,
+            (message_uid,),
+        ).fetchone()
+    if not row:
+        return None
+    output = dict(row)
+    output["details"] = parse_json_value(output.pop("details_json", None), {})
+    return output
+
+
+def update_reply_outbox(
+    outbox_id: str,
+    status: str,
+    error: str | None = None,
+    details: dict | None = None,
+    sent_confirmed: bool | None = None,
+) -> dict:
     now = now_iso()
     details_json = json.dumps(details or {}, ensure_ascii=False)
+    assignments = ["updated_at=?", "status=?", "error=?", "attempt_count=attempt_count+1", "details_json=?"]
+    values: list = [now, status, error, details_json]
+    if sent_confirmed is not None:
+        assignments.append("sent_confirmed=?")
+        values.append(1 if sent_confirmed else 0)
+    values.append(outbox_id)
     with db_connect(AI_DB) as conn:
         conn.execute(
-            """
+            f"""
             UPDATE reply_outbox
-            SET updated_at=?, status=?, error=?, attempt_count=attempt_count+1, details_json=?
+            SET {', '.join(assignments)}
             WHERE outbox_id=?
             """,
-            (now, status, error, details_json, outbox_id),
+            tuple(values),
         )
         row = conn.execute("SELECT * FROM reply_outbox WHERE outbox_id=?", (outbox_id,)).fetchone()
     output = dict(row) if row else {"outbox_id": outbox_id, "status": status, "error": error}
@@ -1506,6 +1594,500 @@ def reply_outbox_list(limit: int = 30) -> dict:
     for row in rows:
         row["details"] = parse_json_value(row.pop("details_json", None), {})
     return {"ok": True, "outbox": rows}
+
+
+def default_auto_reply_state() -> dict:
+    return {
+        "ok": True,
+        "enabled": False,
+        "running": False,
+        "last_started_at": "",
+        "last_checked_at": "",
+        "last_action_at": "",
+        "last_error": "",
+        "last_skip_reason": "",
+        "last_message_uid": "",
+        "last_chat_username": "",
+        "last_chat_display_name": "",
+        "last_score": 0,
+        "last_threshold": 0,
+        "last_decision": "",
+        "last_outbox_id": "",
+        "processed_count": 0,
+        "sent_count": 0,
+        "failed_count": 0,
+        "skipped_count": 0,
+        "watermarks": {},
+        "recent_events": [],
+    }
+
+
+def auto_reply_state() -> dict:
+    return read_json(AUTO_REPLY_STATE_FILE, default_auto_reply_state())
+
+
+def write_auto_reply_state(payload: dict) -> None:
+    with AUTO_REPLY_STATE_LOCK:
+        current = auto_reply_state()
+        current.update(payload)
+        events = current.get("recent_events") if isinstance(current.get("recent_events"), list) else []
+        current["recent_events"] = events[:40]
+        write_json(AUTO_REPLY_STATE_FILE, current)
+
+
+def add_auto_reply_event(kind: str, message: str, details: dict | None = None) -> None:
+    with AUTO_REPLY_STATE_LOCK:
+        state = auto_reply_state()
+        events = state.get("recent_events") if isinstance(state.get("recent_events"), list) else []
+        events.insert(
+            0,
+            {
+                "at": now_iso(),
+                "kind": kind,
+                "message": str(message or "")[:240],
+                "details": details or {},
+            },
+        )
+        state["recent_events"] = events[:40]
+        write_json(AUTO_REPLY_STATE_FILE, state)
+
+
+def auto_reply_public_state(config: dict | None = None) -> dict:
+    config = config or read_config()
+    state = auto_reply_state()
+    sender = config.get("reply_sender", {})
+    active = bool(
+        config.get("agent", {}).get("enabled", True)
+        and config.get("agent", {}).get("auto_reply_enabled", False)
+        and sender.get("enabled", False)
+        and sender.get("mode") == "auto_send"
+    )
+    return {
+        **state,
+        "active": active,
+        "enabled": bool(sender.get("enabled", False)),
+        "mode": sender.get("mode") or "draft_only",
+        "poll_interval_seconds": sender.get("poll_interval_seconds", 5),
+        "allowed_chats": sender.get("allowed_chats") or [],
+    }
+
+
+def chat_watermark(row: dict | None) -> dict:
+    if not row:
+        return {"create_time": 0, "local_id": 0, "message_uid": ""}
+    return {
+        "create_time": int(row.get("create_time") or 0),
+        "local_id": int(row.get("local_id") or 0),
+        "message_uid": str(row.get("message_uid") or ""),
+    }
+
+
+def latest_group_message_watermarks() -> dict[str, dict]:
+    if not MEMORY_DB.exists():
+        return {}
+    try:
+        with db_connect(MEMORY_DB, readonly=True) as conn:
+            rows = conn.execute(
+                """
+                SELECT m.chat_username, m.chat_display_name, m.message_uid,
+                       m.create_time, m.local_id
+                FROM messages m
+                JOIN chats c ON c.username=m.chat_username
+                WHERE COALESCE(c.is_group, 0)=1
+                ORDER BY m.chat_username, m.create_time DESC, m.local_id DESC
+                """
+            ).fetchall()
+    except sqlite3.Error:
+        return {}
+    output: dict[str, dict] = {}
+    for row in rows:
+        chat = str(row["chat_username"] or "")
+        if chat and chat not in output:
+            output[chat] = chat_watermark(dict(row))
+    return output
+
+
+def initialize_auto_reply_state() -> None:
+    state = auto_reply_state()
+    watermarks = state.get("watermarks") if isinstance(state.get("watermarks"), dict) else {}
+    latest = latest_group_message_watermarks()
+    changed = False
+    for chat, watermark in latest.items():
+        if chat not in watermarks:
+            watermarks[chat] = watermark
+            changed = True
+    if changed or not AUTO_REPLY_STATE_FILE.exists():
+        write_auto_reply_state(
+            {
+                "ok": True,
+                "running": False,
+                "watermarks": watermarks,
+                "last_checked_at": now_iso(),
+                "last_skip_reason": "initialized_watermarks",
+            }
+        )
+
+
+def allowed_auto_reply_chats(config: dict) -> set[str]:
+    allowed = config.get("reply_sender", {}).get("allowed_chats") or []
+    return {str(item).strip() for item in allowed if str(item).strip()}
+
+
+def is_auto_reply_allowed_chat(row: dict, allowed: set[str]) -> bool:
+    chat_username = str(row.get("chat_username") or "").strip()
+    chat_display = str(row.get("chat_display_name") or "").strip()
+    return not allowed or chat_username in allowed or chat_display in allowed
+
+
+def auto_reply_candidate_messages(config: dict, state: dict, limit: int) -> list[dict]:
+    if not MEMORY_DB.exists():
+        return []
+    watermarks = state.get("watermarks") if isinstance(state.get("watermarks"), dict) else {}
+    allowed = allowed_auto_reply_chats(config)
+    rows: list[dict] = []
+    watermarks_changed = False
+    try:
+        with db_connect(MEMORY_DB, readonly=True) as conn:
+            chat_rows = conn.execute(
+                """
+                SELECT username, display_name
+                FROM chats
+                WHERE COALESCE(is_group, 0)=1
+                ORDER BY COALESCE(sort_timestamp, last_timestamp, 0) DESC, username ASC
+                """
+            ).fetchall()
+            for chat_row in chat_rows:
+                chat = str(chat_row["username"] or "")
+                if not chat:
+                    continue
+                if allowed and chat not in allowed and str(chat_row["display_name"] or "") not in allowed:
+                    continue
+                watermark = watermarks.get(chat) if isinstance(watermarks.get(chat), dict) else {}
+                since_time = int(watermark.get("create_time") or 0)
+                since_local = int(watermark.get("local_id") or 0)
+                if since_time <= 0 and chat not in watermarks:
+                    latest = conn.execute(
+                        """
+                        SELECT message_uid, chat_username, chat_display_name, local_id, create_time
+                        FROM messages
+                        WHERE chat_username=?
+                        ORDER BY create_time DESC, local_id DESC
+                        LIMIT 1
+                        """,
+                        (chat,),
+                    ).fetchone()
+                    watermarks[chat] = chat_watermark(dict(latest) if latest else None)
+                    watermarks_changed = True
+                    continue
+                new_rows = conn.execute(
+                    """
+                    SELECT message_uid, chat_username, chat_display_name, type_label,
+                           create_time, local_id, source, message_content, compress_content,
+                           origin_source
+                    FROM messages
+                    WHERE chat_username=?
+                      AND (COALESCE(create_time, 0)>?
+                           OR (COALESCE(create_time, 0)=? AND COALESCE(local_id, 0)>?))
+                    ORDER BY create_time ASC, local_id ASC
+                    LIMIT ?
+                    """,
+                    (chat, since_time, since_time, since_local, max(limit, 1)),
+                ).fetchall()
+                rows.extend(dict(row) for row in new_rows)
+    except sqlite3.Error as exc:
+        write_auto_reply_state({"ok": False, "last_error": str(exc), "last_checked_at": now_iso()})
+        return []
+    if watermarks_changed:
+        write_auto_reply_state({"watermarks": watermarks})
+    rows.sort(key=lambda item: (int(item.get("create_time") or 0), int(item.get("local_id") or 0)))
+    return [row for row in rows if is_auto_reply_allowed_chat(row, allowed)][:limit]
+
+
+def is_self_message(row: dict) -> bool:
+    sender, _ = message_index_text(row)
+    if sender:
+        return False
+    origin = row.get("origin_source")
+    try:
+        return int(origin) == 1
+    except (TypeError, ValueError):
+        return False
+
+
+def normalize_auto_message(row: dict) -> dict:
+    sender, text = message_index_text(row)
+    return {
+        **row,
+        "sender_hint": sender,
+        "text": clean_contact_text(text),
+        "is_self_message": is_self_message(row),
+    }
+
+
+def mark_auto_reply_watermark(state: dict, row: dict) -> None:
+    chat = str(row.get("chat_username") or "")
+    if not chat:
+        return
+    watermarks = state.get("watermarks") if isinstance(state.get("watermarks"), dict) else {}
+    watermarks[chat] = chat_watermark(row)
+    write_auto_reply_state({"watermarks": watermarks})
+
+
+def auto_reply_skip(row: dict, reason: str, scoring: dict | None = None) -> None:
+    state = auto_reply_state()
+    write_auto_reply_state(
+        {
+            "last_action_at": now_iso(),
+            "last_skip_reason": reason,
+            "last_message_uid": row.get("message_uid") or "",
+            "last_chat_username": row.get("chat_username") or "",
+            "last_chat_display_name": row.get("chat_display_name") or "",
+            "last_score": int((scoring or {}).get("score") or 0),
+            "last_threshold": int((scoring or {}).get("threshold") or 0),
+            "last_decision": str((scoring or {}).get("decision") or "skipped"),
+            "skipped_count": int(state.get("skipped_count") or 0) + 1,
+        }
+    )
+
+
+def confirm_sent_message(reply_text: str, chat_username: str, after_time: int, timeout_seconds: float = 8.0) -> dict:
+    chat_username = str(chat_username or "").strip()
+    needle = str(reply_text or "").strip()
+    if not chat_username or not needle or not MEMORY_DB.exists():
+        return {"ok": False, "error": "缺少发送确认参数"}
+    deadline = time.time() + max(0.5, float(timeout_seconds or 0))
+    checks = 0
+    latest_match = None
+    while time.time() < deadline:
+        checks += 1
+        try:
+            with db_connect(MEMORY_DB, readonly=True) as conn:
+                row = conn.execute(
+                    """
+                    SELECT message_uid, chat_username, chat_display_name, local_id,
+                           create_time, message_content, origin_source
+                    FROM messages
+                    WHERE chat_username=?
+                      AND COALESCE(create_time, 0)>=?
+                      AND message_content LIKE ?
+                    ORDER BY create_time DESC, local_id DESC
+                    LIMIT 1
+                    """,
+                    (chat_username, max(0, int(after_time or 0) - 5), f"%{needle[:80]}%"),
+                ).fetchone()
+        except sqlite3.Error as exc:
+            return {"ok": False, "error": str(exc), "checks": checks}
+        if row:
+            latest_match = dict(row)
+            if is_self_message(latest_match):
+                return {"ok": True, "checks": checks, "message": latest_match}
+        time.sleep(0.8)
+    return {
+        "ok": False,
+        "error": "同步库内尚未确认自己发出的同文本消息",
+        "checks": checks,
+        "latest_match": latest_match,
+    }
+
+
+def auto_reply_execute_message(row: dict, config: dict) -> dict:
+    message = normalize_auto_message(row)
+    state = auto_reply_state()
+    mark_auto_reply_watermark(state, message)
+    text = message.get("text") or ""
+    if not text:
+        auto_reply_skip(message, "empty_text")
+        return {"ok": True, "skipped": True, "reason": "empty_text"}
+    if message.get("is_self_message"):
+        auto_reply_skip(message, "self_message")
+        return {"ok": True, "skipped": True, "reason": "self_message"}
+    if str(message.get("type_label") or "") not in {"text", "link_or_file"}:
+        auto_reply_skip(message, "unsupported_message_type")
+        return {"ok": True, "skipped": True, "reason": "unsupported_message_type"}
+    if auto_outbox_for_message(str(message.get("message_uid") or "")):
+        auto_reply_skip(message, "already_processed")
+        return {"ok": True, "skipped": True, "reason": "already_processed"}
+
+    recent = recent_context(
+        str(message.get("chat_username") or ""),
+        before_time=int(message.get("create_time") or 0),
+        limit=16,
+    )
+    context = infer_talk_context(
+        message,
+        recent,
+        {
+            "group_auto_reply_enabled": True,
+            "is_self_message": False,
+        },
+    )
+    mode_key = config.get("agent", {}).get("reply_mode", "normal")
+    scoring = evaluate_talk({"text": text, "mode": mode_key, "context": context})
+    if scoring.get("decision") != "reply":
+        auto_reply_skip(message, "score_below_threshold", scoring)
+        return {"ok": True, "skipped": True, "reason": "score_below_threshold", "scoring": scoring}
+
+    preview = preview_reply(
+        {
+            "chat": message.get("chat_username"),
+            "chat_display_name": message.get("chat_display_name"),
+            "message_uid": message.get("message_uid"),
+            "text": text,
+            "mode": mode_key,
+            "context": {
+                **context,
+                "group_auto_reply_enabled": True,
+                "is_self_message": False,
+            },
+        }
+    )
+    reply_text = str(preview.get("reply") or "").strip()
+    if not preview.get("ok") or not reply_text:
+        auto_reply_skip(message, "preview_failed", scoring)
+        return {"ok": False, "error": preview.get("error") or "回复生成失败", "preview": preview}
+
+    outbox = create_reply_outbox(
+        {
+            "chat": message.get("chat_username"),
+            "chat_display_name": message.get("chat_display_name"),
+            "message_uid": message.get("message_uid"),
+            "source_text": text,
+            "reply_text": reply_text,
+            "scoring": scoring,
+            "trigger": "auto",
+        },
+        "auto_send",
+        status="approved",
+    )
+    delays = reply_sender_delays(config)
+    with WECHAT_SEND_LOCK:
+        send_result = paste_reply_to_wechat(
+            reply_text,
+            send=True,
+            chat_display_name=outbox.get("chat_display_name") or "",
+            chat_username=outbox.get("chat_username") or "",
+            delays=delays,
+        )
+    confirmed = False
+    confirmation = {}
+    if send_result.get("ok"):
+        confirmation = confirm_sent_message(
+            reply_text,
+            str(outbox.get("chat_username") or ""),
+            int(message.get("create_time") or 0),
+            timeout_seconds=8.0,
+        )
+        confirmed = bool(confirmation.get("ok"))
+    details = {
+        "auto": True,
+        "message": {
+            "message_uid": message.get("message_uid"),
+            "chat_username": message.get("chat_username"),
+            "chat_display_name": message.get("chat_display_name"),
+            "sender_hint": message.get("sender_hint"),
+            "text": text[:300],
+            "create_time": message.get("create_time"),
+            "local_id": message.get("local_id"),
+        },
+        "scoring": scoring,
+        "context": context,
+        "preview": {
+            "fallback": preview.get("fallback"),
+            "llm": preview.get("llm"),
+            "error": preview.get("error"),
+        },
+        "send": send_result.get("details") if isinstance(send_result.get("details"), dict) else send_result,
+        "confirmation": confirmation,
+    }
+    status = "sent" if send_result.get("ok") else "failed"
+    updated = update_reply_outbox(
+        outbox["outbox_id"],
+        status,
+        None if send_result.get("ok") else str(send_result.get("error") or "自动发送失败"),
+        details,
+        sent_confirmed=confirmed,
+    )
+    state = auto_reply_state()
+    counter_payload = {
+        "ok": bool(send_result.get("ok")),
+        "last_action_at": now_iso(),
+        "last_error": "" if send_result.get("ok") else str(send_result.get("error") or "自动发送失败"),
+        "last_skip_reason": "",
+        "last_message_uid": message.get("message_uid") or "",
+        "last_chat_username": message.get("chat_username") or "",
+        "last_chat_display_name": message.get("chat_display_name") or "",
+        "last_score": int(scoring.get("score") or 0),
+        "last_threshold": int(scoring.get("threshold") or 0),
+        "last_decision": str(scoring.get("decision") or ""),
+        "last_outbox_id": outbox["outbox_id"],
+        "processed_count": int(state.get("processed_count") or 0) + 1,
+        "sent_count": int(state.get("sent_count") or 0) + (1 if send_result.get("ok") else 0),
+        "failed_count": int(state.get("failed_count") or 0) + (0 if send_result.get("ok") else 1),
+    }
+    write_auto_reply_state(counter_payload)
+    add_auto_reply_event(
+        "sent" if send_result.get("ok") else "failed",
+        f"{outbox.get('chat_display_name') or outbox.get('chat_username')} · {reply_text[:80]}",
+        {
+            "outbox_id": outbox["outbox_id"],
+            "message_uid": message.get("message_uid"),
+            "score": scoring.get("score"),
+            "threshold": scoring.get("threshold"),
+            "confirmed": confirmed,
+            "error": send_result.get("error"),
+        },
+    )
+    return {
+        "ok": bool(send_result.get("ok")),
+        "sent": bool(send_result.get("ok")),
+        "confirmed": confirmed,
+        "outbox": updated,
+        "error": send_result.get("error"),
+        "details": details,
+    }
+
+
+def auto_reply_once(config: dict | None = None) -> dict:
+    config = config or read_config()
+    sender = config.get("reply_sender", {})
+    state = auto_reply_state()
+    max_messages = clamp_int(sender.get("max_messages_per_cycle"), 8, 1, 100)
+    candidates = auto_reply_candidate_messages(config, state, max_messages)
+    if not candidates:
+        write_auto_reply_state(
+            {
+                "ok": True,
+                "last_checked_at": now_iso(),
+                "last_skip_reason": "no_new_messages",
+            }
+        )
+        return {"ok": True, "processed": 0, "sent": 0, "failed": 0, "skipped": 0}
+    processed = sent = failed = skipped = 0
+    errors = []
+    for row in candidates:
+        try:
+            result = auto_reply_execute_message(row, config)
+            processed += 1
+            if result.get("sent"):
+                sent += 1
+            elif result.get("skipped"):
+                skipped += 1
+            elif not result.get("ok"):
+                failed += 1
+                errors.append(result.get("error") or result)
+        except Exception as exc:
+            failed += 1
+            errors.append(str(exc))
+            write_auto_reply_state({"ok": False, "last_error": str(exc), "last_action_at": now_iso()})
+            add_auto_reply_event("error", str(exc), {"message_uid": row.get("message_uid")})
+    return {
+        "ok": not errors,
+        "processed": processed,
+        "sent": sent,
+        "failed": failed,
+        "skipped": skipped,
+        "errors": errors[:5],
+    }
 
 
 def execute_reply_to_wechat(payload: dict, send: bool) -> dict:
@@ -4475,6 +5057,52 @@ def semantic_extract_loop() -> None:
         time.sleep(5)
 
 
+def auto_reply_loop() -> None:
+    initialize_auto_reply_state()
+    while True:
+        sleep_seconds = 5.0
+        try:
+            config = read_config()
+            sender = config.get("reply_sender", {})
+            sleep_seconds = clamp_float(sender.get("poll_interval_seconds"), 5, 1.0, 300.0)
+            active = bool(
+                config.get("agent", {}).get("enabled", True)
+                and config.get("agent", {}).get("auto_reply_enabled", False)
+                and sender.get("enabled", False)
+                and sender.get("mode") == "auto_send"
+            )
+            write_auto_reply_state(
+                {
+                    "enabled": bool(sender.get("enabled", False)),
+                    "running": active,
+                    "last_checked_at": now_iso(),
+                }
+            )
+            if not active:
+                write_auto_reply_state({"last_skip_reason": "disabled"})
+                time.sleep(min(5.0, sleep_seconds))
+                continue
+            result = auto_reply_once(config)
+            if result.get("sent") or result.get("failed"):
+                add_auto_reply_event(
+                    "cycle",
+                    f"自动接话轮询：处理 {result.get('processed', 0)}，发送 {result.get('sent', 0)}，失败 {result.get('failed', 0)}",
+                    result,
+                )
+        except Exception as exc:
+            write_auto_reply_state(
+                {
+                    "ok": False,
+                    "running": False,
+                    "last_checked_at": now_iso(),
+                    "last_error": str(exc),
+                }
+            )
+            add_auto_reply_event("error", str(exc))
+            print(f"auto reply error: {exc}", flush=True)
+        time.sleep(sleep_seconds)
+
+
 def api_status(chat: str = "") -> dict:
     config = read_config()
     last_test = read_json(STATUS_FILE, {})
@@ -4485,6 +5113,7 @@ def api_status(chat: str = "") -> dict:
         "memory": memory_status(),
         "semantic_memory": semantic_memory_preview(chat),
         "semantic_runs": semantic_runs(8),
+        "auto_reply": auto_reply_public_state(config),
         "last_test": last_test,
     }
 
@@ -4604,6 +5233,8 @@ class Handler(BaseHTTPRequestHandler):
                 json_response(self, suite_status())
             elif parsed.path == "/api/reply/outbox":
                 json_response(self, reply_outbox_list(clamp_int(query.get("limit", ["30"])[0], 30, 1, 100)))
+            elif parsed.path == "/api/reply/auto-state":
+                json_response(self, {"ok": True, "auto_reply": auto_reply_public_state(read_config())})
             elif parsed.path.startswith("/api/avatar/"):
                 serve_avatar(self, parsed.path)
             elif parsed.path.startswith("/media/"):
@@ -4663,6 +5294,9 @@ class Handler(BaseHTTPRequestHandler):
             elif parsed.path == "/api/reply/send":
                 result = execute_reply_to_wechat(payload, send=True)
                 json_response(self, result, 200 if result.get("ok") else 400 if result.get("status") == "rejected" else 502)
+            elif parsed.path == "/api/reply/auto-run-once":
+                result = auto_reply_once(config)
+                json_response(self, result, 200 if result.get("ok") else 502)
             elif parsed.path == "/api/memory/review":
                 result = memory_review_mutate(payload)
                 json_response(self, result, 200 if result.get("ok") else 400)
@@ -4681,8 +5315,10 @@ def main(argv: list[str] | None = None) -> int:
     init_semantic_memory()
     backfill_fact_graph_edges(limit=160)
     initialize_semantic_state()
+    initialize_auto_reply_state()
     threading.Thread(target=health_loop, daemon=True, name="llm-health-check").start()
     threading.Thread(target=semantic_extract_loop, daemon=True, name="semantic-memory-extract").start()
+    threading.Thread(target=auto_reply_loop, daemon=True, name="wechat-auto-reply").start()
     server = ThreadingHTTPServer((args.host, args.port), Handler)
     print(f"Serving WeChat Agent console at http://{args.host}:{args.port}", flush=True)
     try:

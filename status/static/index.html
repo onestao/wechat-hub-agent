@@ -1,0 +1,128 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>微信记忆服务状态</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <main class="shell">
+      <header class="topbar">
+        <div>
+          <p class="eyebrow">WeChat Memory Suite</p>
+          <h1>服务运行状态</h1>
+        </div>
+        <div class="top-actions">
+          <span id="refreshState" class="refresh-state">等待刷新</span>
+          <button id="refreshBtn" type="button">刷新</button>
+        </div>
+      </header>
+
+      <section class="overview" aria-label="总体状态">
+        <div class="status-tile main-status">
+          <span class="label">总体</span>
+          <strong id="overallText">检查中</strong>
+          <small id="generatedAt">--</small>
+        </div>
+        <div class="status-tile">
+          <span class="label">聊天消息</span>
+          <strong id="messageCount">--</strong>
+          <small id="latestMessage">--</small>
+        </div>
+        <div class="status-tile">
+          <span class="label">AI 记忆</span>
+          <strong id="indexedCount">--</strong>
+          <small id="aiAge">--</small>
+        </div>
+        <div class="status-tile">
+          <span class="label">媒体文件</span>
+          <strong id="mediaCount">--</strong>
+          <small id="mediaStatus">--</small>
+        </div>
+      </section>
+
+      <section class="layout">
+        <section class="panel services-panel">
+          <div class="panel-head">
+            <h2>服务</h2>
+            <span id="serviceCount">--</span>
+          </div>
+          <div id="services" class="services"></div>
+        </section>
+
+        <aside class="panel detail-panel">
+          <div class="panel-head">
+            <h2>同步链路</h2>
+            <span id="flowState">--</span>
+          </div>
+          <div class="flow">
+            <div class="flow-step">
+              <span class="dot"></span>
+              <div>
+                <strong>微信数据</strong>
+                <small>原始数据只读挂载</small>
+              </div>
+            </div>
+            <div class="flow-step">
+              <span class="dot"></span>
+              <div>
+                <strong>聊天同步</strong>
+                <small id="syncSummary">--</small>
+              </div>
+            </div>
+            <div class="flow-step">
+              <span class="dot"></span>
+              <div>
+                <strong>8080 查看器</strong>
+                <small id="viewerSummary">--</small>
+              </div>
+            </div>
+            <div class="flow-step">
+              <span class="dot"></span>
+              <div>
+                <strong>8090 AI 记忆</strong>
+                <small id="aiSummary">--</small>
+              </div>
+            </div>
+          </div>
+
+          <div class="metrics">
+            <div>
+              <span>群聊</span>
+              <strong id="groupCount">--</strong>
+            </div>
+            <div>
+              <span>会话</span>
+              <strong id="chatCount">--</strong>
+            </div>
+            <div>
+              <span>索引差值</span>
+              <strong id="indexGap">--</strong>
+            </div>
+          </div>
+        </aside>
+      </section>
+
+      <section class="panel logs-panel">
+        <div class="panel-head">
+          <h2>最近状态</h2>
+          <span>自动刷新 5 秒</span>
+        </div>
+        <div class="log-grid">
+          <pre id="syncLog">{}</pre>
+          <pre id="aiLog">{}</pre>
+        </div>
+      </section>
+
+      <section class="panel containers-panel">
+        <div class="panel-head">
+          <h2>容器</h2>
+          <span id="containerCount">--</span>
+        </div>
+        <div id="containers" class="containers"></div>
+      </section>
+    </main>
+    <script src="/app.js"></script>
+  </body>
+</html>

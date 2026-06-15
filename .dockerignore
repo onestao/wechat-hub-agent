@@ -1,0 +1,8 @@
+.git
+.DS_Store
+.env
+config
+runtime
+tools
+__pycache__
+*.pyc

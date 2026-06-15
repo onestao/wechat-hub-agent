@@ -1,0 +1,410 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Agent Console V2</title>
+    <style>
+      * { box-sizing: border-box; }
+      body {
+        margin: 0;
+        width: 1440px;
+        height: 960px;
+        overflow: hidden;
+        color: #e9edf2;
+        background: #0c1016;
+        font: 14px/1.45 Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      }
+      h1, h2, h3, p { margin: 0; letter-spacing: 0; }
+      .screen {
+        width: 1440px;
+        height: 960px;
+        display: grid;
+        grid-template-columns: 88px 292px 1fr;
+        background:
+          radial-gradient(circle at 62% 18%, rgba(111, 134, 255, .14), transparent 26%),
+          radial-gradient(circle at 80% 86%, rgba(19, 197, 152, .12), transparent 26%),
+          linear-gradient(180deg, #101720, #0b0f15 62%);
+      }
+      .rail {
+        padding: 18px 14px;
+        border-right: 1px solid rgba(255,255,255,.07);
+        background: rgba(255,255,255,.025);
+        display: grid;
+        grid-template-rows: auto 1fr auto;
+        justify-items: center;
+      }
+      .logo {
+        width: 50px;
+        height: 50px;
+        border-radius: 16px;
+        display: grid;
+        place-items: center;
+        color: #081016;
+        font-weight: 950;
+        background: linear-gradient(145deg, #f5e8c8, #75a7ff 54%, #23d9b0);
+        box-shadow: 0 18px 42px rgba(73, 126, 255, .24);
+      }
+      .rail-nav { display: grid; gap: 14px; align-content: center; }
+      .rail-dot {
+        width: 42px;
+        height: 42px;
+        border-radius: 14px;
+        display: grid;
+        place-items: center;
+        color: #758191;
+        background: rgba(255,255,255,.04);
+      }
+      .rail-dot.active {
+        color: #fff;
+        background: rgba(255,255,255,.12);
+        box-shadow: inset 0 0 0 1px rgba(255,255,255,.08);
+      }
+      .side {
+        padding: 24px 18px;
+        border-right: 1px solid rgba(255,255,255,.07);
+        background: rgba(14, 20, 28, .7);
+      }
+      .side h1 { font-size: 22px; }
+      .side p { margin-top: 4px; color: #7d8897; }
+      .side-section { margin-top: 28px; }
+      .side-title { color: #7d8897; font-size: 12px; font-weight: 800; text-transform: uppercase; }
+      .menu { display: grid; gap: 8px; margin-top: 10px; }
+      .menu-item {
+        min-height: 42px;
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        padding: 0 12px;
+        border-radius: 12px;
+        color: #9ba6b4;
+      }
+      .menu-item.active {
+        color: #fff;
+        background: rgba(255,255,255,.08);
+      }
+      .count {
+        min-width: 26px;
+        height: 22px;
+        display: grid;
+        place-items: center;
+        border-radius: 999px;
+        color: #071018;
+        background: #a8f2d4;
+        font-size: 12px;
+        font-weight: 900;
+      }
+      .profile {
+        margin-top: 28px;
+        padding: 14px;
+        border-radius: 18px;
+        background: rgba(255,255,255,.055);
+        border: 1px solid rgba(255,255,255,.075);
+      }
+      .profile strong, .profile span { display: block; }
+      .profile span { color: #8d98a7; margin-top: 4px; }
+      .main {
+        padding: 24px;
+        display: grid;
+        grid-template-rows: auto auto 1fr;
+        gap: 18px;
+        min-width: 0;
+      }
+      .top {
+        display: flex;
+        align-items: flex-start;
+        justify-content: space-between;
+        gap: 16px;
+      }
+      .top h2 { font-size: 32px; line-height: 1.05; }
+      .top p { margin-top: 8px; color: #7d8897; }
+      .actions { display: flex; gap: 10px; }
+      .btn {
+        min-height: 38px;
+        border: 1px solid rgba(255,255,255,.11);
+        border-radius: 12px;
+        padding: 0 14px;
+        display: inline-flex;
+        align-items: center;
+        background: rgba(255,255,255,.06);
+        color: #e9edf2;
+        font-weight: 800;
+      }
+      .btn.primary {
+        color: #071018;
+        background: #a8f2d4;
+        border-color: #a8f2d4;
+      }
+      .metrics {
+        display: grid;
+        grid-template-columns: 1.2fr 1fr 1fr 1fr;
+        gap: 12px;
+      }
+      .card {
+        border: 1px solid rgba(255,255,255,.08);
+        border-radius: 18px;
+        background: rgba(255,255,255,.055);
+        box-shadow: 0 28px 70px rgba(0,0,0,.28);
+      }
+      .metric {
+        min-height: 92px;
+        padding: 16px;
+        display: grid;
+        align-content: space-between;
+      }
+      .metric span { color: #7d8897; font-size: 12px; font-weight: 800; }
+      .metric strong { font-size: 26px; }
+      .metric small { color: #92a0b0; }
+      .workspace {
+        min-height: 0;
+        display: grid;
+        grid-template-columns: 1fr 350px;
+        gap: 18px;
+      }
+      .graph-card {
+        position: relative;
+        overflow: hidden;
+        padding: 18px;
+      }
+      .card-head {
+        display: flex;
+        justify-content: space-between;
+        align-items: flex-start;
+        gap: 12px;
+        position: relative;
+        z-index: 2;
+      }
+      .card-head p { color: #7d8897; margin-top: 4px; }
+      .filters { display: flex; gap: 8px; flex-wrap: wrap; justify-content: flex-end; }
+      .filter {
+        min-height: 28px;
+        display: inline-flex;
+        align-items: center;
+        border-radius: 999px;
+        padding: 0 10px;
+        color: #9aa7b6;
+        background: rgba(255,255,255,.06);
+        font-size: 12px;
+        font-weight: 800;
+      }
+      .filter.on { color: #071018; background: #a8f2d4; }
+      .graph {
+        position: absolute;
+        left: 18px;
+        right: 18px;
+        bottom: 18px;
+        top: 92px;
+        border-radius: 18px;
+        overflow: hidden;
+        background:
+          linear-gradient(transparent 31px, rgba(255,255,255,.025) 32px),
+          linear-gradient(90deg, transparent 31px, rgba(255,255,255,.025) 32px),
+          radial-gradient(circle at 50% 50%, rgba(255,255,255,.045), transparent 42%);
+        background-size: 32px 32px, 32px 32px, auto;
+      }
+      .hex {
+        position: absolute;
+        width: 10px;
+        height: 10px;
+        border-radius: 50%;
+        background: rgba(168, 242, 212, .58);
+      }
+      .hex.hot {
+        background: #a8f2d4;
+        box-shadow: 0 0 18px rgba(168,242,212,.62);
+      }
+      .edge {
+        position: absolute;
+        height: 2px;
+        transform-origin: left center;
+        background: linear-gradient(90deg, transparent, rgba(168,242,212,.72), transparent);
+      }
+      .edge.blue { background: linear-gradient(90deg, transparent, rgba(127,161,255,.72), transparent); }
+      .node {
+        position: absolute;
+        width: 108px;
+        height: 108px;
+        border-radius: 28px;
+        display: grid;
+        place-items: center;
+        text-align: center;
+        font-weight: 950;
+        color: #0b1016;
+        background: linear-gradient(145deg, #f7e9c8, #8eb2ff 54%, #a8f2d4);
+        box-shadow: 0 0 0 1px rgba(255,255,255,.25), 0 22px 60px rgba(83,126,255,.24);
+      }
+      .node.secondary {
+        width: 88px;
+        height: 88px;
+        border-radius: 24px;
+        color: #e9edf2;
+        background: rgba(255,255,255,.08);
+        border: 1px solid rgba(255,255,255,.12);
+      }
+      .node small {
+        display: block;
+        margin-top: 3px;
+        color: rgba(10,16,22,.65);
+        font-weight: 800;
+      }
+      .node.secondary small { color: #8e9aaa; }
+      .side-stack {
+        display: grid;
+        gap: 18px;
+        min-height: 0;
+      }
+      .panel {
+        padding: 16px;
+      }
+      .talk-modes {
+        display: grid;
+        gap: 10px;
+        margin-top: 14px;
+      }
+      .mode {
+        display: grid;
+        grid-template-columns: 76px 1fr 38px;
+        align-items: center;
+        gap: 12px;
+        min-height: 48px;
+        padding: 0 12px;
+        border-radius: 14px;
+        background: rgba(255,255,255,.045);
+        border: 1px solid rgba(255,255,255,.06);
+      }
+      .mode.active {
+        border-color: rgba(168,242,212,.42);
+        background: rgba(168,242,212,.1);
+      }
+      .bar { height: 7px; border-radius: 999px; background: rgba(255,255,255,.08); overflow: hidden; }
+      .bar span { display: block; height: 100%; border-radius: inherit; background: #a8f2d4; }
+      .mode small { color: #8d98a7; text-align: right; }
+      .custom {
+        margin-top: 12px;
+        border-radius: 14px;
+        padding: 12px;
+        background: rgba(127,161,255,.09);
+        border: 1px solid rgba(127,161,255,.16);
+      }
+      .memory-list {
+        display: grid;
+        gap: 10px;
+        margin-top: 14px;
+      }
+      .memory-item {
+        padding: 12px;
+        border-radius: 14px;
+        background: rgba(255,255,255,.045);
+        border: 1px solid rgba(255,255,255,.06);
+      }
+      .memory-item strong, .memory-item span { display: block; }
+      .memory-item span { color: #8d98a7; margin-top: 4px; }
+    </style>
+  </head>
+  <body>
+    <section class="screen">
+      <aside class="rail">
+        <div class="logo">微</div>
+        <div class="rail-nav">
+          <div class="rail-dot active">总</div>
+          <div class="rail-dot">模</div>
+          <div class="rail-dot">人</div>
+          <div class="rail-dot">接</div>
+          <div class="rail-dot">忆</div>
+        </div>
+        <div class="rail-dot">设</div>
+      </aside>
+
+      <aside class="side">
+        <h1>WeChat Agent</h1>
+        <p>群聊记忆与自动接话控制台</p>
+
+        <div class="side-section">
+          <div class="side-title">Workspace</div>
+          <div class="menu">
+            <div class="menu-item active"><span>Memory Graph</span><span class="count">1</span></div>
+            <div class="menu-item"><span>Talk Strategy</span><span>4</span></div>
+            <div class="menu-item"><span>LLM Profiles</span><span>13</span></div>
+            <div class="menu-item"><span>Persona Studio</span><span></span></div>
+            <div class="menu-item"><span>Audit Queue</span><span>0</span></div>
+          </div>
+        </div>
+
+        <div class="side-section">
+          <div class="side-title">Active Group</div>
+          <div class="profile">
+            <strong>PT站看片狂魔小群</strong>
+            <span>348 messages indexed</span>
+            <span>DeepSeek-V4-Flash · online</span>
+          </div>
+        </div>
+      </aside>
+
+      <main class="main">
+        <header class="top">
+          <div>
+            <h2>Memory Graph Command Center</h2>
+            <p>把群摘要、人物偏好、长期事实和接话策略放在同一张可审阅关系图里。</p>
+          </div>
+          <div class="actions">
+            <div class="btn">Extract memory</div>
+            <div class="btn primary">Save policy</div>
+          </div>
+        </header>
+
+        <section class="metrics">
+          <article class="card metric"><span>MESSAGE INDEX</span><strong>348 / 348</strong><small>5s incremental sync</small></article>
+          <article class="card metric"><span>ACTIVE MODEL</span><strong>Online</strong><small>DeepSeek · 3.5s</small></article>
+          <article class="card metric"><span>REPLY MODE</span><strong>Normal</strong><small>threshold 50</small></article>
+          <article class="card metric"><span>MEMORY OBJECTS</span><strong>1</strong><small>summary · no pending review</small></article>
+        </section>
+
+        <section class="workspace">
+          <article class="card graph-card">
+            <div class="card-head">
+              <div>
+                <h3>蜂窝点阵知识图谱</h3>
+                <p>节点可点击展开证据、置信度、来源消息；关系边按记忆类型分层。</p>
+              </div>
+              <div class="filters"><span class="filter on">All</span><span class="filter">People</span><span class="filter">Facts</span><span class="filter">Preference</span></div>
+            </div>
+            <div class="graph">
+              <div class="edge" style="left:328px;top:286px;width:296px;transform:rotate(-24deg)"></div>
+              <div class="edge blue" style="left:612px;top:164px;width:254px;transform:rotate(42deg)"></div>
+              <div class="edge" style="left:382px;top:398px;width:358px;transform:rotate(-5deg)"></div>
+              <div class="edge blue" style="left:760px;top:332px;width:220px;transform:rotate(29deg)"></div>
+              <div class="node" style="left:286px;top:238px">群摘要<small>summary</small></div>
+              <div class="node secondary" style="left:638px;top:104px">人物偏好<small>pending</small></div>
+              <div class="node secondary" style="left:806px;top:292px">长期事实<small>0 facts</small></div>
+              <div class="node" style="left:494px;top:414px">接话策略<small>score 50</small></div>
+              <div class="node secondary" style="left:1016px;top:400px">回答上下文<small>RAG</small></div>
+              <div class="hex hot" style="left:90px;top:76px"></div><div class="hex" style="left:142px;top:112px"></div><div class="hex" style="left:198px;top:86px"></div><div class="hex" style="left:252px;top:130px"></div><div class="hex hot" style="left:310px;top:72px"></div><div class="hex" style="left:1070px;top:94px"></div><div class="hex hot" style="left:1126px;top:140px"></div><div class="hex" style="left:1188px;top:106px"></div><div class="hex" style="left:154px;top:526px"></div><div class="hex hot" style="left:226px;top:572px"></div><div class="hex" style="left:1080px;top:566px"></div>
+            </div>
+          </article>
+
+          <aside class="side-stack">
+            <article class="card panel">
+              <div class="card-head"><div><h3>接话模式</h3><p>预设可选，自定义可保存为策略。</p></div></div>
+              <div class="talk-modes">
+                <div class="mode"><strong>安静</strong><div class="bar"><span style="width:75%"></span></div><small>75</small></div>
+                <div class="mode active"><strong>正常</strong><div class="bar"><span style="width:50%"></span></div><small>50</small></div>
+                <div class="mode"><strong>活跃</strong><div class="bar"><span style="width:35%"></span></div><small>35</small></div>
+                <div class="mode"><strong>发疯</strong><div class="bar"><span style="width:20%"></span></div><small>20</small></div>
+              </div>
+              <div class="custom"><strong>自定义策略</strong><p style="margin-top:4px;color:#9aa6b5">复制预设后编辑阈值、间隔、群白名单、静默规则。</p></div>
+            </article>
+
+            <article class="card panel">
+              <div class="card-head"><div><h3>可审阅记忆</h3><p>写入回答前先看来源和置信度。</p></div></div>
+              <div class="memory-list">
+                <div class="memory-item"><strong>群摘要</strong><span>投注盈亏、比分接口、IPTV 源需求与群内互动。</span></div>
+                <div class="memory-item"><strong>人物偏好</strong><span>暂无高置信记录，等待更多证据。</span></div>
+                <div class="memory-item"><strong>知识图谱</strong><span>暂无关系边，抽取到实体关系后显示。</span></div>
+              </div>
+            </article>
+          </aside>
+        </section>
+      </main>
+    </section>
+  </body>
+</html>

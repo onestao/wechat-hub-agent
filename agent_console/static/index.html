@@ -1,0 +1,524 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>微信 Agent 控制台</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <main class="screen">
+      <aside class="sidebar">
+        <div class="brand">
+          <div class="logo">微</div>
+          <div>
+            <h1>微信 Agent</h1>
+            <p id="agentState">加载中</p>
+          </div>
+        </div>
+
+        <nav class="nav" aria-label="控制台菜单">
+          <button class="active" type="button" data-view="overview">总览 <span id="navOverviewCount">1</span></button>
+          <button type="button" data-view="chat">聊天记录 <span id="navChatCount">--</span></button>
+          <button type="button" data-view="services">服务状态 <span id="navServiceCount">--</span></button>
+          <button type="button" data-view="models">模型 <span id="navModelCount">--</span></button>
+          <button type="button" data-view="persona">人格 <span></span></button>
+          <button type="button" data-view="talk">接话 <span>4</span></button>
+          <button type="button" data-view="memory">群记忆 <span id="navMemoryCount">--</span></button>
+          <button type="button" data-view="test">测试 <span></span></button>
+        </nav>
+
+        <div></div>
+
+        <div class="group-card">
+          <strong id="activeGroupName">未选择会话</strong>
+          <span id="activeGroupMeta">等待聊天记录加载</span>
+          <span id="llmSummary">等待模型检测</span>
+        </div>
+      </aside>
+
+      <section class="main">
+        <header class="topbar">
+          <div>
+            <h2 id="pageTitle">群记忆总览</h2>
+            <p id="pageSubtitle">查看服务运行、聊天同步、长期记忆和知识图谱。</p>
+          </div>
+          <div class="top-actions">
+            <label class="scope-select"><span>记忆群组</span><select id="memoryChat"></select></label>
+            <button id="refreshBtn" class="btn" type="button">刷新</button>
+            <button id="extractMemoryBtn" class="btn primary" type="button">抽取记忆</button>
+          </div>
+        </header>
+
+        <section class="status-grid">
+          <article class="card stat"><label>消息索引</label><strong id="memoryBadge">--</strong><small id="syncHint">5 秒增量同步</small></article>
+          <article class="card stat"><label>模型状态</label><strong id="modelHealth">--</strong><small id="modelHint">等待检测</small></article>
+          <article class="card stat"><label>服务运行</label><strong id="runMode">--</strong><small id="talkHint">等待检测</small></article>
+          <article class="card stat"><label>长期记忆</label><strong id="memoryObjectCount">--</strong><small id="memoryHint">群摘要/人物/事实/关系</small></article>
+        </section>
+
+        <section class="page active" data-page="overview">
+          <section class="work">
+            <article class="card graph-panel">
+              <div class="panel-head">
+                <div>
+                  <h3>记忆宇宙图</h3>
+                  <p>人物、摘要、事实和主题围绕群记忆核心展开；节点不重叠，可缩放拖拽并点击查看相关记忆。</p>
+                </div>
+                <div class="universe-legend" aria-label="记忆宇宙图图例">
+                  <span id="memoryScopeHint"><i class="legend-core"></i>全部会话</span>
+                  <span><i class="legend-person"></i>人物星体</span>
+                  <span><i class="legend-memory"></i>记忆节点</span>
+                  <span><i class="legend-core"></i>群记忆核心</span>
+                </div>
+              </div>
+              <div id="graphViewport" class="graph-viewport">
+                <div id="graphLeaderboard" class="graph-leaderboard" aria-label="发言排行榜"></div>
+                <div id="graphWorld" class="graph-world">
+                  <svg id="graphEdges" class="graph-edges" aria-hidden="true"></svg>
+                  <div id="graphNodes" class="graph-nodes"></div>
+                </div>
+              </div>
+              <div class="graph-tools">
+                <button id="zoomOutBtn" type="button">-</button>
+                <button id="zoomResetBtn" type="button">复位</button>
+                <button id="zoomInBtn" type="button">+</button>
+              </div>
+            </article>
+
+            <aside class="inspector graph-inspector">
+              <section id="graphDetail" class="graph-detail card">
+                <div class="graph-detail-empty">
+                  <strong>点击节点查看详情</strong>
+                  <span>人物画像、事实、主题和群摘要会在这里分段展开。</span>
+                </div>
+              </section>
+            </aside>
+          </section>
+        </section>
+
+        <section class="page" data-page="chat">
+          <section class="chat-layout">
+            <aside class="card chat-side">
+              <div class="panel-head compact-head">
+                <h3>会话</h3>
+                <span id="chatSummary" class="muted">--</span>
+              </div>
+              <input id="chatSearch" class="search-input" placeholder="搜索会话" autocomplete="off" />
+              <div id="chatList" class="chat-list"></div>
+            </aside>
+            <article class="card chat-main">
+              <div class="chat-toolbar">
+                <div>
+                  <h3 id="selectedChatName">聊天记录</h3>
+                  <p id="selectedChatMeta" class="muted">选择左侧会话查看记录</p>
+                </div>
+                <div class="chat-actions">
+                  <select id="typeFilter" class="search-input" aria-label="消息类型">
+                    <option value="">全部类型</option>
+                  </select>
+                  <input id="messageSearch" class="search-input" placeholder="搜索当前会话" autocomplete="off" />
+                  <button id="messageSearchBtn" class="btn" type="button">搜索</button>
+                </div>
+              </div>
+              <div id="chatStats" class="chat-stats"></div>
+              <div id="messageList" class="message-list"></div>
+            </article>
+          </section>
+        </section>
+
+        <section class="page" data-page="services">
+          <section class="service-status-layout">
+            <section class="service-overview">
+              <article id="statusOverall" class="card status-tile">
+                <label>总体</label>
+                <strong id="statusOverallText">检查中</strong>
+                <small id="suiteGeneratedAt">--</small>
+              </article>
+              <article class="card status-tile">
+                <label>聊天消息</label>
+                <strong id="statusMessageCount">--</strong>
+                <small id="statusLatestMessage">--</small>
+              </article>
+              <article class="card status-tile">
+                <label>AI 记忆</label>
+                <strong id="statusIndexedCount">--</strong>
+                <small id="statusAiAge">--</small>
+              </article>
+              <article class="card status-tile">
+                <label>媒体文件</label>
+                <strong id="statusMediaCount">--</strong>
+                <small id="statusMediaStatus">--</small>
+              </article>
+            </section>
+
+            <section class="service-detail-grid">
+              <article class="card panel services-panel">
+                <div class="panel-head">
+                  <div>
+                    <h3>服务</h3>
+                    <p>统一在 8078 查看：容器、端口、健康探测、同步和索引状态。</p>
+                  </div>
+                  <span id="serviceCount" class="pill">--</span>
+                </div>
+                <div id="serviceGrid" class="service-grid"></div>
+              </article>
+
+              <aside class="card panel flow-panel">
+                <div class="panel-head">
+                  <div>
+                    <h3>同步链路</h3>
+                    <p>原始数据只读，所有派生数据写入 runtime。</p>
+                  </div>
+                  <span id="flowState" class="pill">--</span>
+                </div>
+                <div class="flow">
+                  <div class="flow-step"><span class="flow-dot"></span><div><strong>微信数据</strong><small>原始数据只读挂载</small></div></div>
+                  <div class="flow-step"><span class="flow-dot"></span><div><strong>聊天同步</strong><small id="syncSummary">--</small></div></div>
+                  <div class="flow-step"><span class="flow-dot"></span><div><strong>8078 聊天查看</strong><small id="viewerSummary">--</small></div></div>
+                  <div class="flow-step"><span class="flow-dot"></span><div><strong>8090 AI 记忆</strong><small id="aiSummary">--</small></div></div>
+                </div>
+                <div class="metrics">
+                  <div><span>群聊</span><strong id="groupCount">--</strong></div>
+                  <div><span>会话</span><strong id="statusChatCount">--</strong></div>
+                  <div><span>索引差值</span><strong id="indexGap">--</strong></div>
+                </div>
+              </aside>
+
+              <article class="card panel logs-panel">
+                <div class="panel-head">
+                  <div>
+                    <h3>最近状态</h3>
+                    <p>同步 worker 与 AI 记忆 worker 的最近一次状态。</p>
+                  </div>
+                  <span class="pill">自动刷新</span>
+                </div>
+                <div class="log-grid">
+                  <pre id="syncLog">{}</pre>
+                  <pre id="aiLog">{}</pre>
+                </div>
+              </article>
+
+              <article class="card panel containers-panel">
+                <div class="panel-head">
+                  <div>
+                    <h3>容器</h3>
+                    <p>运行状态、镜像、启动时间和重启次数。</p>
+                  </div>
+                  <span id="containerCount" class="pill">--</span>
+                </div>
+                <div id="containerGrid" class="containers"></div>
+              </article>
+            </section>
+          </section>
+        </section>
+
+        <section class="page" data-page="models">
+          <section class="card panel">
+            <div class="panel-head">
+              <h3>模型配置</h3>
+              <div class="button-row">
+                <button id="addProfileBtn" class="btn" type="button">新增模型</button>
+                <button id="saveModelsBtn" class="btn primary" type="button">保存模型</button>
+              </div>
+            </div>
+            <div class="profile-tabs" id="profileTabs"></div>
+            <div class="form-grid">
+              <label><span>配置名称</span><input id="llmName" autocomplete="off" /></label>
+              <label><span>Base URL</span><input id="baseUrl" autocomplete="off" /></label>
+              <label><span>模型</span><input id="model" list="modelOptions" autocomplete="off" /></label>
+              <datalist id="modelOptions"></datalist>
+              <label><span>API Key</span><input id="apiKey" type="password" autocomplete="off" placeholder="留空则保持已保存 key" /></label>
+              <label><span>Temperature</span><input id="temperature" type="number" min="0" max="2" step="0.1" /></label>
+              <label><span>上下文窗口</span><input id="contextWindow" type="number" min="4096" max="2000000" step="1024" /></label>
+              <label><span>输出上限</span><input id="maxTokens" type="number" min="16" max="8192" step="16" /></label>
+              <label><span>自检间隔 秒</span><input id="healthInterval" type="number" min="15" max="3600" step="5" /></label>
+              <label class="switch-label tight"><input id="healthEnabled" type="checkbox" /><span>启用定时自检</span></label>
+            </div>
+            <div class="button-row model-actions">
+              <button id="modelsBtn" class="btn" type="button">获取模型列表</button>
+              <button id="checkBtn" class="btn" type="button">立即检测通断</button>
+              <span id="keyState" class="pill">--</span>
+            </div>
+            <div id="modelList" class="model-list"></div>
+          </section>
+        </section>
+
+        <section class="page" data-page="persona">
+          <section class="card panel">
+            <div class="panel-head">
+              <h3>人格设置</h3>
+              <button id="savePersonaBtn" class="btn primary" type="button">保存人格</button>
+            </div>
+            <div class="switch-row">
+              <label class="switch-label"><input id="agentEnabled" type="checkbox" /><span>启用 Agent 分析</span></label>
+              <label class="switch-label"><input id="autoReplyEnabled" type="checkbox" /><span>允许自动回复判定</span></label>
+              <select id="replyMode"></select>
+            </div>
+            <label class="textarea-label"><span>人格提示词</span><textarea id="personality" rows="10"></textarea></label>
+            <label class="textarea-label"><span>安全边界</span><textarea id="safetyPolicy" rows="4"></textarea></label>
+          </section>
+        </section>
+
+        <section class="page" data-page="talk">
+          <section class="talk-layout">
+            <article class="card panel span-2">
+              <div class="panel-head">
+                <div>
+                  <h3>接话模式</h3>
+                  <p>选择当前生效模式；下方参数可以按你的群风格自定义后保存。</p>
+                </div>
+                <button id="saveTalkBtn" class="btn primary" type="button">保存接话设置</button>
+              </div>
+              <div id="talkModePicker" class="talk-mode-picker"></div>
+            </article>
+            <article class="card panel">
+              <div class="panel-head">
+                <h3>模式参数</h3>
+              </div>
+              <label class="ttl-field"><span>自由任务 TTL</span><input id="freeTaskTtl" type="number" min="0" step="1" /></label>
+              <div id="talkModes" class="talk-modes"></div>
+            </article>
+            <article class="card panel">
+              <div class="panel-head"><h3>评分标准</h3></div>
+              <div class="score-columns">
+                <div><h4>正向评分</h4><div id="positiveScores" class="score-list"></div></div>
+                <div><h4>负向 / 抑制</h4><div id="negativeScores" class="score-list"></div></div>
+              </div>
+            </article>
+            <article class="card panel span-2">
+              <div class="panel-head">
+                <div>
+                  <h3>接话调试与回复预览</h3>
+                  <p>先生成候选回复；系统会自动切到目标群，随机等待后粘贴，发送前会二次确认。</p>
+                </div>
+                <div class="button-row">
+                  <button id="debugTalkBtn" class="btn" type="button">评分调试</button>
+                  <button id="previewReplyBtn" class="btn primary" type="button">生成回复预览</button>
+                  <button id="draftReplyBtn" class="btn" type="button">粘贴到微信</button>
+                  <button id="sendReplyBtn" class="btn danger" type="button">发送到微信</button>
+                </div>
+              </div>
+              <div class="debug-grid">
+                <label><span>选择会话</span><select id="debugChat"></select></label>
+                <label><span>接话模式</span><select id="debugMode"></select></label>
+                <label class="span-2"><span>待判断消息</span><textarea id="debugText" rows="4" placeholder="输入一条群消息，或先在聊天记录中复制消息文本"></textarea></label>
+              </div>
+              <div class="debug-result-grid">
+                <div class="debug-score">
+                  <strong id="debugScore">--</strong>
+                  <span id="debugDecision">等待调试</span>
+                  <small id="debugThreshold">--</small>
+                </div>
+                <div id="debugHits" class="score-list"></div>
+                <div class="reply-preview-box">
+                  <pre id="replyPreview">等待生成候选回复</pre>
+                  <div id="replySendState" class="reply-send-state">未创建发送记录</div>
+                </div>
+              </div>
+            </article>
+          </section>
+        </section>
+
+        <section class="page" data-page="memory">
+          <section class="memory-console">
+            <article class="card panel memory-command">
+              <div class="panel-head">
+                <div>
+                  <h3>群记忆中枢</h3>
+                  <p>人物画像、长期事实、群故事线和聚焦关系都来自 AI 记忆库。</p>
+                </div>
+                <div class="memory-command-actions">
+                  <label class="scope-select compact"><span>当前记忆</span><select id="memoryChatPanel"></select></label>
+                  <div class="memory-tabs" aria-label="记忆视图">
+                    <button class="active" type="button" data-memory-tab="people">人物画像</button>
+                    <button type="button" data-memory-tab="facts">事实库</button>
+                    <button type="button" data-memory-tab="stories">群记忆</button>
+                    <button type="button" data-memory-tab="relations">关系视图</button>
+                    <button type="button" data-memory-tab="settings">设置</button>
+                  </div>
+                </div>
+              </div>
+              <div class="memory-dashboard">
+                <div><span>人物画像</span><strong id="memoryPeopleCount">--</strong><small id="memoryPeopleHint">按成员聚合</small></div>
+                <div><span>长期事实</span><strong id="memoryFactsCount">--</strong><small>自动入库</small></div>
+                <div><span>群摘要</span><strong id="memorySummaryCount">--</strong><small>故事线来源</small></div>
+                <div><span>关系边</span><strong id="memoryEdgeCount">--</strong><small>聚焦展示</small></div>
+                <div><span>最近更新</span><strong id="memoryFreshness">--</strong><small id="memoryFreshnessHint">等待抽取</small></div>
+              </div>
+            </article>
+
+            <section class="memory-tab-page active" data-memory-page="people">
+              <section class="memory-people-layout">
+                <article class="card panel memory-profile-wall">
+                  <div class="panel-head">
+                    <div>
+                      <h3>人物画像</h3>
+                      <p>每个群成员独立成卡，点击后查看性格、偏好、故事线和证据。</p>
+                    </div>
+                    <input id="memoryPeopleSearch" class="search-input compact" placeholder="搜索成员、标签、画像" autocomplete="off" />
+                  </div>
+                  <div id="memoryPeopleGrid" class="memory-profile-grid"></div>
+                </article>
+                <aside class="card panel memory-profile-detail">
+                  <div class="panel-head">
+                    <div>
+                      <h3>画像详情</h3>
+                      <p id="memoryProfileHint">选择成员查看完整画像。</p>
+                    </div>
+                    <span id="memoryProfileConfidence" class="pill">--</span>
+                  </div>
+                  <div id="memoryPersonDetail" class="memory-detail-body"></div>
+                </aside>
+              </section>
+            </section>
+
+            <section class="memory-tab-page" data-memory-page="facts">
+              <section class="memory-facts-layout">
+                <aside class="card panel memory-filter-panel">
+                  <div class="panel-head">
+                    <h3>事实筛选</h3>
+                    <span id="memoryFactFilterCount" class="pill">--</span>
+                  </div>
+                  <div id="memoryFactFilters" class="memory-filter-list"></div>
+                </aside>
+                <article class="card panel memory-fact-workbench">
+                  <div class="panel-head">
+                    <div>
+                      <h3>事实工作台</h3>
+                      <p>结论、置信度、分类和来源消息分开展示，避免标签堆成一团。</p>
+                    </div>
+                    <input id="memoryFactSearch" class="search-input compact" placeholder="搜索事实、人物、对象" autocomplete="off" />
+                  </div>
+                  <div id="memoryFactAutoStatus" class="memory-fact-auto"></div>
+                  <div id="memoryFactLanes" class="memory-fact-lanes"></div>
+                </article>
+                <aside class="card panel memory-evidence-panel">
+                  <div class="panel-head">
+                    <div>
+                      <h3>证据链</h3>
+                      <p>选中事实后查看来源和管理操作。</p>
+                    </div>
+                  </div>
+                  <div id="memoryFactDetail" class="memory-detail-body"></div>
+                </aside>
+              </section>
+            </section>
+
+            <section class="memory-tab-page" data-memory-page="stories">
+              <section class="memory-stories-layout">
+                <article class="card panel memory-story-board">
+                  <div class="panel-head">
+                    <div>
+                      <h3>群记忆时间线</h3>
+                      <p>把群摘要、事实和人物动态整理成可读故事。</p>
+                    </div>
+                    <div id="memoryStoryTags" class="memory-tag-row"></div>
+                  </div>
+                  <div id="memoryStoryList" class="memory-story-list"></div>
+                </article>
+                <aside class="card panel memory-tag-panel">
+                  <div class="panel-head">
+                    <div>
+                      <h3>标签索引</h3>
+                      <p>标签按语义分组，并用不同动效和材质区分。</p>
+                    </div>
+                  </div>
+                  <div id="memoryTagIndex" class="memory-tag-index"></div>
+                </aside>
+              </section>
+            </section>
+
+            <section class="memory-tab-page" data-memory-page="relations">
+              <section class="memory-relations-layout">
+                <aside class="card panel memory-focus-panel">
+                  <div class="panel-head">
+                    <div>
+                      <h3>聚焦对象</h3>
+                      <p>每次只展示一个成员或主题周边关系。</p>
+                    </div>
+                  </div>
+                  <div id="memoryFocusList" class="memory-focus-list"></div>
+                </aside>
+                <article class="card panel memory-relation-map">
+                  <div class="panel-head">
+                    <div>
+                      <h3>关系视图</h3>
+                      <p>固定分区布局，节点不重叠，可看清每条关系。</p>
+                    </div>
+                  </div>
+                  <div id="memoryRelationCanvas" class="memory-relation-canvas"></div>
+                </article>
+                <aside class="card panel memory-relation-detail">
+                  <div class="panel-head">
+                    <div>
+                      <h3>关系摘要</h3>
+                      <p>关联事实、人物故事和证据。</p>
+                    </div>
+                  </div>
+                  <div id="memoryRelationDetail" class="memory-detail-body"></div>
+                </aside>
+              </section>
+            </section>
+
+            <section class="memory-tab-page" data-memory-page="settings">
+              <section class="memory-settings-layout">
+                <article class="card panel span-2">
+                  <div class="panel-head">
+                    <div>
+                      <h3>记忆层</h3>
+                      <p>长期事实会自动判断并入库；这里用于修正、禁用或删除派生记忆。</p>
+                    </div>
+                    <div class="button-row">
+                      <span id="memoryState" class="pill">--</span>
+                      <button id="saveMemoryBtn" class="btn primary" type="button">保存记忆设置</button>
+                    </div>
+                  </div>
+                  <div id="memoryLayers" class="layers"></div>
+                </article>
+                <article class="card panel span-2">
+                  <div class="panel-head">
+                    <div>
+                      <h3>自动抽取</h3>
+                      <p>消息实时同步，长期事实按批次进入记忆层，避免把玩笑误记成长期事实。</p>
+                    </div>
+                    <span id="extractRunState" class="pill">--</span>
+                  </div>
+                  <div class="extract-grid">
+                    <label class="switch-label"><input id="semanticEnabled" type="checkbox" /><span>启用自动抽取</span></label>
+                    <label><span>抽取间隔 秒</span><input id="semanticInterval" type="number" min="5" step="5" /></label>
+                    <label><span>至少新增消息</span><input id="semanticMinNew" type="number" min="1" step="1" /></label>
+                    <label><span>每轮读取消息</span><input id="semanticLimit" type="number" min="10" step="10" /></label>
+                    <label><span>批大小</span><input id="semanticBatch" type="number" min="1" max="10" step="1" /></label>
+                    <label><span>限定会话</span><select id="semanticChat"></select></label>
+                  </div>
+                  <div id="semanticRunList" class="run-list"></div>
+                </article>
+                <article class="card panel span-2"><div class="panel-head"><h3>群摘要管理</h3></div><div id="summaryPreview" class="memory-list"></div></article>
+                <article class="card panel"><div class="panel-head"><h3>人物画像管理</h3></div><div id="peoplePreview" class="memory-list"></div></article>
+                <article class="card panel"><div class="panel-head"><h3>长期事实管理</h3></div><div id="factPreview" class="memory-list"></div></article>
+                <article class="card panel span-2"><div class="panel-head"><h3>关系边管理</h3></div><div id="edgePreview" class="edge-list"></div></article>
+              </section>
+            </section>
+          </section>
+        </section>
+
+        <section class="page" data-page="test">
+          <section class="card panel test-panel">
+            <div class="panel-head">
+              <h3>模型测试</h3>
+              <span id="testState" class="pill">待测试</span>
+            </div>
+            <textarea id="testPrompt" rows="6">请用一句中文回答：模型连接正常。</textarea>
+            <button id="testBtn" type="button" class="btn primary full">测试模型</button>
+            <div class="test-result">
+              <div class="result-meta"><span id="testMeta">--</span><span id="usageMeta">--</span></div>
+              <pre id="testOutput">等待测试</pre>
+            </div>
+          </section>
+        </section>
+      </section>
+    </main>
+    <script src="/app.js"></script>
+  </body>
+</html>

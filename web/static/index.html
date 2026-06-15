@@ -1,0 +1,51 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>WeChat Memory</title>
+    <link rel="stylesheet" href="/styles.css">
+  </head>
+  <body>
+    <main class="app">
+      <aside class="sidebar">
+        <header class="brand">
+          <div>
+            <h1>微信记忆库</h1>
+            <p id="summaryText">加载中</p>
+          </div>
+          <span id="syncDot" class="dot"></span>
+        </header>
+
+        <section class="searchBox">
+          <input id="chatFilter" type="search" placeholder="搜索会话">
+        </section>
+
+        <nav id="chatList" class="chatList"></nav>
+      </aside>
+
+      <section class="content">
+        <header class="toolbar">
+          <div>
+            <h2 id="chatTitle">选择一个会话</h2>
+            <p id="chatMeta">本地只读 · 自动同步</p>
+          </div>
+          <div class="actions">
+            <select id="typeFilter" aria-label="消息类型">
+              <option value="">全部类型</option>
+            </select>
+            <input id="messageSearch" type="search" placeholder="搜索聊天内容">
+            <button id="refreshButton" type="button">刷新</button>
+          </div>
+        </header>
+
+        <section id="statusPanel" class="statusPanel"></section>
+        <section id="messageList" class="messageList empty">
+          <div class="emptyState">选择左侧会话查看聊天记录</div>
+        </section>
+      </section>
+    </main>
+
+    <script src="/app.js"></script>
+  </body>
+</html>

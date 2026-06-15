@@ -1,0 +1,690 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>总览蜂窝点阵知识图谱三版方案</title>
+    <style>
+      :root {
+        color-scheme: dark;
+        --bg: #090d12;
+        --panel: rgba(255, 255, 255, 0.052);
+        --panel-2: rgba(255, 255, 255, 0.075);
+        --line: rgba(255, 255, 255, 0.085);
+        --text: #eff3f7;
+        --muted: #7f8b99;
+        --muted-2: #a5afba;
+        --accent: #9bf4d2;
+        --blue: #8ba2ff;
+        --amber: #ffd37b;
+        --rose: #ff8ecd;
+        --bad: #ff7d7d;
+        --shadow: 0 24px 60px rgba(0, 0, 0, 0.28);
+      }
+      * { box-sizing: border-box; }
+      body {
+        margin: 0;
+        min-height: 100vh;
+        color: var(--text);
+        background: #05070a;
+        font: 14px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      }
+      h1, h2, h3, p { margin: 0; letter-spacing: 0; }
+      button { font: inherit; }
+      .screen {
+        width: 1440px;
+        height: 960px;
+        overflow: hidden;
+        display: grid;
+        grid-template-columns: 246px minmax(0, 1fr);
+        background:
+          radial-gradient(circle at 78% 14%, rgba(123, 141, 255, .12), transparent 26%),
+          radial-gradient(circle at 70% 88%, rgba(45, 211, 161, .08), transparent 30%),
+          linear-gradient(180deg, #111820 0%, #0a0e13 74%);
+      }
+      .sidebar {
+        padding: 22px;
+        border-right: 1px solid var(--line);
+        background: rgba(255, 255, 255, .025);
+        display: grid;
+        grid-template-rows: auto auto 1fr auto;
+        gap: 22px;
+      }
+      .brand { display: flex; gap: 12px; align-items: center; }
+      .logo {
+        width: 44px;
+        height: 44px;
+        border-radius: 14px;
+        display: grid;
+        place-items: center;
+        color: #07110e;
+        font-weight: 950;
+        background: linear-gradient(145deg, #edf1f7, #8fb0ff 52%, #79f0cc);
+      }
+      .brand h1 { font-size: 20px; }
+      .brand p, .muted { color: var(--muted); }
+      .nav { display: grid; gap: 7px; }
+      .nav button {
+        border: 0;
+        min-height: 42px;
+        border-radius: 12px;
+        padding: 0 12px;
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        background: transparent;
+        color: #929eab;
+        text-align: left;
+      }
+      .nav button.active {
+        background: var(--panel-2);
+        color: #fff;
+        box-shadow: inset 0 0 0 1px var(--line);
+      }
+      .nav span {
+        min-width: 22px;
+        min-height: 22px;
+        border-radius: 999px;
+        display: grid;
+        place-items: center;
+        background: rgba(255,255,255,.07);
+        color: #aab4c0;
+        font-size: 12px;
+        font-weight: 800;
+      }
+      .nav button.active span {
+        background: var(--accent);
+        color: #07110e;
+      }
+      .group-card {
+        border-radius: 18px;
+        padding: 14px;
+        background: var(--panel);
+        border: 1px solid var(--line);
+      }
+      .group-card strong, .group-card span { display: block; }
+      .group-card span { color: var(--muted-2); margin-top: 4px; }
+      .main {
+        min-width: 0;
+        padding: 22px;
+        display: grid;
+        grid-template-rows: auto auto minmax(0, 1fr);
+        gap: 14px;
+      }
+      .topbar {
+        min-height: 72px;
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 16px;
+      }
+      .topbar h2 { font-size: 30px; line-height: 1.1; }
+      .topbar p { margin-top: 6px; color: var(--muted); }
+      .top-actions { display: flex; gap: 10px; align-items: center; }
+      .btn {
+        border: 1px solid rgba(255,255,255,.12);
+        border-radius: 12px;
+        background: rgba(255,255,255,.065);
+        color: var(--text);
+        padding: 0 14px;
+        min-height: 38px;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        font-weight: 800;
+      }
+      .btn.primary {
+        border-color: var(--accent);
+        background: var(--accent);
+        color: #06100d;
+      }
+      .status-grid {
+        display: grid;
+        grid-template-columns: 1.25fr repeat(3, minmax(0, 1fr));
+        gap: 12px;
+      }
+      .card {
+        border: 1px solid var(--line);
+        border-radius: 18px;
+        background: var(--panel);
+        box-shadow: var(--shadow);
+      }
+      .stat {
+        min-height: 86px;
+        padding: 15px;
+        display: grid;
+        align-content: space-between;
+      }
+      .stat label {
+        color: var(--muted);
+        font-size: 12px;
+        font-weight: 800;
+      }
+      .stat strong { display: block; margin-top: 4px; font-size: 26px; }
+      .stat small { color: var(--muted-2); }
+      .work {
+        min-height: 0;
+        height: calc(960px - 206px);
+        display: grid;
+        grid-template-columns: minmax(0, 1fr) 354px;
+        gap: 14px;
+      }
+      .graph-panel {
+        min-height: 0;
+        position: relative;
+        overflow: hidden;
+        padding: 17px;
+      }
+      .panel-head {
+        display: flex;
+        justify-content: space-between;
+        gap: 12px;
+        align-items: flex-start;
+        margin-bottom: 14px;
+        position: relative;
+        z-index: 6;
+      }
+      .panel-head p { color: var(--muted); margin-top: 4px; }
+      .filter-row { display: flex; gap: 8px; flex-wrap: wrap; justify-content: flex-end; }
+      .pill {
+        border: 0;
+        min-height: 28px;
+        border-radius: 999px;
+        display: inline-flex;
+        align-items: center;
+        padding: 0 10px;
+        background: rgba(255,255,255,.07);
+        color: #98a4b2;
+        font-size: 12px;
+        font-weight: 850;
+      }
+      .pill.on {
+        color: #06100d;
+        background: var(--accent);
+      }
+      .inspector { display: grid; gap: 14px; min-height: 0; }
+      .panel { padding: 16px; }
+      .memory-list, .service-mini-list { display: grid; gap: 9px; }
+      .memory, .service-mini {
+        border-radius: 14px;
+        padding: 12px;
+        background: rgba(255,255,255,.042);
+        border: 1px solid rgba(255,255,255,.06);
+      }
+      .memory strong, .memory span, .service-mini strong, .service-mini span { display: block; }
+      .memory span, .service-mini span { color: #8f9aaa; margin-top: 4px; }
+      .service-mini { min-height: 58px; display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+      .service-mini em { font-style: normal; color: var(--accent); font-weight: 900; }
+      .preview-label {
+        position: absolute;
+        left: 18px;
+        bottom: 14px;
+        z-index: 20;
+        color: rgba(239,243,247,.42);
+        font-size: 12px;
+        font-weight: 850;
+      }
+      .canvas {
+        position: absolute;
+        left: 17px;
+        right: 17px;
+        top: 92px;
+        bottom: 17px;
+        border-radius: 18px;
+        overflow: hidden;
+        isolation: isolate;
+      }
+      .legend {
+        position: absolute;
+        left: 22px;
+        bottom: 22px;
+        z-index: 10;
+        display: flex;
+        gap: 7px;
+        flex-wrap: wrap;
+        max-width: 420px;
+      }
+      .legend span {
+        min-height: 26px;
+        border-radius: 999px;
+        padding: 0 9px;
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+        color: #dce9f3;
+        background: rgba(4, 8, 12, .55);
+        border: 1px solid rgba(255,255,255,.10);
+        backdrop-filter: blur(12px);
+        font-size: 12px;
+        font-weight: 850;
+      }
+      .legend i {
+        width: 8px;
+        height: 8px;
+        border-radius: 50%;
+        display: block;
+        background: var(--accent);
+      }
+      .legend .person i { background: var(--rose); }
+      .legend .fact i { background: var(--amber); }
+      .legend .risk i { background: var(--bad); }
+      .tools {
+        position: absolute;
+        right: 24px;
+        bottom: 22px;
+        z-index: 10;
+        display: flex;
+        gap: 6px;
+      }
+      .tools button {
+        border: 1px solid rgba(255,255,255,.12);
+        border-radius: 10px;
+        min-width: 34px;
+        height: 34px;
+        background: rgba(6,10,14,.72);
+        color: var(--text);
+        font-weight: 850;
+      }
+      svg.edges {
+        position: absolute;
+        inset: 0;
+        width: 100%;
+        height: 100%;
+        z-index: 2;
+        overflow: visible;
+      }
+      .edges path {
+        fill: none;
+        stroke-dasharray: 8 16;
+        animation: flow 7s linear infinite;
+        filter: drop-shadow(0 0 8px rgba(155,244,210,.22));
+      }
+      @keyframes flow { to { stroke-dashoffset: -72; } }
+      @keyframes float { 0%,100% { translate: 0 0; } 50% { translate: 0 -5px; } }
+      @keyframes breathe { 0%,100% { opacity: .42; scale: 1; } 50% { opacity: .9; scale: 1.05; } }
+      @keyframes sheen { 0%,70%,100% { translate: -120% 0; } 82% { translate: 120% 0; } }
+
+      /* Option A */
+      .option-a .canvas {
+        background:
+          radial-gradient(circle at 52% 48%, rgba(155,244,210,.18), transparent 28%),
+          radial-gradient(circle at 70% 25%, rgba(139,162,255,.15), transparent 24%),
+          linear-gradient(180deg, rgba(255,255,255,.032), rgba(255,255,255,.012)),
+          #071017;
+      }
+      .option-a .canvas::before {
+        content: "";
+        position: absolute;
+        inset: -30px;
+        opacity: .46;
+        background:
+          linear-gradient(30deg, transparent 44%, rgba(155,244,210,.13) 45% 46%, transparent 47%),
+          linear-gradient(150deg, transparent 44%, rgba(139,162,255,.11) 45% 46%, transparent 47%),
+          linear-gradient(90deg, transparent 48%, rgba(255,255,255,.045) 49% 50%, transparent 51%);
+        background-size: 88px 76px;
+        mask-image: radial-gradient(circle at 52% 48%, black 0 70%, transparent 96%);
+      }
+      .a-ring {
+        position: absolute;
+        left: 50%;
+        top: 50%;
+        border: 1px solid rgba(155,244,210,.12);
+        border-radius: 50%;
+        translate: -50% -50%;
+        z-index: 1;
+      }
+      .a-ring.r1 { width: 280px; height: 220px; }
+      .a-ring.r2 { width: 530px; height: 410px; }
+      .a-ring.r3 { width: 780px; height: 570px; }
+      .hex-node {
+        position: absolute;
+        z-index: 4;
+        width: 132px;
+        height: 116px;
+        clip-path: polygon(25% 5%, 75% 5%, 100% 50%, 75% 95%, 25% 95%, 0 50%);
+        display: grid;
+        place-items: center;
+        padding: 18px;
+        text-align: center;
+        color: var(--text);
+        background:
+          linear-gradient(145deg, rgba(255,255,255,.12), rgba(255,255,255,.045)),
+          rgba(5, 12, 18, .84);
+        border: 1px solid rgba(255,255,255,.16);
+        filter: drop-shadow(0 18px 34px rgba(0,0,0,.35));
+        animation: float 7s ease-in-out infinite;
+      }
+      .hex-node::after {
+        content: "";
+        position: absolute;
+        inset: 0;
+        background: linear-gradient(120deg, transparent, rgba(255,255,255,.22), transparent);
+        translate: -120% 0;
+        animation: sheen 8s ease-in-out infinite;
+      }
+      .hex-node strong, .hex-node span { display: block; position: relative; z-index: 2; }
+      .hex-node strong { font-size: 16px; line-height: 1.1; }
+      .hex-node span { margin-top: 6px; color: var(--muted-2); font-size: 12px; font-weight: 850; }
+      .hex-node.center {
+        width: 178px;
+        height: 154px;
+        color: #06100d;
+        background: linear-gradient(145deg, #f0fff8, #9bf4d2 45%, #8ba2ff);
+        filter: drop-shadow(0 0 36px rgba(155,244,210,.35));
+      }
+      .hex-node.person { border-color: rgba(255,142,205,.42); box-shadow: inset 0 0 42px rgba(255,142,205,.12); }
+      .hex-node.fact { border-color: rgba(255,211,123,.42); box-shadow: inset 0 0 42px rgba(255,211,123,.12); }
+      .hex-node.topic { border-color: rgba(155,244,210,.42); box-shadow: inset 0 0 42px rgba(155,244,210,.11); }
+      .hex-node.risk { border-color: rgba(255,125,125,.5); box-shadow: inset 0 0 42px rgba(255,125,125,.13); }
+      .detail-a {
+        position: absolute;
+        z-index: 8;
+        right: 22px;
+        top: 24px;
+        width: 300px;
+        border: 1px solid rgba(155,244,210,.18);
+        border-radius: 16px;
+        padding: 14px;
+        background: rgba(4,9,14,.68);
+        backdrop-filter: blur(18px);
+        box-shadow: 0 20px 60px rgba(0,0,0,.34);
+      }
+      .detail-a small { color: var(--accent); font-weight: 900; }
+      .detail-a strong { display: block; margin-top: 6px; font-size: 18px; }
+      .detail-a p { margin-top: 8px; color: var(--muted-2); }
+
+      /* Option B */
+      .option-b .canvas {
+        background:
+          radial-gradient(circle at 50% 50%, rgba(139,162,255,.18), transparent 30%),
+          radial-gradient(circle at 20% 80%, rgba(255,142,205,.10), transparent 28%),
+          linear-gradient(180deg, rgba(255,255,255,.02), rgba(0,0,0,.22)),
+          #06080f;
+      }
+      .option-b .canvas::before {
+        content: "";
+        position: absolute;
+        inset: 0;
+        opacity: .68;
+        background:
+          radial-gradient(circle, rgba(139,162,255,.32) 0 1.5px, transparent 2.5px) 0 0 / 34px 30px,
+          radial-gradient(circle, rgba(155,244,210,.22) 0 1.2px, transparent 2.2px) 17px 15px / 34px 30px;
+        mask-image: radial-gradient(circle at 50% 50%, black 0 72%, transparent 96%);
+      }
+      .orbit {
+        position: absolute;
+        border: 1px solid rgba(139,162,255,.18);
+        border-radius: 50%;
+        z-index: 1;
+        transform: rotate(-12deg);
+      }
+      .orbit.o1 { width: 340px; height: 178px; left: 304px; top: 194px; }
+      .orbit.o2 { width: 620px; height: 330px; left: 168px; top: 118px; }
+      .orbit.o3 { width: 870px; height: 470px; left: 52px; top: 50px; }
+      .star-node {
+        position: absolute;
+        z-index: 4;
+        min-width: 118px;
+        max-width: 154px;
+        min-height: 72px;
+        border-radius: 16px;
+        padding: 11px 12px;
+        background: rgba(10, 15, 27, .82);
+        border: 1px solid rgba(255,255,255,.13);
+        box-shadow: 0 18px 45px rgba(0,0,0,.38), inset 0 0 0 1px rgba(255,255,255,.035);
+        backdrop-filter: blur(12px);
+        animation: float 6.2s ease-in-out infinite;
+      }
+      .star-node::before {
+        content: "";
+        position: absolute;
+        left: 12px;
+        top: -8px;
+        width: 16px;
+        height: 16px;
+        border-radius: 50%;
+        background: var(--blue);
+        box-shadow: 0 0 28px var(--blue);
+      }
+      .star-node strong, .star-node span { display: block; position: relative; z-index: 2; }
+      .star-node strong { font-size: 14px; line-height: 1.2; }
+      .star-node span { color: var(--muted-2); margin-top: 5px; font-size: 12px; font-weight: 850; }
+      .star-node.center {
+        width: 176px;
+        min-height: 92px;
+        border-color: rgba(139,162,255,.48);
+        background: linear-gradient(145deg, rgba(139,162,255,.24), rgba(155,244,210,.11)), rgba(10,15,27,.92);
+        box-shadow: 0 0 42px rgba(139,162,255,.26);
+      }
+      .star-node.center::before { background: var(--accent); box-shadow: 0 0 34px var(--accent); }
+      .star-node.person::before { background: var(--rose); box-shadow: 0 0 28px var(--rose); }
+      .star-node.fact::before { background: var(--amber); box-shadow: 0 0 28px var(--amber); }
+      .star-node.risk::before { background: var(--bad); box-shadow: 0 0 28px var(--bad); }
+      .mini-map {
+        position: absolute;
+        right: 22px;
+        top: 24px;
+        z-index: 9;
+        width: 240px;
+        border-radius: 16px;
+        padding: 12px;
+        background: rgba(6,9,15,.72);
+        border: 1px solid rgba(139,162,255,.18);
+        backdrop-filter: blur(16px);
+      }
+      .mini-map strong, .mini-map span { display: block; }
+      .mini-map span { color: var(--muted); margin-top: 4px; }
+      .mini-map .bar {
+        margin-top: 10px;
+        height: 8px;
+        border-radius: 999px;
+        overflow: hidden;
+        background: rgba(255,255,255,.08);
+      }
+      .mini-map .bar i { display: block; height: 100%; width: 78%; background: linear-gradient(90deg, var(--blue), var(--accent)); }
+
+      /* Option C */
+      .option-c .canvas {
+        background:
+          linear-gradient(90deg, rgba(255,255,255,.035) 1px, transparent 1px),
+          linear-gradient(rgba(255,255,255,.035) 1px, transparent 1px),
+          radial-gradient(circle at 42% 44%, rgba(255,211,123,.13), transparent 27%),
+          radial-gradient(circle at 72% 60%, rgba(155,244,210,.10), transparent 32%),
+          #0b1016;
+        background-size: 46px 46px, 46px 46px, auto, auto, auto;
+      }
+      .option-c .canvas::before {
+        content: "";
+        position: absolute;
+        inset: 18px 22px;
+        border-radius: 16px;
+        border: 1px solid rgba(255,255,255,.07);
+        background:
+          linear-gradient(30deg, transparent 45%, rgba(255,211,123,.09) 46% 47%, transparent 48%),
+          linear-gradient(150deg, transparent 45%, rgba(155,244,210,.08) 46% 47%, transparent 48%);
+        background-size: 70px 62px;
+        opacity: .72;
+      }
+      .lane {
+        position: absolute;
+        z-index: 2;
+        top: 34px;
+        bottom: 84px;
+        border-radius: 16px;
+        border: 1px solid rgba(255,255,255,.07);
+        background: rgba(255,255,255,.025);
+      }
+      .lane.l1 { left: 40px; width: 220px; }
+      .lane.l2 { left: 288px; width: 280px; }
+      .lane.l3 { right: 308px; width: 280px; }
+      .lane.l4 { right: 40px; width: 240px; }
+      .lane-title {
+        position: absolute;
+        top: 50px;
+        z-index: 5;
+        color: var(--muted);
+        font-size: 12px;
+        font-weight: 900;
+      }
+      .lane-title.t1 { left: 58px; }
+      .lane-title.t2 { left: 306px; }
+      .lane-title.t3 { right: 496px; }
+      .lane-title.t4 { right: 214px; }
+      .module-node {
+        position: absolute;
+        z-index: 4;
+        width: 170px;
+        min-height: 70px;
+        border-radius: 14px;
+        padding: 11px 12px;
+        background: rgba(12,16,22,.88);
+        border: 1px solid rgba(255,255,255,.12);
+        box-shadow: 0 16px 38px rgba(0,0,0,.32);
+        animation: float 7s ease-in-out infinite;
+      }
+      .module-node::before {
+        content: "";
+        position: absolute;
+        left: 10px;
+        top: 10px;
+        bottom: 10px;
+        width: 3px;
+        border-radius: 999px;
+        background: var(--accent);
+        box-shadow: 0 0 20px var(--accent);
+      }
+      .module-node strong, .module-node span { display: block; padding-left: 12px; }
+      .module-node strong { font-size: 14px; }
+      .module-node span { color: var(--muted-2); margin-top: 4px; font-size: 12px; font-weight: 850; }
+      .module-node.center {
+        width: 220px;
+        min-height: 90px;
+        border-color: rgba(255,211,123,.42);
+        background: linear-gradient(145deg, rgba(255,211,123,.18), rgba(155,244,210,.08)), rgba(12,16,22,.92);
+      }
+      .module-node.center::before { background: var(--amber); box-shadow: 0 0 22px var(--amber); }
+      .module-node.person::before { background: var(--rose); box-shadow: 0 0 20px var(--rose); }
+      .module-node.fact::before { background: var(--amber); box-shadow: 0 0 20px var(--amber); }
+      .module-node.risk::before { background: var(--bad); box-shadow: 0 0 20px var(--bad); }
+      .focus-drawer {
+        position: absolute;
+        z-index: 8;
+        right: 28px;
+        bottom: 70px;
+        width: 280px;
+        border-radius: 16px;
+        padding: 14px;
+        background: rgba(6,10,14,.72);
+        border: 1px solid rgba(255,211,123,.18);
+        backdrop-filter: blur(16px);
+      }
+      .focus-drawer small { color: var(--amber); font-weight: 900; }
+      .focus-drawer strong { display: block; margin-top: 6px; font-size: 18px; }
+      .focus-drawer p { margin-top: 8px; color: var(--muted-2); }
+    </style>
+  </head>
+  <body>
+    <section id="option-a" class="screen option-a">
+      <aside class="sidebar">
+        <div class="brand"><div class="logo">微</div><div><h1>微信 Agent</h1><p>总览图谱方案 A</p></div></div>
+        <nav class="nav"><button class="active">总览 <span>1</span></button><button>聊天记录 <span>531</span></button><button>服务状态 <span>4</span></button><button>模型 <span>1</span></button><button>人格 <span></span></button><button>接话 <span>4</span></button><button>群记忆 <span>31</span></button><button>测试 <span></span></button></nav>
+        <div></div>
+        <div class="group-card"><strong>18725461928@chatroom</strong><span>531 条消息已索引</span><span>DeepSeek-V4-Flash · 连通</span></div>
+      </aside>
+      <main class="main">
+        <header class="topbar"><div><h2>群记忆总览</h2><p>查看服务运行、聊天同步、长期记忆和知识图谱。</p></div><div class="top-actions"><button class="btn">刷新</button><button class="btn primary">抽取记忆</button></div></header>
+        <section class="status-grid"><article class="card stat"><label>消息索引</label><strong>531 / 531</strong><small>5 秒增量同步</small></article><article class="card stat"><label>模型状态</label><strong>连通</strong><small>DeepSeek-V4-Flash · 1266 ms</small></article><article class="card stat"><label>服务运行</label><strong>4/4</strong><small>全部正常</small></article><article class="card stat"><label>长期记忆</label><strong>31</strong><small>1 摘要 · 14 人物 · 26 事实</small></article></section>
+        <section class="work">
+          <article class="card graph-panel">
+            <div class="panel-head"><div><h3>蜂窝点阵知识图谱</h3><p>方案 A：中心蜂巢。摘要在中心，人物、事实、风险按六边形环绕。</p></div><div class="filter-row"><span class="pill on">全部</span><span class="pill">摘要</span><span class="pill">人物</span><span class="pill">事实</span></div></div>
+            <div class="canvas">
+              <span class="a-ring r1"></span><span class="a-ring r2"></span><span class="a-ring r3"></span>
+              <svg class="edges" viewBox="0 0 1000 560" preserveAspectRatio="none"><path d="M500 280 C392 182 330 162 260 120" stroke="rgba(255,142,205,.62)" stroke-width="2"/><path d="M500 280 C590 150 650 124 760 102" stroke="rgba(255,211,123,.68)" stroke-width="2"/><path d="M500 280 C352 300 286 338 174 382" stroke="rgba(155,244,210,.62)" stroke-width="2"/><path d="M500 280 C606 316 690 332 818 382" stroke="rgba(255,125,125,.66)" stroke-width="2"/><path d="M500 280 C474 398 452 430 420 482" stroke="rgba(139,162,255,.62)" stroke-width="2"/><path d="M500 280 C522 176 502 130 500 78" stroke="rgba(155,244,210,.72)" stroke-width="2"/></svg>
+              <div class="hex-node center" style="left:calc(50% - 89px);top:calc(50% - 77px)"><div><strong>群摘要</strong><span>531 条消息</span></div></div>
+              <div class="hex-node person" style="left:188px;top:66px"><div><strong>pllynn</strong><span>107 条发言</span></div></div>
+              <div class="hex-node fact" style="right:150px;top:64px"><div><strong>长期事实</strong><span>26 条</span></div></div>
+              <div class="hex-node topic" style="left:96px;top:322px"><div><strong>部署主题</strong><span>Docker / 8078</span></div></div>
+              <div class="hex-node risk" style="right:92px;top:322px"><div><strong>安全约束</strong><span>原始库只读</span></div></div>
+              <div class="hex-node" style="left:calc(50% - 66px);bottom:48px"><div><strong>接话策略</strong><span>积极自然</span></div></div>
+              <div class="hex-node topic" style="left:calc(50% - 66px);top:34px"><div><strong>记忆抽取</strong><span>自动更新</span></div></div>
+              <aside class="detail-a"><small>选中节点 · 人物</small><strong>pllynn</strong><p>活跃推动者，关注 UI 是否清晰、图谱是否遮挡，以及微信原始数据只读安全边界。</p></aside>
+              <div class="legend"><span class="person"><i></i>人物</span><span class="fact"><i></i>事实</span><span><i></i>主题</span><span class="risk"><i></i>风险</span></div>
+              <div class="tools"><button>-</button><button>复位</button><button>+</button></div>
+            </div>
+            <span class="preview-label">A · 中心蜂巢中枢</span>
+          </article>
+          <aside class="inspector"><article class="card panel"><div class="panel-head"><div><h3>服务运行</h3><p>容器、端口、同步和索引服务状态。</p></div></div><div class="service-mini-list"><div class="service-mini"><div><strong>Agent Console</strong><span>8078</span></div><em>正常</em></div><div class="service-mini"><div><strong>AI Memory</strong><span>8090</span></div><em>正常</em></div><div class="service-mini"><div><strong>Memory Sync</strong><span>5 秒同步</span></div><em>正常</em></div></div></article><article class="card panel"><div class="panel-head"><div><h3>可管理记忆</h3><p>长期事实自动入库，可按需修正或删除。</p></div></div><div class="memory-list"><div class="memory"><strong>群摘要</strong><span>1 条摘要已生成</span></div><div class="memory"><strong>人物画像</strong><span>14 个成员画像</span></div><div class="memory"><strong>长期事实</strong><span>26 条事实</span></div></div></article></aside>
+        </section>
+      </main>
+    </section>
+
+    <section id="option-b" class="screen option-b">
+      <aside class="sidebar">
+        <div class="brand"><div class="logo">微</div><div><h1>微信 Agent</h1><p>总览图谱方案 B</p></div></div>
+        <nav class="nav"><button class="active">总览 <span>1</span></button><button>聊天记录 <span>531</span></button><button>服务状态 <span>4</span></button><button>模型 <span>1</span></button><button>人格 <span></span></button><button>接话 <span>4</span></button><button>群记忆 <span>31</span></button><button>测试 <span></span></button></nav>
+        <div></div><div class="group-card"><strong>18725461928@chatroom</strong><span>531 条消息已索引</span><span>DeepSeek-V4-Flash · 连通</span></div>
+      </aside>
+      <main class="main">
+        <header class="topbar"><div><h2>群记忆总览</h2><p>查看服务运行、聊天同步、长期记忆和知识图谱。</p></div><div class="top-actions"><button class="btn">刷新</button><button class="btn primary">抽取记忆</button></div></header>
+        <section class="status-grid"><article class="card stat"><label>消息索引</label><strong>531 / 531</strong><small>5 秒增量同步</small></article><article class="card stat"><label>模型状态</label><strong>连通</strong><small>DeepSeek-V4-Flash · 1266 ms</small></article><article class="card stat"><label>服务运行</label><strong>4/4</strong><small>全部正常</small></article><article class="card stat"><label>长期记忆</label><strong>31</strong><small>1 摘要 · 14 人物 · 26 事实</small></article></section>
+        <section class="work">
+          <article class="card graph-panel">
+            <div class="panel-head"><div><h3>蜂窝点阵知识图谱</h3><p>方案 B：星图点阵。点阵更炫，关系以轨道连接，适合强视觉冲击。</p></div><div class="filter-row"><span class="pill on">全部</span><span class="pill">摘要</span><span class="pill">人物</span><span class="pill">事实</span></div></div>
+            <div class="canvas">
+              <span class="orbit o1"></span><span class="orbit o2"></span><span class="orbit o3"></span>
+              <svg class="edges" viewBox="0 0 1000 560" preserveAspectRatio="none"><path d="M500 270 C320 118 246 112 160 110" stroke="rgba(255,142,205,.6)" stroke-width="2"/><path d="M500 270 C690 126 764 116 854 118" stroke="rgba(255,211,123,.65)" stroke-width="2"/><path d="M500 270 C290 270 212 270 118 272" stroke="rgba(155,244,210,.6)" stroke-width="2"/><path d="M500 270 C710 270 780 272 870 278" stroke="rgba(255,125,125,.65)" stroke-width="2"/><path d="M500 270 C370 400 282 414 180 440" stroke="rgba(139,162,255,.62)" stroke-width="2"/><path d="M500 270 C634 404 742 418 850 446" stroke="rgba(155,244,210,.68)" stroke-width="2"/></svg>
+              <div class="star-node center" style="left:calc(50% - 88px);top:calc(50% - 46px)"><strong>群记忆核心</strong><span>摘要 / 人物 / 事实</span></div>
+              <div class="star-node person" style="left:92px;top:78px"><strong>pllynn</strong><span>107 条发言</span></div>
+              <div class="star-node fact" style="right:76px;top:84px"><strong>长期事实</strong><span>高置信 24</span></div>
+              <div class="star-node" style="left:72px;top:246px"><strong>8078 控制台</strong><span>统一入口</span></div>
+              <div class="star-node risk" style="right:62px;top:250px"><strong>只读约束</strong><span>账号安全</span></div>
+              <div class="star-node" style="left:132px;bottom:80px"><strong>接话模式</strong><span>积极自然</span></div>
+              <div class="star-node" style="right:98px;bottom:76px"><strong>图谱反馈</strong><span>避免遮挡</span></div>
+              <div class="star-node fact" style="left:376px;top:42px"><strong>数据入库</strong><span>实时同步</span></div>
+              <div class="mini-map"><strong>当前缩放 82%</strong><span>点击节点展开右侧详情，拖动画布查看外围蜂窝点阵。</span><div class="bar"><i></i></div></div>
+              <div class="legend"><span class="person"><i></i>人物星点</span><span class="fact"><i></i>事实星点</span><span><i></i>主题轨道</span><span class="risk"><i></i>风险约束</span></div>
+              <div class="tools"><button>-</button><button>复位</button><button>+</button></div>
+            </div>
+            <span class="preview-label">B · 赛博点阵星图</span>
+          </article>
+          <aside class="inspector"><article class="card panel"><div class="panel-head"><div><h3>服务运行</h3><p>容器、端口、同步和索引服务状态。</p></div></div><div class="service-mini-list"><div class="service-mini"><div><strong>Agent Console</strong><span>8078</span></div><em>正常</em></div><div class="service-mini"><div><strong>AI Memory</strong><span>8090</span></div><em>正常</em></div><div class="service-mini"><div><strong>Memory Sync</strong><span>5 秒同步</span></div><em>正常</em></div></div></article><article class="card panel"><div class="panel-head"><div><h3>可管理记忆</h3><p>长期事实自动入库，可按需修正或删除。</p></div></div><div class="memory-list"><div class="memory"><strong>群摘要</strong><span>1 条摘要已生成</span></div><div class="memory"><strong>人物画像</strong><span>14 个成员画像</span></div><div class="memory"><strong>长期事实</strong><span>26 条事实</span></div></div></article></aside>
+        </section>
+      </main>
+    </section>
+
+    <section id="option-c" class="screen option-c">
+      <aside class="sidebar">
+        <div class="brand"><div class="logo">微</div><div><h1>微信 Agent</h1><p>总览图谱方案 C</p></div></div>
+        <nav class="nav"><button class="active">总览 <span>1</span></button><button>聊天记录 <span>531</span></button><button>服务状态 <span>4</span></button><button>模型 <span>1</span></button><button>人格 <span></span></button><button>接话 <span>4</span></button><button>群记忆 <span>31</span></button><button>测试 <span></span></button></nav>
+        <div></div><div class="group-card"><strong>18725461928@chatroom</strong><span>531 条消息已索引</span><span>DeepSeek-V4-Flash · 连通</span></div>
+      </aside>
+      <main class="main">
+        <header class="topbar"><div><h2>群记忆总览</h2><p>查看服务运行、聊天同步、长期记忆和知识图谱。</p></div><div class="top-actions"><button class="btn">刷新</button><button class="btn primary">抽取记忆</button></div></header>
+        <section class="status-grid"><article class="card stat"><label>消息索引</label><strong>531 / 531</strong><small>5 秒增量同步</small></article><article class="card stat"><label>模型状态</label><strong>连通</strong><small>DeepSeek-V4-Flash · 1266 ms</small></article><article class="card stat"><label>服务运行</label><strong>4/4</strong><small>全部正常</small></article><article class="card stat"><label>长期记忆</label><strong>31</strong><small>1 摘要 · 14 人物 · 26 事实</small></article></section>
+        <section class="work">
+          <article class="card graph-panel">
+            <div class="panel-head"><div><h3>蜂窝点阵知识图谱</h3><p>方案 C：操作台蜂窝。按层分区，最不乱，适合长期使用和快速定位。</p></div><div class="filter-row"><span class="pill on">全部</span><span class="pill">摘要</span><span class="pill">人物</span><span class="pill">事实</span></div></div>
+            <div class="canvas">
+              <div class="lane l1"></div><div class="lane l2"></div><div class="lane l3"></div><div class="lane l4"></div>
+              <span class="lane-title t1">人物层</span><span class="lane-title t2">主题层</span><span class="lane-title t3">事实层</span><span class="lane-title t4">约束层</span>
+              <svg class="edges" viewBox="0 0 1000 560" preserveAspectRatio="none"><path d="M190 126 C315 126 340 224 468 224" stroke="rgba(255,142,205,.58)" stroke-width="2"/><path d="M190 282 C316 282 340 256 468 256" stroke="rgba(255,142,205,.58)" stroke-width="2"/><path d="M468 224 C590 220 600 126 728 124" stroke="rgba(255,211,123,.62)" stroke-width="2"/><path d="M468 256 C594 268 606 292 728 304" stroke="rgba(255,211,123,.62)" stroke-width="2"/><path d="M728 124 C794 132 818 184 870 226" stroke="rgba(255,125,125,.62)" stroke-width="2"/><path d="M468 382 C590 382 610 420 730 440" stroke="rgba(155,244,210,.62)" stroke-width="2"/></svg>
+              <div class="module-node person" style="left:64px;top:92px"><strong>pllynn</strong><span>活跃推动者</span></div>
+              <div class="module-node person" style="left:64px;top:250px"><strong>群成员画像</strong><span>14 个成员</span></div>
+              <div class="module-node center" style="left:374px;top:198px"><strong>群摘要中枢</strong><span>531 条消息聚合</span></div>
+              <div class="module-node" style="left:346px;top:354px"><strong>UI 反馈</strong><span>图谱不能乱</span></div>
+              <div class="module-node fact" style="right:210px;top:92px"><strong>长期事实</strong><span>26 条自动入库</span></div>
+              <div class="module-node fact" style="right:210px;top:276px"><strong>部署状态</strong><span>8078 / 8090</span></div>
+              <div class="module-node risk" style="right:54px;top:196px"><strong>原始库只读</strong><span>账号安全约束</span></div>
+              <div class="module-node" style="right:206px;bottom:66px"><strong>接话策略</strong><span>积极但像人</span></div>
+              <aside class="focus-drawer"><small>选中事实</small><strong>原始微信数据只读</strong><p>所有派生记忆写入 runtime，图谱只读取记忆库展示，不修改微信元数据。</p></aside>
+              <div class="legend"><span class="person"><i></i>人物层</span><span><i></i>主题层</span><span class="fact"><i></i>事实层</span><span class="risk"><i></i>约束层</span></div>
+              <div class="tools"><button>-</button><button>复位</button><button>+</button></div>
+            </div>
+            <span class="preview-label">C · 操作台式聚焦蜂窝</span>
+          </article>
+          <aside class="inspector"><article class="card panel"><div class="panel-head"><div><h3>服务运行</h3><p>容器、端口、同步和索引服务状态。</p></div></div><div class="service-mini-list"><div class="service-mini"><div><strong>Agent Console</strong><span>8078</span></div><em>正常</em></div><div class="service-mini"><div><strong>AI Memory</strong><span>8090</span></div><em>正常</em></div><div class="service-mini"><div><strong>Memory Sync</strong><span>5 秒同步</span></div><em>正常</em></div></div></article><article class="card panel"><div class="panel-head"><div><h3>可管理记忆</h3><p>长期事实自动入库，可按需修正或删除。</p></div></div><div class="memory-list"><div class="memory"><strong>群摘要</strong><span>1 条摘要已生成</span></div><div class="memory"><strong>人物画像</strong><span>14 个成员画像</span></div><div class="memory"><strong>长期事实</strong><span>26 条事实</span></div></div></article></aside>
+        </section>
+      </main>
+    </section>
+  </body>
+</html>

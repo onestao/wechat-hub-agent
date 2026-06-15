@@ -1,0 +1,1326 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>记忆展示重构预览</title>
+    <style>
+      :root {
+        color-scheme: dark;
+        --bg: #0d0f12;
+        --surface: #15181d;
+        --surface-2: #1b1f25;
+        --surface-3: #22272e;
+        --line: #2c333b;
+        --line-soft: rgba(255, 255, 255, 0.075);
+        --text: #eef2f4;
+        --muted: #8f9aa7;
+        --muted-2: #b4bec8;
+        --green: #74e0b0;
+        --green-soft: rgba(116, 224, 176, 0.12);
+        --blue: #8ca7ff;
+        --blue-soft: rgba(140, 167, 255, 0.13);
+        --amber: #f1c36b;
+        --amber-soft: rgba(241, 195, 107, 0.13);
+        --rose: #ef8d9a;
+        --rose-soft: rgba(239, 141, 154, 0.13);
+        --shadow: 0 20px 60px rgba(0, 0, 0, 0.28);
+      }
+
+      * { box-sizing: border-box; }
+      html, body { min-height: 100%; }
+      body {
+        margin: 0;
+        background:
+          linear-gradient(180deg, rgba(255,255,255,0.018), transparent 240px),
+          var(--bg);
+        color: var(--text);
+        font: 14px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      }
+      body::before {
+        content: "";
+        position: fixed;
+        inset: 0;
+        pointer-events: none;
+        opacity: 0.28;
+        background-image:
+          linear-gradient(var(--line-soft) 1px, transparent 1px),
+          linear-gradient(90deg, var(--line-soft) 1px, transparent 1px);
+        background-size: 28px 28px;
+        mask-image: linear-gradient(180deg, black, transparent 72%);
+      }
+      button, input, select { font: inherit; }
+      button { cursor: pointer; }
+      h1, h2, h3, h4, p { margin: 0; letter-spacing: 0; }
+
+      .shell {
+        min-height: 100vh;
+        display: grid;
+        grid-template-columns: 252px minmax(0, 1fr);
+      }
+
+      .sidebar {
+        position: sticky;
+        top: 0;
+        height: 100vh;
+        padding: 18px;
+        background: rgba(14, 16, 19, 0.92);
+        border-right: 1px solid var(--line);
+        display: grid;
+        grid-template-rows: auto auto 1fr auto;
+        gap: 18px;
+      }
+
+      .brand {
+        display: grid;
+        grid-template-columns: 42px minmax(0, 1fr);
+        gap: 11px;
+        align-items: center;
+      }
+      .mark {
+        width: 42px;
+        height: 42px;
+        border-radius: 8px;
+        display: grid;
+        place-items: center;
+        color: #06100c;
+        background: linear-gradient(135deg, var(--green), var(--amber));
+        font-weight: 950;
+      }
+      .brand h1 { font-size: 19px; line-height: 1.1; }
+      .brand p { color: var(--muted); margin-top: 3px; font-size: 12px; }
+
+      .nav {
+        display: grid;
+        gap: 6px;
+      }
+      .nav button {
+        min-height: 40px;
+        border: 0;
+        border-radius: 8px;
+        padding: 0 11px;
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        background: transparent;
+        color: var(--muted-2);
+        text-align: left;
+      }
+      .nav button.active {
+        color: var(--text);
+        background: var(--surface-2);
+        box-shadow: inset 0 0 0 1px var(--line);
+      }
+      .nav span {
+        min-width: 22px;
+        height: 22px;
+        border-radius: 7px;
+        display: grid;
+        place-items: center;
+        color: #06100c;
+        background: var(--green);
+        font-size: 12px;
+        font-weight: 850;
+      }
+
+      .mini-status {
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        padding: 12px;
+        background: var(--surface);
+      }
+      .mini-status strong, .mini-status span { display: block; }
+      .mini-status span { color: var(--muted); margin-top: 5px; font-size: 12px; }
+      .dotline {
+        margin-top: 12px;
+        display: grid;
+        gap: 7px;
+      }
+      .dotline div {
+        display: flex;
+        justify-content: space-between;
+        gap: 10px;
+        color: var(--muted-2);
+        font-size: 12px;
+      }
+      .dotline i {
+        width: 8px;
+        height: 8px;
+        border-radius: 50%;
+        background: var(--green);
+        box-shadow: 0 0 18px rgba(116, 224, 176, 0.5);
+        align-self: center;
+      }
+
+      .main {
+        position: relative;
+        min-width: 0;
+        padding: 20px;
+        display: grid;
+        grid-template-rows: auto auto minmax(0, 1fr);
+        gap: 14px;
+      }
+
+      .topbar {
+        min-height: 68px;
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 16px;
+      }
+      .topbar h2 {
+        font-size: 28px;
+        line-height: 1.12;
+      }
+      .topbar p {
+        margin-top: 5px;
+        color: var(--muted);
+      }
+      .top-actions {
+        display: flex;
+        gap: 8px;
+        align-items: center;
+        flex-wrap: wrap;
+      }
+      .btn, .seg button, .icon-btn {
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        min-height: 36px;
+        padding: 0 12px;
+        color: var(--text);
+        background: var(--surface-2);
+        font-weight: 760;
+      }
+      .btn.primary {
+        border-color: transparent;
+        color: #07100c;
+        background: var(--green);
+      }
+      .icon-btn {
+        width: 36px;
+        padding: 0;
+        display: grid;
+        place-items: center;
+      }
+      .seg {
+        display: flex;
+        gap: 5px;
+        padding: 4px;
+        background: var(--surface);
+        border: 1px solid var(--line);
+        border-radius: 10px;
+      }
+      .seg button {
+        border: 0;
+        min-height: 32px;
+        background: transparent;
+        color: var(--muted-2);
+      }
+      .seg button.active {
+        color: var(--text);
+        background: var(--surface-3);
+      }
+
+      .metrics {
+        display: grid;
+        grid-template-columns: 1.2fr repeat(4, minmax(0, 1fr));
+        gap: 10px;
+      }
+      .metric {
+        min-height: 76px;
+        padding: 13px;
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        background: var(--surface);
+        box-shadow: var(--shadow);
+      }
+      .metric label {
+        color: var(--muted);
+        display: block;
+        font-size: 12px;
+        font-weight: 800;
+      }
+      .metric strong {
+        display: block;
+        margin-top: 5px;
+        font-size: 24px;
+        line-height: 1;
+      }
+      .metric small {
+        display: block;
+        margin-top: 7px;
+        color: var(--muted);
+      }
+      .metric.wide strong { color: var(--green); }
+
+      .page {
+        min-height: 0;
+        display: none;
+      }
+      .page.active {
+        display: grid;
+      }
+
+      .panel {
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        background: rgba(21, 24, 29, 0.92);
+        box-shadow: var(--shadow);
+        min-width: 0;
+      }
+      .panel-head {
+        min-height: 58px;
+        padding: 14px 15px;
+        border-bottom: 1px solid var(--line);
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 12px;
+      }
+      .panel-head h3 { font-size: 16px; }
+      .panel-head p { color: var(--muted); margin-top: 3px; font-size: 12px; }
+
+      .search {
+        height: 36px;
+        width: 220px;
+        min-width: 120px;
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        padding: 0 12px;
+        outline: none;
+        color: var(--text);
+        background: var(--surface-2);
+      }
+
+      .profile-layout {
+        min-height: 0;
+        display: grid;
+        grid-template-columns: minmax(620px, 1fr) 392px;
+        gap: 12px;
+      }
+      .profile-wall {
+        min-height: 0;
+        display: grid;
+        grid-template-rows: auto minmax(0, 1fr);
+      }
+      .profile-grid {
+        min-height: 0;
+        overflow: auto;
+        padding: 14px;
+        display: grid;
+        grid-template-columns: repeat(3, minmax(0, 1fr));
+        align-content: start;
+        gap: 10px;
+      }
+      .person-card {
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        padding: 12px;
+        background: var(--surface-2);
+        min-height: 176px;
+        display: grid;
+        grid-template-rows: auto auto 1fr auto;
+        gap: 10px;
+        text-align: left;
+        color: inherit;
+        transition: border-color 160ms ease, transform 160ms ease, background 160ms ease;
+      }
+      .person-card:hover,
+      .person-card.active {
+        border-color: rgba(116, 224, 176, 0.76);
+        background: linear-gradient(180deg, rgba(116, 224, 176, 0.095), var(--surface-2));
+        transform: translateY(-1px);
+      }
+      .person-top {
+        display: grid;
+        grid-template-columns: 44px minmax(0, 1fr) auto;
+        gap: 10px;
+        align-items: center;
+      }
+      .avatar {
+        width: 44px;
+        height: 44px;
+        border-radius: 8px;
+        display: grid;
+        place-items: center;
+        color: #06100c;
+        background: var(--green);
+        font-weight: 950;
+      }
+      .avatar.blue { background: var(--blue); }
+      .avatar.amber { background: var(--amber); }
+      .avatar.rose { background: var(--rose); }
+      .person-top strong {
+        display: block;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+      .person-top span {
+        display: block;
+        color: var(--muted);
+        margin-top: 2px;
+        font-size: 12px;
+      }
+      .score {
+        min-width: 44px;
+        height: 28px;
+        display: grid;
+        place-items: center;
+        border-radius: 8px;
+        color: var(--green);
+        background: var(--green-soft);
+        font-size: 12px;
+        font-weight: 850;
+      }
+      .trait-row, .tag-row {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 6px;
+      }
+      .chip {
+        min-height: 24px;
+        padding: 3px 8px;
+        display: inline-flex;
+        align-items: center;
+        border-radius: 7px;
+        border: 1px solid var(--line);
+        color: var(--muted-2);
+        background: rgba(255,255,255,0.035);
+        font-size: 12px;
+        font-weight: 760;
+      }
+      .chip.green { color: var(--green); background: var(--green-soft); border-color: rgba(116,224,176,0.22); }
+      .chip.blue { color: var(--blue); background: var(--blue-soft); border-color: rgba(140,167,255,0.22); }
+      .chip.amber { color: var(--amber); background: var(--amber-soft); border-color: rgba(241,195,107,0.22); }
+      .chip.rose { color: var(--rose); background: var(--rose-soft); border-color: rgba(239,141,154,0.22); }
+      .person-card p {
+        color: var(--muted-2);
+        min-height: 42px;
+      }
+      .person-meta {
+        display: flex;
+        justify-content: space-between;
+        gap: 10px;
+        color: var(--muted);
+        font-size: 12px;
+      }
+
+      .detail {
+        min-height: 0;
+        overflow: hidden;
+        display: grid;
+        grid-template-rows: auto minmax(0, 1fr);
+      }
+      .detail-body {
+        min-height: 0;
+        overflow: auto;
+        padding: 14px 15px 16px;
+        display: grid;
+        align-content: start;
+        gap: 15px;
+      }
+      .profile-hero {
+        display: grid;
+        grid-template-columns: 58px minmax(0, 1fr);
+        gap: 12px;
+        align-items: center;
+      }
+      .profile-hero .avatar {
+        width: 58px;
+        height: 58px;
+      }
+      .profile-hero h3 { font-size: 20px; }
+      .profile-hero p { color: var(--muted); margin-top: 4px; }
+      .section {
+        border-top: 1px solid var(--line);
+        padding-top: 13px;
+      }
+      .section:first-child {
+        border-top: 0;
+        padding-top: 0;
+      }
+      .section h4 {
+        margin: 0 0 9px;
+        font-size: 12px;
+        color: var(--muted);
+        font-weight: 850;
+      }
+      .section p { color: var(--muted-2); }
+      .kv {
+        display: grid;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap: 8px;
+      }
+      .kv div {
+        padding: 9px;
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        background: var(--surface-2);
+      }
+      .kv span {
+        display: block;
+        color: var(--muted);
+        font-size: 12px;
+      }
+      .kv strong {
+        display: block;
+        margin-top: 4px;
+        font-size: 14px;
+      }
+      .timeline {
+        display: grid;
+        gap: 9px;
+      }
+      .event {
+        position: relative;
+        padding: 0 0 0 17px;
+      }
+      .event::before {
+        content: "";
+        position: absolute;
+        left: 1px;
+        top: 7px;
+        width: 7px;
+        height: 7px;
+        border-radius: 50%;
+        background: var(--green);
+      }
+      .event strong { display: block; font-size: 13px; }
+      .event span { display: block; color: var(--muted); margin-top: 2px; font-size: 12px; }
+
+      .facts-layout {
+        min-height: 0;
+        display: grid;
+        grid-template-columns: 300px minmax(0, 1fr) 340px;
+        gap: 12px;
+      }
+      .filters {
+        padding: 14px;
+        display: grid;
+        align-content: start;
+        gap: 12px;
+      }
+      .filter-block {
+        display: grid;
+        gap: 8px;
+      }
+      .filter-block h4 {
+        color: var(--muted);
+        margin: 0;
+        font-size: 12px;
+      }
+      .filter-item {
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        padding: 10px;
+        background: var(--surface-2);
+        display: flex;
+        justify-content: space-between;
+        gap: 8px;
+      }
+      .filter-item strong { font-size: 13px; }
+      .filter-item span { color: var(--muted); font-size: 12px; }
+      .fact-workbench {
+        min-height: 0;
+        display: grid;
+        grid-template-rows: auto minmax(0, 1fr);
+      }
+      .fact-lanes {
+        min-height: 0;
+        overflow: auto;
+        padding: 14px;
+        display: grid;
+        grid-template-columns: repeat(3, minmax(260px, 1fr));
+        gap: 10px;
+      }
+      .lane {
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        background: var(--surface-2);
+        min-height: 0;
+        display: grid;
+        grid-template-rows: auto 1fr;
+      }
+      .lane h4 {
+        margin: 0;
+        padding: 12px;
+        border-bottom: 1px solid var(--line);
+        color: var(--text);
+        font-size: 14px;
+      }
+      .lane-list {
+        padding: 10px;
+        display: grid;
+        gap: 8px;
+        align-content: start;
+      }
+      .fact-card {
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        padding: 10px;
+        background: #121519;
+        display: grid;
+        gap: 8px;
+      }
+      .fact-card strong { font-size: 13px; }
+      .fact-card p {
+        color: var(--muted-2);
+        display: -webkit-box;
+        -webkit-line-clamp: 3;
+        -webkit-box-orient: vertical;
+        overflow: hidden;
+      }
+      .fact-meta {
+        display: flex;
+        justify-content: space-between;
+        gap: 8px;
+        color: var(--muted);
+        font-size: 12px;
+      }
+      .evidence {
+        padding: 14px;
+        overflow: auto;
+      }
+      .quote {
+        border-left: 2px solid var(--green);
+        padding: 8px 0 8px 10px;
+        color: var(--muted-2);
+        background: linear-gradient(90deg, rgba(116,224,176,0.08), transparent);
+        margin-bottom: 10px;
+      }
+      .quote span {
+        display: block;
+        margin-top: 4px;
+        color: var(--muted);
+        font-size: 12px;
+      }
+
+      .memory-layout {
+        min-height: 0;
+        display: grid;
+        grid-template-columns: minmax(0, 1fr) 366px;
+        gap: 12px;
+      }
+      .story-board {
+        min-height: 0;
+        display: grid;
+        grid-template-rows: auto minmax(0, 1fr);
+      }
+      .story-list {
+        min-height: 0;
+        overflow: auto;
+        padding: 14px;
+        display: grid;
+        align-content: start;
+        gap: 12px;
+      }
+      .story {
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        background: var(--surface-2);
+        display: grid;
+        grid-template-columns: 136px minmax(0, 1fr);
+      }
+      .story-time {
+        padding: 14px;
+        border-right: 1px solid var(--line);
+        color: var(--muted);
+      }
+      .story-time strong {
+        display: block;
+        color: var(--text);
+        font-size: 18px;
+      }
+      .story-content {
+        padding: 14px;
+        display: grid;
+        gap: 9px;
+      }
+      .story-content h4 {
+        margin: 0;
+        color: var(--text);
+        font-size: 15px;
+      }
+      .story-content p { color: var(--muted-2); }
+
+      .relation-layout {
+        min-height: 0;
+        display: grid;
+        grid-template-columns: 284px minmax(0, 1fr) 354px;
+        gap: 12px;
+      }
+      .focus-list {
+        padding: 12px;
+        display: grid;
+        gap: 8px;
+        align-content: start;
+      }
+      .focus-item {
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        padding: 10px;
+        background: var(--surface-2);
+        display: grid;
+        grid-template-columns: 36px 1fr;
+        gap: 9px;
+        align-items: center;
+      }
+      .focus-item.active { border-color: rgba(116,224,176,0.62); }
+      .focus-item .avatar {
+        width: 36px;
+        height: 36px;
+      }
+      .focus-item strong {
+        display: block;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+      .focus-item span {
+        color: var(--muted);
+        font-size: 12px;
+      }
+      .relation-map {
+        position: relative;
+        overflow: hidden;
+        min-height: 0;
+      }
+      .map-canvas {
+        position: absolute;
+        inset: 14px;
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        background:
+          linear-gradient(90deg, rgba(255,255,255,0.035) 1px, transparent 1px),
+          linear-gradient(rgba(255,255,255,0.035) 1px, transparent 1px),
+          #101317;
+        background-size: 48px 48px;
+      }
+      .map-canvas svg {
+        position: absolute;
+        inset: 0;
+        width: 100%;
+        height: 100%;
+      }
+      .map-node {
+        position: absolute;
+        width: 138px;
+        min-height: 58px;
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        padding: 9px;
+        background: rgba(27,31,37,0.96);
+        box-shadow: 0 10px 24px rgba(0,0,0,0.25);
+      }
+      .map-node.center {
+        width: 164px;
+        min-height: 76px;
+        border-color: rgba(116,224,176,0.75);
+        background: linear-gradient(180deg, rgba(116,224,176,0.15), rgba(27,31,37,0.96));
+      }
+      .map-node strong {
+        display: block;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+      .map-node span {
+        display: block;
+        color: var(--muted);
+        margin-top: 4px;
+        font-size: 12px;
+      }
+      .pulse {
+        animation: pulse 2.4s ease-in-out infinite;
+      }
+      @keyframes pulse {
+        0%, 100% { box-shadow: 0 0 0 rgba(116,224,176,0); }
+        50% { box-shadow: 0 0 24px rgba(116,224,176,0.2); }
+      }
+
+      .tags-panel {
+        min-height: 0;
+        overflow: auto;
+        padding: 14px;
+        display: grid;
+        align-content: start;
+        gap: 12px;
+      }
+      .tag-group {
+        border-top: 1px solid var(--line);
+        padding-top: 12px;
+      }
+      .tag-group:first-child {
+        border-top: 0;
+        padding-top: 0;
+      }
+      .tag-group h4 {
+        margin: 0 0 8px;
+        color: var(--muted);
+        font-size: 12px;
+      }
+
+      @media (max-width: 1180px) {
+        .shell { grid-template-columns: 210px minmax(0, 1fr); }
+        .profile-layout,
+        .facts-layout,
+        .memory-layout,
+        .relation-layout { grid-template-columns: 1fr; }
+        .detail, .evidence { max-height: 520px; }
+        .profile-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+        .metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      }
+    </style>
+  </head>
+  <body>
+    <div class="shell">
+      <aside class="sidebar">
+        <div class="brand">
+          <div class="mark">微</div>
+          <div>
+            <h1>微信 Agent</h1>
+            <p>记忆展示重构预览</p>
+          </div>
+        </div>
+
+        <nav class="nav" aria-label="预览菜单">
+          <button type="button">总览 <span>1</span></button>
+          <button type="button">聊天记录 <span>496</span></button>
+          <button type="button">服务状态 <span>4</span></button>
+          <button type="button">模型人格 <span>2</span></button>
+          <button type="button">接话策略 <span>4</span></button>
+          <button class="active" type="button">群记忆 <span>新</span></button>
+          <button type="button">测试 <span></span></button>
+        </nav>
+
+        <div></div>
+
+        <section class="mini-status">
+          <strong>18725461928@chatroom</strong>
+          <span>样例数据 · 不连接生产服务</span>
+          <div class="dotline">
+            <div><span>AI 记忆</span><i></i></div>
+            <div><span>聊天同步</span><i></i></div>
+            <div><span>LLM 自检</span><i></i></div>
+          </div>
+        </section>
+      </aside>
+
+      <main class="main">
+        <header class="topbar">
+          <div>
+            <h2 id="pageTitle">人物画像墙</h2>
+            <p id="pageSubtitle">每个成员独立成卡，点开后看性格、偏好、故事线、证据和关联事实。</p>
+          </div>
+          <div class="top-actions">
+            <div class="seg" aria-label="方案切换">
+              <button class="active" type="button" data-tab="people">人物画像</button>
+              <button type="button" data-tab="facts">事实库</button>
+              <button type="button" data-tab="memory">群记忆</button>
+              <button type="button" data-tab="relations">关系视图</button>
+            </div>
+            <button class="btn" type="button">刷新</button>
+            <button class="btn primary" type="button">抽取记忆</button>
+          </div>
+        </header>
+
+        <section class="metrics" aria-label="记忆指标">
+          <article class="metric wide"><label>记忆覆盖</label><strong>14 / 14</strong><small>群成员均有画像草稿</small></article>
+          <article class="metric"><label>长期事实</label><strong>68</strong><small>自动入库</small></article>
+          <article class="metric"><label>故事线</label><strong>23</strong><small>按时间聚合</small></article>
+          <article class="metric"><label>证据片段</label><strong>312</strong><small>可回溯消息</small></article>
+          <article class="metric"><label>更新时间</label><strong>3m</strong><small>增量抽取后更新</small></article>
+        </section>
+
+        <section class="page active" data-page="people">
+          <div class="profile-layout">
+            <section class="panel profile-wall">
+              <div class="panel-head">
+                <div>
+                  <h3>人物画像</h3>
+                  <p>成员卡片按活跃度、更新时间和置信度排序。</p>
+                </div>
+                <input class="search" placeholder="搜索成员、话题、标签" />
+              </div>
+              <div class="profile-grid" id="profileGrid"></div>
+            </section>
+
+            <aside class="panel detail">
+              <div class="panel-head">
+                <div>
+                  <h3>画像详情</h3>
+                  <p id="detailHint">当前选中：阿明</p>
+                </div>
+                <button class="icon-btn" type="button" aria-label="固定详情">□</button>
+              </div>
+              <div class="detail-body" id="profileDetail"></div>
+            </aside>
+          </div>
+        </section>
+
+        <section class="page" data-page="facts">
+          <div class="facts-layout">
+            <aside class="panel filters">
+              <div class="filter-block">
+                <h4>事实分类</h4>
+                <div class="filter-item"><strong>群共识</strong><span>18</span></div>
+                <div class="filter-item"><strong>人物事实</strong><span>21</span></div>
+                <div class="filter-item"><strong>项目资料</strong><span>11</span></div>
+                <div class="filter-item"><strong>事件节点</strong><span>12</span></div>
+                <div class="filter-item"><strong>待确认</strong><span>6</span></div>
+              </div>
+              <div class="filter-block">
+                <h4>置信度</h4>
+                <div class="tag-row">
+                  <span class="chip green">高</span>
+                  <span class="chip amber">中</span>
+                  <span class="chip rose">冲突</span>
+                </div>
+              </div>
+              <div class="filter-block">
+                <h4>关联对象</h4>
+                <div class="tag-row">
+                  <span class="chip">阿明</span>
+                  <span class="chip">小周</span>
+                  <span class="chip">测试群</span>
+                  <span class="chip">部署</span>
+                </div>
+              </div>
+            </aside>
+
+            <section class="panel fact-workbench">
+              <div class="panel-head">
+                <div>
+                  <h3>事实工作台</h3>
+                  <p>事实按类型分栏，展示结论、来源、置信度和关联人物。</p>
+                </div>
+                <input class="search" placeholder="搜索事实内容" />
+              </div>
+              <div class="fact-lanes">
+                <section class="lane">
+                  <h4>群共识</h4>
+                  <div class="lane-list">
+                    <article class="fact-card">
+                      <strong>群里正在测试微信容器与 AI 记忆库的联动。</strong>
+                      <p>讨论重点是聊天记录同步、增量入库、长期事实和后续自动回复。</p>
+                      <div class="fact-meta"><span>置信度 96%</span><span>12 条证据</span></div>
+                    </article>
+                    <article class="fact-card">
+                      <strong>8078 是统一控制台入口。</strong>
+                      <p>8080 和 8079 已被合并进统一页面，不再作为独立入口保留。</p>
+                      <div class="fact-meta"><span>置信度 98%</span><span>8 条证据</span></div>
+                    </article>
+                  </div>
+                </section>
+                <section class="lane">
+                  <h4>人物事实</h4>
+                  <div class="lane-list">
+                    <article class="fact-card">
+                      <strong>用户偏好直接、清晰、可视化的管理页面。</strong>
+                      <p>多次强调 UI 不能乱，图谱不能遮挡，人物画像要按人组织。</p>
+                      <div class="fact-meta"><span>置信度 94%</span><span>16 条证据</span></div>
+                    </article>
+                    <article class="fact-card">
+                      <strong>用户希望机器人群聊接话更积极。</strong>
+                      <p>评分策略应减少沉默负分，但仍要像人一样自然介入。</p>
+                      <div class="fact-meta"><span>置信度 91%</span><span>9 条证据</span></div>
+                    </article>
+                  </div>
+                </section>
+                <section class="lane">
+                  <h4>项目资料</h4>
+                  <div class="lane-list">
+                    <article class="fact-card">
+                      <strong>原始微信数据只读，派生数据写入 runtime。</strong>
+                      <p>系统不得修改微信原始数据库和元数据，降低封号风险。</p>
+                      <div class="fact-meta"><span>置信度 99%</span><span>14 条证据</span></div>
+                    </article>
+                    <article class="fact-card">
+                      <strong>当前不启用自动发送。</strong>
+                      <p>回复功能暂时只做预览和评分，不向微信客户端提交消息。</p>
+                      <div class="fact-meta"><span>置信度 97%</span><span>7 条证据</span></div>
+                    </article>
+                  </div>
+                </section>
+              </div>
+            </section>
+
+            <aside class="panel">
+              <div class="panel-head">
+                <div>
+                  <h3>证据链</h3>
+                  <p>事实卡选中后显示可回溯消息。</p>
+                </div>
+              </div>
+              <div class="evidence">
+                <div class="quote">“8080 不做任何其他功能了，他的作用只是我来查看目前聊天记录的。”<span>用户 · 2026-06-14</span></div>
+                <div class="quote">“都完整合并到 http://localhost:8078/ 里啊。”<span>用户 · 2026-06-14</span></div>
+                <div class="quote">“不要影响元数据，这样会被封号的风险。”<span>用户 · 2026-06-14</span></div>
+              </div>
+            </aside>
+          </div>
+        </section>
+
+        <section class="page" data-page="memory">
+          <div class="memory-layout">
+            <section class="panel story-board">
+              <div class="panel-head">
+                <div>
+                  <h3>群记忆时间线</h3>
+                  <p>把零散聊天整理成可读故事线，摘要、人物和事实互相引用。</p>
+                </div>
+                <div class="tag-row">
+                  <span class="chip green">今天</span>
+                  <span class="chip">近 7 天</span>
+                  <span class="chip">全部</span>
+                </div>
+              </div>
+              <div class="story-list">
+                <article class="story">
+                  <div class="story-time"><strong>21:40</strong><span>展示重构</span></div>
+                  <div class="story-content">
+                    <h4>从全局图谱改为结构化记忆页面</h4>
+                    <p>用户指出全量知识图谱过乱，要求人物、事实和标签独立组织，成员画像以卡片方式展示，关系图只作为聚焦视图。</p>
+                    <div class="tag-row"><span class="chip green">人物画像</span><span class="chip blue">事实库</span><span class="chip amber">关系视图</span></div>
+                  </div>
+                </article>
+                <article class="story">
+                  <div class="story-time"><strong>20:58</strong><span>接话策略</span></div>
+                  <div class="story-content">
+                    <h4>评分策略更积极但保持自然</h4>
+                    <p>对需要回答的问题提高接话倾向，减少“沉默负分”，长期事实自动判断入库，不再要求人工审核。</p>
+                    <div class="tag-row"><span class="chip rose">接话评分</span><span class="chip green">自动事实</span></div>
+                  </div>
+                </article>
+                <article class="story">
+                  <div class="story-time"><strong>19:30</strong><span>统一控制台</span></div>
+                  <div class="story-content">
+                    <h4>8078 成为唯一后台入口</h4>
+                    <p>聊天记录、服务状态、模型配置、人格、接话、记忆和测试都合并到统一菜单，8080 与 8079 不再作为独立页面存在。</p>
+                    <div class="tag-row"><span class="chip blue">服务状态</span><span class="chip amber">聊天记录</span></div>
+                  </div>
+                </article>
+              </div>
+            </section>
+            <aside class="panel">
+              <div class="panel-head">
+                <div>
+                  <h3>标签索引</h3>
+                  <p>全部标签按语义分组，不再铺满画布。</p>
+                </div>
+              </div>
+              <div class="tags-panel">
+                <section class="tag-group">
+                  <h4>人物</h4>
+                  <div class="tag-row"><span class="chip green">阿明</span><span class="chip">小周</span><span class="chip">老李</span><span class="chip">产品同学</span></div>
+                </section>
+                <section class="tag-group">
+                  <h4>主题</h4>
+                  <div class="tag-row"><span class="chip blue">Docker</span><span class="chip blue">微信数据</span><span class="chip blue">LLM</span><span class="chip blue">UI 重构</span></div>
+                </section>
+                <section class="tag-group">
+                  <h4>事实类型</h4>
+                  <div class="tag-row"><span class="chip amber">项目约束</span><span class="chip amber">用户偏好</span><span class="chip amber">运行状态</span></div>
+                </section>
+                <section class="tag-group">
+                  <h4>风险</h4>
+                  <div class="tag-row"><span class="chip rose">原始库只读</span><span class="chip rose">不自动发送</span><span class="chip rose">账号安全</span></div>
+                </section>
+              </div>
+            </aside>
+          </div>
+        </section>
+
+        <section class="page" data-page="relations">
+          <div class="relation-layout">
+            <aside class="panel">
+              <div class="panel-head">
+                <div>
+                  <h3>聚焦对象</h3>
+                  <p>每次只看一个对象的关系。</p>
+                </div>
+              </div>
+              <div class="focus-list">
+                <div class="focus-item active"><div class="avatar">明</div><div><strong>阿明</strong><span>12 个关系节点</span></div></div>
+                <div class="focus-item"><div class="avatar blue">周</div><div><strong>小周</strong><span>9 个关系节点</span></div></div>
+                <div class="focus-item"><div class="avatar amber">群</div><div><strong>测试群</strong><span>31 个关系节点</span></div></div>
+                <div class="focus-item"><div class="avatar rose">项</div><div><strong>AI 记忆项目</strong><span>18 个关系节点</span></div></div>
+              </div>
+            </aside>
+
+            <section class="panel relation-map">
+              <div class="panel-head">
+                <div>
+                  <h3>关系视图</h3>
+                  <p>固定分区布局，节点不会互相遮挡。</p>
+                </div>
+                <div class="top-actions">
+                  <button class="icon-btn" type="button" aria-label="缩小">-</button>
+                  <button class="btn" type="button">复位</button>
+                  <button class="icon-btn" type="button" aria-label="放大">+</button>
+                </div>
+              </div>
+              <div class="map-canvas">
+                <svg viewBox="0 0 760 560" preserveAspectRatio="none" aria-hidden="true">
+                  <path d="M382 280 C260 130 180 118 92 98" stroke="rgba(116,224,176,0.62)" stroke-width="2" fill="none" />
+                  <path d="M382 280 C272 234 198 236 96 238" stroke="rgba(140,167,255,0.62)" stroke-width="2" fill="none" />
+                  <path d="M382 280 C270 420 184 432 92 450" stroke="rgba(241,195,107,0.62)" stroke-width="2" fill="none" />
+                  <path d="M382 280 C498 138 590 126 668 98" stroke="rgba(116,224,176,0.62)" stroke-width="2" fill="none" />
+                  <path d="M382 280 C516 272 594 274 670 276" stroke="rgba(140,167,255,0.62)" stroke-width="2" fill="none" />
+                  <path d="M382 280 C498 424 590 434 670 456" stroke="rgba(239,141,154,0.62)" stroke-width="2" fill="none" />
+                </svg>
+                <div class="map-node center pulse" style="left: calc(50% - 82px); top: calc(50% - 38px);"><strong>阿明</strong><span>活跃提问者 · 偏执行落地</span></div>
+                <div class="map-node" style="left: 36px; top: 48px;"><strong>UI 重构</strong><span>强关联主题</span></div>
+                <div class="map-node" style="left: 40px; top: 220px;"><strong>接话策略</strong><span>历史偏好</span></div>
+                <div class="map-node" style="left: 38px; bottom: 46px;"><strong>账号安全</strong><span>关键约束</span></div>
+                <div class="map-node" style="right: 34px; top: 50px;"><strong>小周</strong><span>共同讨论者</span></div>
+                <div class="map-node" style="right: 36px; top: 258px;"><strong>8078 控制台</strong><span>项目对象</span></div>
+                <div class="map-node" style="right: 34px; bottom: 40px;"><strong>不自动发送</strong><span>事实约束</span></div>
+              </div>
+            </section>
+
+            <aside class="panel">
+              <div class="panel-head">
+                <div>
+                  <h3>关系摘要</h3>
+                  <p>选中对象的一跳关系和证据。</p>
+                </div>
+              </div>
+              <div class="detail-body">
+                <section class="section">
+                  <h4>核心画像</h4>
+                  <p>阿明在群里主要推动“能不能落地”和“页面是否好用”的讨论，偏好可视化、可验证、低风险的方案。</p>
+                </section>
+                <section class="section">
+                  <h4>强关系</h4>
+                  <div class="tag-row"><span class="chip green">UI 重构</span><span class="chip blue">接话评分</span><span class="chip amber">记忆入库</span><span class="chip rose">元数据风险</span></div>
+                </section>
+                <section class="section">
+                  <h4>事实连接</h4>
+                  <div class="timeline">
+                    <div class="event"><strong>要求人物卡片独立展示</strong><span>来自 3 条连续反馈</span></div>
+                    <div class="event"><strong>要求事实按类型整理</strong><span>来自知识图谱混乱反馈</span></div>
+                    <div class="event"><strong>要求关系图可缩放拖拽</strong><span>来自节点遮挡反馈</span></div>
+                  </div>
+                </section>
+              </div>
+            </aside>
+          </div>
+        </section>
+      </main>
+    </div>
+
+    <script>
+      const profiles = [
+        {
+          id: "aming",
+          name: "阿明",
+          role: "活跃提问者",
+          avatar: "明",
+          color: "",
+          score: "96%",
+          traits: ["直接", "重视落地", "视觉敏感"],
+          tags: ["UI 重构", "账号安全", "记忆库"],
+          summary: "持续推动项目从能跑走向好用，关注页面清晰度、封号风险和数据互通。",
+          messages: "146 条",
+          last: "3 分钟前",
+          detail: {
+            tone: "表达直接，反馈密度高，偏好立刻看到可操作结果。",
+            preference: "喜欢统一入口、结构清楚、能展开细节的页面；不接受全量节点混杂展示。",
+            storyline: [
+              ["统一入口", "要求 8080/8079 并入 8078"],
+              ["记忆增强", "要求长期事实自动入库"],
+              ["展示重构", "要求人物画像按人形成卡片"]
+            ],
+            facts: ["原始微信数据必须只读", "当前阶段不启用自动发送", "接话策略需要更积极但自然"]
+          }
+        },
+        {
+          id: "xiaozhou",
+          name: "小周",
+          role: "技术讨论者",
+          avatar: "周",
+          color: "blue",
+          score: "88%",
+          traits: ["谨慎", "偏技术", "常补充上下文"],
+          tags: ["Docker", "同步链路", "日志"],
+          summary: "经常围绕服务状态、容器链路和日志证据参与讨论。",
+          messages: "82 条",
+          last: "18 分钟前",
+          detail: {
+            tone: "偏理性，喜欢用状态和日志判断问题。",
+            preference: "希望服务状态能明确显示容器、端口、同步和索引差值。",
+            storyline: [["服务状态", "推动统一状态页面"], ["聊天同步", "关注增量同步是否漏消息"], ["模型自检", "关注 LLM 通断检测"]],
+            facts: ["服务状态需要覆盖全部容器", "聊天记录最新消息要在最上方", "LLM 配置需要保存和自检"]
+          }
+        },
+        {
+          id: "laoli",
+          name: "老李",
+          role: "风险提醒者",
+          avatar: "李",
+          color: "amber",
+          score: "81%",
+          traits: ["稳健", "关注风险", "少量高质量发言"],
+          tags: ["封号风险", "只读", "备份"],
+          summary: "重点提醒不能改动微信原始库和元数据，强调可回滚和只读链路。",
+          messages: "41 条",
+          last: "1 小时前",
+          detail: {
+            tone: "短句为主，通常直接指出风险点。",
+            preference: "偏好先验证、再上线，不希望影响微信登录状态。",
+            storyline: [["账号安全", "多次强调不要触碰元数据"], ["数据链路", "建议派生库独立保存"], ["部署", "关注容器重启影响"]],
+            facts: ["微信容器不应随意重启", "派生数据库位于 runtime", "聊天同步应避免阻塞微信进程"]
+          }
+        },
+        {
+          id: "chanpin",
+          name: "产品同学",
+          role: "体验整理者",
+          avatar: "产",
+          color: "rose",
+          score: "79%",
+          traits: ["注重体验", "善于归纳", "关注操作路径"],
+          tags: ["菜单", "页面布局", "信息架构"],
+          summary: "把功能拆成菜单和页面流程，关注用户是否一眼看懂。",
+          messages: "37 条",
+          last: "2 小时前",
+          detail: {
+            tone: "常用对比和分组说明问题。",
+            preference: "喜欢菜单稳定、内容分区明确、操作入口不混乱。",
+            storyline: [["控制台", "建议多菜单管理模型、人格和记忆"], ["图谱", "建议从全局改成聚焦"], ["事实库", "建议分类和证据链"]],
+            facts: ["人物画像要独立展示", "事实要能搜索过滤", "标签要按语义分组"]
+          }
+        },
+        {
+          id: "yunwei",
+          name: "运维",
+          role: "部署维护者",
+          avatar: "维",
+          color: "blue",
+          score: "74%",
+          traits: ["看指标", "重稳定", "偏自动化"],
+          tags: ["容器", "端口", "健康检查"],
+          summary: "关心 Docker 服务是否自启动、健康检查是否直观、端口是否统一。",
+          messages: "29 条",
+          last: "昨天",
+          detail: {
+            tone: "偏命令和指标，少闲聊。",
+            preference: "希望一页能看到容器、端口、索引、媒体同步和 LLM 状态。",
+            storyline: [["Docker", "确认 ARM64 可运行"], ["服务合并", "去掉独立 8080/8079"], ["状态页", "补齐服务状态卡片"]],
+            facts: ["8078 是统一入口", "服务列表应显示 wechat-selkies", "AI 记忆和聊天同步需要健康状态"]
+          }
+        },
+        {
+          id: "ceshi",
+          name: "测试",
+          role: "边界验证者",
+          avatar: "测",
+          color: "",
+          score: "72%",
+          traits: ["找问题", "截屏反馈", "追求一致"],
+          tags: ["图片表情", "引用消息", "刷新"],
+          summary: "通过截图反馈页面兼容问题，包括表情、图片、引用消息和最新消息排序。",
+          messages: "33 条",
+          last: "昨天",
+          detail: {
+            tone: "以问题清单为主，常附带截图。",
+            preference: "希望聊天记录展示和真实微信尽量一致。",
+            storyline: [["媒体兼容", "反馈表情图片无法显示"], ["引用解析", "反馈引用消息显示异常"], ["自动刷新", "要求最新消息在上方"]],
+            facts: ["图片和斗图需要兼容", "引用消息不能简化成文件链接", "聊天查看需要自动刷新"]
+          }
+        }
+      ];
+
+      const grid = document.getElementById("profileGrid");
+      const detail = document.getElementById("profileDetail");
+      const detailHint = document.getElementById("detailHint");
+
+      function renderGrid(activeId = profiles[0].id) {
+        grid.innerHTML = profiles.map((item) => `
+          <button class="person-card ${item.id === activeId ? "active" : ""}" type="button" data-person="${item.id}">
+            <div class="person-top">
+              <div class="avatar ${item.color}">${item.avatar}</div>
+              <div><strong>${item.name}</strong><span>${item.role}</span></div>
+              <div class="score">${item.score}</div>
+            </div>
+            <div class="trait-row">${item.traits.map((trait) => `<span class="chip green">${trait}</span>`).join("")}</div>
+            <p>${item.summary}</p>
+            <div>
+              <div class="tag-row">${item.tags.map((tag, index) => `<span class="chip ${index === 0 ? "blue" : index === 1 ? "amber" : ""}">${tag}</span>`).join("")}</div>
+              <div class="person-meta"><span>${item.messages}</span><span>${item.last}</span></div>
+            </div>
+          </button>
+        `).join("");
+      }
+
+      function renderDetail(id) {
+        const item = profiles.find((profile) => profile.id === id) || profiles[0];
+        detailHint.textContent = `当前选中：${item.name}`;
+        detail.innerHTML = `
+          <section class="section">
+            <div class="profile-hero">
+              <div class="avatar ${item.color}">${item.avatar}</div>
+              <div>
+                <h3>${item.name}</h3>
+                <p>${item.role} · 画像置信度 ${item.score}</p>
+              </div>
+            </div>
+          </section>
+          <section class="section">
+            <h4>核心画像</h4>
+            <p>${item.summary}</p>
+          </section>
+          <section class="section">
+            <h4>属性</h4>
+            <div class="kv">
+              <div><span>发言风格</span><strong>${item.detail.tone}</strong></div>
+              <div><span>偏好</span><strong>${item.detail.preference}</strong></div>
+              <div><span>消息量</span><strong>${item.messages}</strong></div>
+              <div><span>最近活跃</span><strong>${item.last}</strong></div>
+            </div>
+          </section>
+          <section class="section">
+            <h4>故事线</h4>
+            <div class="timeline">${item.detail.storyline.map((event) => `<div class="event"><strong>${event[0]}</strong><span>${event[1]}</span></div>`).join("")}</div>
+          </section>
+          <section class="section">
+            <h4>关联事实</h4>
+            <div class="tag-row">${item.detail.facts.map((fact, index) => `<span class="chip ${index === 0 ? "green" : index === 1 ? "blue" : "amber"}">${fact}</span>`).join("")}</div>
+          </section>
+          <section class="section">
+            <h4>证据片段</h4>
+            <div class="quote">“页面不要乱，每个人都应该有自己的画像卡片。”<span>${item.name} 相关证据 · 样例</span></div>
+          </section>
+        `;
+      }
+
+      renderGrid();
+      renderDetail(profiles[0].id);
+
+      grid.addEventListener("click", (event) => {
+        const card = event.target.closest("[data-person]");
+        if (!card) return;
+        renderGrid(card.dataset.person);
+        renderDetail(card.dataset.person);
+      });
+
+      const tabTitles = {
+        people: ["人物画像墙", "每个成员独立成卡，点开后看性格、偏好、故事线、证据和关联事实。"],
+        facts: ["事实库", "事实按类型分栏，保留置信度、证据链、关联人物和冲突状态。"],
+        memory: ["群记忆时间线", "把聊天历史整理成按时间推进的群故事，标签只作为索引辅助。"],
+        relations: ["聚焦关系视图", "关系图只展示选中对象周边，不再把全部节点同时铺开。"]
+      };
+
+      document.querySelector(".seg").addEventListener("click", (event) => {
+        const button = event.target.closest("[data-tab]");
+        if (!button) return;
+        document.querySelectorAll(".seg button").forEach((item) => item.classList.toggle("active", item === button));
+        document.querySelectorAll(".page").forEach((page) => page.classList.toggle("active", page.dataset.page === button.dataset.tab));
+        document.getElementById("pageTitle").textContent = tabTitles[button.dataset.tab][0];
+        document.getElementById("pageSubtitle").textContent = tabTitles[button.dataset.tab][1];
+      });
+    </script>
+  </body>
+</html>

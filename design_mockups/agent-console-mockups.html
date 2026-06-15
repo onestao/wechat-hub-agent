@@ -1,0 +1,259 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Agent Console Mockups</title>
+    <style>
+      * { box-sizing: border-box; }
+      body {
+        margin: 0;
+        background: #0b1118;
+        font: 14px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        color: #eaf5f4;
+      }
+      .mockup {
+        width: 1440px;
+        height: 960px;
+        overflow: hidden;
+        position: relative;
+        display: grid;
+        grid-template-columns: 260px 1fr;
+      }
+      h1, h2, h3, p { margin: 0; letter-spacing: 0; }
+      button { font: inherit; }
+      .chip, .pill {
+        display: inline-flex;
+        align-items: center;
+        min-height: 28px;
+        border-radius: 999px;
+        padding: 0 10px;
+        font-size: 12px;
+        font-weight: 800;
+        white-space: nowrap;
+      }
+      .metric-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 14px; }
+      .metric { border-radius: 14px; padding: 16px; }
+      .metric span { display: block; font-size: 12px; opacity: .72; }
+      .metric strong { display: block; margin-top: 6px; font-size: 28px; }
+      .panel { border-radius: 16px; padding: 18px; min-width: 0; }
+      .panel-head { display: flex; justify-content: space-between; gap: 12px; align-items: flex-start; margin-bottom: 14px; }
+      .panel-head p { opacity: .62; margin-top: 3px; }
+      .mode-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; }
+      .mode-card { border-radius: 14px; padding: 14px; min-height: 112px; display: grid; gap: 8px; }
+      .mode-card strong { font-size: 18px; }
+      .mode-card small { opacity: .68; }
+      .threshold { display: flex; justify-content: space-between; align-items: center; }
+      .slider { height: 8px; border-radius: 999px; overflow: hidden; background: rgba(255,255,255,.12); }
+      .slider span { display: block; height: 100%; border-radius: inherit; }
+      .hexgraph {
+        position: relative;
+        height: 398px;
+        border-radius: 18px;
+        overflow: hidden;
+      }
+      .hex {
+        position: absolute;
+        width: 13px;
+        height: 13px;
+        border-radius: 50%;
+        opacity: .72;
+      }
+      .node {
+        position: absolute;
+        display: grid;
+        place-items: center;
+        width: 88px;
+        height: 88px;
+        border-radius: 28px;
+        font-weight: 900;
+        text-align: center;
+        font-size: 13px;
+      }
+      .line {
+        position: absolute;
+        height: 2px;
+        transform-origin: left center;
+      }
+      .memory-card { border-radius: 14px; padding: 14px; display: grid; gap: 8px; }
+      .memory-card p { opacity: .72; }
+
+      /* Option A */
+      .a {
+        background:
+          radial-gradient(circle at 78% 16%, rgba(0,255,204,.25), transparent 28%),
+          radial-gradient(circle at 54% 88%, rgba(74,144,255,.18), transparent 30%),
+          #08111c;
+      }
+      .a .side {
+        padding: 22px;
+        background: rgba(6, 17, 29, .78);
+        border-right: 1px solid rgba(115, 255, 222, .14);
+      }
+      .a .brand { display: flex; align-items: center; gap: 12px; margin-bottom: 26px; }
+      .a .mark { width: 48px; height: 48px; border-radius: 16px; display: grid; place-items: center; background: linear-gradient(135deg, #00f0b5, #2f79ff); color: #031018; font-weight: 1000; }
+      .a .nav { display: grid; gap: 8px; }
+      .a .nav div { border-radius: 12px; padding: 12px 14px; color: #a8bfcb; }
+      .a .nav .on { color: #fff; background: rgba(0, 240, 181, .14); box-shadow: inset 0 0 0 1px rgba(0, 240, 181, .22); }
+      .a .content { padding: 24px; display: grid; grid-template-rows: auto auto 1fr; gap: 16px; }
+      .a .top { display: flex; justify-content: space-between; align-items: center; }
+      .a h1 { font-size: 30px; }
+      .a .panel, .a .metric, .a .mode-card, .a .memory-card {
+        background: rgba(13, 29, 45, .72);
+        border: 1px solid rgba(126, 238, 222, .16);
+        box-shadow: 0 24px 80px rgba(0, 0, 0, .28);
+        backdrop-filter: blur(18px);
+      }
+      .a .metric strong { color: #67ffd4; }
+      .a .mode-card.active { background: linear-gradient(160deg, rgba(0,240,181,.28), rgba(47,121,255,.14)); border-color: rgba(0,240,181,.55); }
+      .a .slider span { background: linear-gradient(90deg, #00f0b5, #48a6ff); }
+      .a .main-grid { display: grid; grid-template-columns: 1.08fr .92fr; gap: 16px; min-height: 0; }
+      .a .hexgraph { background: rgba(2, 10, 18, .56); border: 1px solid rgba(103,255,212,.18); }
+      .a .hex { background: #67ffd4; box-shadow: 0 0 18px #00f0b5; }
+      .a .node { background: linear-gradient(135deg, rgba(0,240,181,.95), rgba(47,121,255,.9)); color: #031018; box-shadow: 0 0 35px rgba(0,240,181,.38); }
+      .a .line { background: linear-gradient(90deg, transparent, rgba(103,255,212,.9), transparent); box-shadow: 0 0 12px rgba(103,255,212,.8); }
+      .a .right-stack { display: grid; gap: 16px; }
+      .a .chip { background: rgba(0,240,181,.14); color: #67ffd4; border: 1px solid rgba(0,240,181,.24); }
+
+      /* Option B */
+      .b { background: #f4f7f8; color: #14202a; }
+      .b .side { background: #15202b; color: #eef6f6; padding: 22px; }
+      .b .brand { margin-bottom: 28px; }
+      .b .mark { width: 44px; height: 44px; border-radius: 10px; background: #10a77a; display: grid; place-items: center; font-weight: 900; margin-bottom: 10px; }
+      .b .nav { display: grid; gap: 8px; }
+      .b .nav div { padding: 11px 12px; border-radius: 8px; color: #b9c6cc; }
+      .b .nav .on { background: #22313e; color: #fff; }
+      .b .content { padding: 22px; display: grid; grid-template-rows: auto auto 1fr; gap: 16px; }
+      .b .top { display: flex; justify-content: space-between; align-items: end; }
+      .b .top p { color: #667684; }
+      .b .panel, .b .metric, .b .mode-card, .b .memory-card {
+        background: #fff;
+        border: 1px solid #dbe4e5;
+        box-shadow: 0 12px 32px rgba(20, 32, 42, .06);
+      }
+      .b .metric strong { color: #0b7d5c; }
+      .b .mode-card.active { border-color: #10a77a; background: #e9f8f2; }
+      .b .slider { background: #edf1f2; }
+      .b .slider span { background: #10a77a; }
+      .b .main-grid { display: grid; grid-template-columns: .96fr 1.04fr; gap: 16px; }
+      .b .table { display: grid; gap: 8px; }
+      .b .row { display: grid; grid-template-columns: 1fr 96px 96px; padding: 12px; border-radius: 10px; background: #f7fafb; color: #43515d; }
+      .b .hexgraph { background: #f8fbfb; border: 1px solid #dbe4e5; }
+      .b .hex { background: #8cc8b7; }
+      .b .node { background: #102a3a; color: #fff; box-shadow: 0 10px 24px rgba(16, 42, 58, .16); }
+      .b .line { background: rgba(16, 167, 122, .45); }
+      .b .chip { background: #e9f8f2; color: #087557; }
+
+      /* Option C */
+      .c {
+        grid-template-columns: 300px 1fr;
+        background:
+          linear-gradient(130deg, rgba(31, 98, 255, .22), transparent 35%),
+          linear-gradient(310deg, rgba(255, 189, 89, .18), transparent 28%),
+          #10151b;
+      }
+      .c .side {
+        padding: 24px;
+        background: rgba(255,255,255,.06);
+        border-right: 1px solid rgba(255,255,255,.12);
+      }
+      .c .brand { margin-bottom: 26px; }
+      .c .mark { width: 56px; height: 56px; border-radius: 20px; display: grid; place-items: center; background: linear-gradient(135deg, #ffbd59, #4f8cff); color: #10151b; font-weight: 1000; margin-bottom: 12px; }
+      .c .nav { display: grid; gap: 10px; }
+      .c .nav div { padding: 13px 14px; border-radius: 14px; background: rgba(255,255,255,.05); color: #b8c7d8; }
+      .c .nav .on { background: rgba(255,189,89,.18); color: #fff; border: 1px solid rgba(255,189,89,.28); }
+      .c .content { padding: 24px; display: grid; grid-template-rows: auto auto 1fr; gap: 16px; }
+      .c .top { display: flex; justify-content: space-between; align-items: center; }
+      .c .top h1 { font-size: 28px; }
+      .c .panel, .c .metric, .c .mode-card, .c .memory-card {
+        background: rgba(255,255,255,.08);
+        border: 1px solid rgba(255,255,255,.12);
+        box-shadow: 0 24px 70px rgba(0,0,0,.24);
+      }
+      .c .metric strong { color: #ffcf7b; }
+      .c .mode-card.active { background: rgba(255,189,89,.18); border-color: rgba(255,189,89,.4); }
+      .c .slider span { background: linear-gradient(90deg, #ffbd59, #4f8cff); }
+      .c .main-grid { display: grid; grid-template-columns: .74fr 1.26fr; gap: 16px; }
+      .c .hexgraph { background: rgba(3,8,14,.48); border: 1px solid rgba(255,255,255,.12); }
+      .c .hex { background: #ffbd59; box-shadow: 0 0 16px rgba(255,189,89,.75); }
+      .c .node { background: linear-gradient(135deg, #ffbd59, #4f8cff); color: #081018; box-shadow: 0 0 35px rgba(79,140,255,.42); }
+      .c .line { background: linear-gradient(90deg, transparent, rgba(255,189,89,.85), transparent); box-shadow: 0 0 12px rgba(255,189,89,.55); }
+      .c .persona { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
+      .c .chip { background: rgba(255,189,89,.16); color: #ffcf7b; }
+
+      .preview-label {
+        position: absolute;
+        right: 22px;
+        bottom: 18px;
+        opacity: .42;
+        font-size: 12px;
+      }
+    </style>
+  </head>
+  <body>
+    <section id="option-a" class="mockup a">
+      <aside class="side">
+        <div class="brand"><div class="mark">微</div><div><h2>Agent Core</h2><p>微信群 AI 控制台</p></div></div>
+        <div class="nav"><div class="on">总览</div><div>模型配置</div><div>人格设定</div><div>接话策略</div><div>蜂窝记忆图谱</div><div>模型测试</div></div>
+      </aside>
+      <main class="content">
+        <div class="top"><div><h1>智能接话中枢</h1><p>四模式接话、长期记忆、蜂窝知识图谱</p></div><span class="pill" style="background:#eafff8;color:#046b4e">DeepSeek 连通 · 3.4s</span></div>
+        <div class="metric-grid">
+          <div class="metric"><span>消息索引</span><strong>348 / 348</strong></div><div class="metric"><span>群摘要</span><strong>1</strong></div><div class="metric"><span>人物偏好</span><strong>0</strong></div><div class="metric"><span>关系边</span><strong>0</strong></div>
+        </div>
+        <div class="main-grid">
+          <section class="panel">
+            <div class="panel-head"><div><h3>接话模式</h3><p>预设阈值可直接选择，也可切到自定义</p></div><span class="chip">自定义阈值 50</span></div>
+            <div class="mode-grid">
+              <div class="mode-card"><div class="threshold"><strong>安静</strong><span>75</span></div><div class="slider"><span style="width:75%"></span></div><small>只在强召唤时接话</small></div>
+              <div class="mode-card active"><div class="threshold"><strong>正常</strong><span>50</span></div><div class="slider"><span style="width:50%"></span></div><small>群里自然辅助</small></div>
+              <div class="mode-card"><div class="threshold"><strong>活跃</strong><span>35</span></div><div class="slider"><span style="width:35%"></span></div><small>更主动承接冷场</small></div>
+              <div class="mode-card"><div class="threshold"><strong>发疯</strong><span>20</span></div><div class="slider"><span style="width:20%"></span></div><small>高参与，娱乐向</small></div>
+            </div>
+            <div class="hexgraph" style="margin-top:16px">
+              <script></script>
+              <div class="line" style="left:312px;top:194px;width:210px;transform:rotate(-22deg)"></div><div class="line" style="left:512px;top:114px;width:168px;transform:rotate(48deg)"></div><div class="line" style="left:348px;top:282px;width:250px;transform:rotate(-4deg)"></div>
+              <div class="node" style="left:274px;top:154px">群摘要</div><div class="node" style="left:520px;top:82px">人物偏好</div><div class="node" style="left:610px;top:244px">知识节点</div><div class="node" style="left:378px;top:294px">长期事实</div>
+              <div class="hex" style="left:70px;top:56px"></div><div class="hex" style="left:112px;top:92px"></div><div class="hex" style="left:158px;top:72px"></div><div class="hex" style="left:202px;top:112px"></div><div class="hex" style="left:242px;top:64px"></div><div class="hex" style="left:720px;top:72px"></div><div class="hex" style="left:774px;top:118px"></div><div class="hex" style="left:820px;top:82px"></div><div class="hex" style="left:160px;top:320px"></div><div class="hex" style="left:208px;top:356px"></div><div class="hex" style="left:760px;top:330px"></div>
+            </div>
+          </section>
+          <aside class="right-stack">
+            <section class="panel"><div class="panel-head"><h3>人格预设</h3><span class="chip">实时生效</span></div><div class="memory-card"><strong>低打扰但会玩梗</strong><p>谨慎回答，参考群记忆；可以使用微信表情语气，但不编造事实。</p></div></section>
+            <section class="panel"><div class="panel-head"><h3>记忆卡片</h3><span class="chip">可审阅</span></div><div class="memory-card"><strong>PT站看片狂魔小群</strong><p>对话围绕投注盈亏、比分接口、IPTV 源需求以及群内互动。</p><div><span class="chip">博彩投注</span> <span class="chip">世界杯</span> <span class="chip">IPTV源</span></div></div></section>
+          </aside>
+        </div>
+      </main>
+      <span class="preview-label">方案 A · 深色蜂窝中枢</span>
+    </section>
+
+    <section id="option-b" class="mockup b">
+      <aside class="side"><div class="brand"><div class="mark">微</div><h2>Agent Console</h2><p>运行、配置、记忆审阅</p></div><div class="nav"><div class="on">Dashboard</div><div>LLM Profiles</div><div>Personality</div><div>Talk Policy</div><div>Memory Graph</div><div>Service Status</div></div></aside>
+      <main class="content">
+        <div class="top"><div><h1>群聊智能体后台</h1><p>清晰、稳定、适合长期运维的专业控制台</p></div><span class="pill" style="background:#e9f8f2;color:#087557">所有服务运行中</span></div>
+        <div class="metric-grid"><div class="metric"><span>消息</span><strong>348</strong></div><div class="metric"><span>向量</span><strong>348</strong></div><div class="metric"><span>摘要</span><strong>1</strong></div><div class="metric"><span>自检</span><strong>正常</strong></div></div>
+        <div class="main-grid">
+          <section class="panel">
+            <div class="panel-head"><div><h3>四模式接话策略</h3><p>预设模式可一键切换，自定义模式可编辑阈值、间隔和上限</p></div><span class="chip">当前：正常</span></div>
+            <div class="mode-grid"><div class="mode-card"><strong>安静</strong><div class="slider"><span style="width:75%"></span></div><small>阈值 75</small></div><div class="mode-card active"><strong>正常</strong><div class="slider"><span style="width:50%"></span></div><small>阈值 50</small></div><div class="mode-card"><strong>活跃</strong><div class="slider"><span style="width:35%"></span></div><small>阈值 35</small></div><div class="mode-card"><strong>自定义</strong><div class="slider"><span style="width:62%"></span></div><small>阈值 62</small></div></div>
+            <div class="table" style="margin-top:14px"><div class="row"><strong>显式 @ 机器人</strong><span>+100</span><span>强触发</span></div><div class="row"><strong>需要群记忆接话</strong><span>+20</span><span>辅助</span></div><div class="row"><strong>争吵/隐私/资金</strong><span>静默</span><span>安全</span></div></div>
+          </section>
+          <section class="panel"><div class="panel-head"><h3>蜂窝知识图谱</h3><span class="chip">可缩放 / 可筛选</span></div><div class="hexgraph"><div class="line" style="left:235px;top:175px;width:250px;transform:rotate(-18deg)"></div><div class="line" style="left:470px;top:96px;width:200px;transform:rotate(38deg)"></div><div class="line" style="left:250px;top:286px;width:300px;transform:rotate(-6deg)"></div><div class="node" style="left:196px;top:138px">群摘要</div><div class="node" style="left:476px;top:58px">人物</div><div class="node" style="left:610px;top:194px">偏好</div><div class="node" style="left:350px;top:294px">事实</div><div class="hex" style="left:70px;top:70px"></div><div class="hex" style="left:118px;top:110px"></div><div class="hex" style="left:164px;top:78px"></div><div class="hex" style="left:720px;top:84px"></div><div class="hex" style="left:772px;top:128px"></div><div class="hex" style="left:750px;top:330px"></div></div></section>
+        </div>
+      </main>
+      <span class="preview-label">方案 B · 专业运维控制台</span>
+    </section>
+
+    <section id="option-c" class="mockup c">
+      <aside class="side"><div class="brand"><div class="mark">AI</div><h2>Memory Nexus</h2><p>群记忆与人格调度台</p></div><div class="nav"><div class="on">记忆中枢</div><div>接话模式</div><div>人格剧本</div><div>模型路由</div><div>审阅队列</div><div>服务健康</div></div></aside>
+      <main class="content">
+        <div class="top"><div><h1>记忆驱动的微信群 Agent</h1><p>让群摘要、人物偏好、事实和图谱一起参与回答</p></div><span class="pill" style="background:rgba(255,189,89,.18);color:#ffcf7b">记忆抽取 · 已启用</span></div>
+        <div class="metric-grid"><div class="metric"><span>当前模式</span><strong>正常</strong></div><div class="metric"><span>人格预设</span><strong>调皮</strong></div><div class="metric"><span>群摘要</span><strong>1</strong></div><div class="metric"><span>待审事实</span><strong>0</strong></div></div>
+        <div class="main-grid">
+          <section class="panel"><div class="panel-head"><h3>人格与接话预设</h3><span class="chip">可自定义</span></div><div class="persona"><div class="mode-card active"><strong>正常</strong><small>阈值 50</small><div class="slider"><span style="width:50%"></span></div></div><div class="mode-card"><strong>活跃</strong><small>阈值 35</small><div class="slider"><span style="width:35%"></span></div></div><div class="mode-card"><strong>调皮人格</strong><small>允许表情、玩梗</small></div><div class="mode-card"><strong>自定义</strong><small>自己写规则和阈值</small></div></div><div class="memory-card" style="margin-top:14px"><strong>自动判定</strong><p>显式 @、求助、需要记忆、图片解析完成会加分；隐私、资金、账号、争吵会静默。</p></div></section>
+          <section class="panel"><div class="panel-head"><h3>点阵蜂窝关系图</h3><span class="chip">效果重点</span></div><div class="hexgraph"><div class="line" style="left:260px;top:192px;width:292px;transform:rotate(-25deg)"></div><div class="line" style="left:526px;top:78px;width:220px;transform:rotate(50deg)"></div><div class="line" style="left:310px;top:292px;width:322px;transform:rotate(-3deg)"></div><div class="line" style="left:648px;top:246px;width:190px;transform:rotate(33deg)"></div><div class="node" style="left:232px;top:154px">群摘要</div><div class="node" style="left:548px;top:54px">人物偏好</div><div class="node" style="left:700px;top:220px">知识图谱</div><div class="node" style="left:388px;top:304px">长期事实</div><div class="node" style="left:842px;top:338px">回答策略</div><div class="hex" style="left:92px;top:60px"></div><div class="hex" style="left:142px;top:102px"></div><div class="hex" style="left:196px;top:62px"></div><div class="hex" style="left:248px;top:110px"></div><div class="hex" style="left:800px;top:72px"></div><div class="hex" style="left:848px;top:120px"></div><div class="hex" style="left:910px;top:92px"></div><div class="hex" style="left:160px;top:338px"></div><div class="hex" style="left:220px;top:382px"></div><div class="hex" style="left:956px;top:360px"></div></div></section>
+        </div>
+      </main>
+      <span class="preview-label">方案 C · 记忆中枢大屏</span>
+    </section>
+  </body>
+</html>

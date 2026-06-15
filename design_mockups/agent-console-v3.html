@@ -1,0 +1,460 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Agent Console V3</title>
+    <style>
+      * { box-sizing: border-box; }
+      body {
+        margin: 0;
+        width: 1440px;
+        height: 960px;
+        overflow: hidden;
+        color: #eff3f7;
+        background: #090d12;
+        font: 14px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      }
+      h1, h2, h3, p { margin: 0; letter-spacing: 0; }
+      .screen {
+        width: 1440px;
+        height: 960px;
+        display: grid;
+        grid-template-columns: 246px minmax(0, 1fr);
+        background:
+          radial-gradient(circle at 78% 14%, rgba(123, 141, 255, .12), transparent 26%),
+          radial-gradient(circle at 70% 88%, rgba(45, 211, 161, .08), transparent 30%),
+          linear-gradient(180deg, #111820 0%, #0a0e13 74%);
+      }
+      .sidebar {
+        padding: 22px;
+        border-right: 1px solid rgba(255,255,255,.075);
+        background: rgba(255,255,255,.025);
+        display: grid;
+        grid-template-rows: auto auto 1fr auto;
+        gap: 22px;
+      }
+      .brand {
+        display: flex;
+        gap: 12px;
+        align-items: center;
+      }
+      .logo {
+        width: 44px;
+        height: 44px;
+        border-radius: 14px;
+        display: grid;
+        place-items: center;
+        color: #07110e;
+        font-weight: 950;
+        background: linear-gradient(145deg, #edf1f7, #8fb0ff 52%, #79f0cc);
+      }
+      .brand h1 { font-size: 20px; }
+      .brand p, .muted { color: #778391; }
+      .nav { display: grid; gap: 7px; }
+      .nav button {
+        border: 0;
+        min-height: 42px;
+        border-radius: 12px;
+        padding: 0 12px;
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        background: transparent;
+        color: #929eab;
+        font: inherit;
+        text-align: left;
+      }
+      .nav button.active {
+        background: rgba(255,255,255,.075);
+        color: #fff;
+        box-shadow: inset 0 0 0 1px rgba(255,255,255,.075);
+      }
+      .nav span {
+        min-width: 22px;
+        min-height: 22px;
+        border-radius: 999px;
+        display: grid;
+        place-items: center;
+        background: rgba(255,255,255,.07);
+        color: #aab4c0;
+        font-size: 12px;
+        font-weight: 800;
+      }
+      .nav button.active span {
+        background: #9bf4d2;
+        color: #07110e;
+      }
+      .group-card {
+        border-radius: 18px;
+        padding: 14px;
+        background: rgba(255,255,255,.055);
+        border: 1px solid rgba(255,255,255,.075);
+      }
+      .group-card strong, .group-card span { display: block; }
+      .group-card span { color: #8793a1; margin-top: 4px; }
+      .main {
+        min-width: 0;
+        padding: 22px;
+        display: grid;
+        grid-template-rows: auto auto minmax(0, 1fr);
+        gap: 14px;
+      }
+      .topbar {
+        min-height: 72px;
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 16px;
+      }
+      .topbar h2 {
+        font-size: 30px;
+        line-height: 1.1;
+      }
+      .topbar p {
+        margin-top: 6px;
+        color: #7c8896;
+      }
+      .top-actions { display: flex; gap: 10px; }
+      .btn {
+        height: 38px;
+        border-radius: 12px;
+        border: 1px solid rgba(255,255,255,.12);
+        background: rgba(255,255,255,.065);
+        color: #eff3f7;
+        padding: 0 14px;
+        display: inline-flex;
+        align-items: center;
+        font-weight: 800;
+      }
+      .btn.primary {
+        border-color: #9bf4d2;
+        background: #9bf4d2;
+        color: #06100d;
+      }
+      .status-grid {
+        display: grid;
+        grid-template-columns: 1.25fr repeat(3, minmax(0, 1fr));
+        gap: 12px;
+      }
+      .card {
+        border: 1px solid rgba(255,255,255,.08);
+        border-radius: 18px;
+        background: rgba(255,255,255,.052);
+        box-shadow: 0 24px 60px rgba(0,0,0,.28);
+      }
+      .stat {
+        min-height: 86px;
+        padding: 15px;
+        display: grid;
+        align-content: space-between;
+      }
+      .stat label {
+        color: #7f8b99;
+        font-size: 12px;
+        font-weight: 800;
+      }
+      .stat strong {
+        display: block;
+        margin-top: 4px;
+        font-size: 26px;
+      }
+      .stat small { color: #8d98a6; }
+      .work {
+        min-height: 0;
+        display: grid;
+        grid-template-columns: minmax(0, 1fr) 354px;
+        gap: 14px;
+      }
+      .graph-panel {
+        min-height: 0;
+        position: relative;
+        overflow: hidden;
+        padding: 17px;
+      }
+      .panel-head {
+        display: flex;
+        justify-content: space-between;
+        gap: 12px;
+        align-items: flex-start;
+        position: relative;
+        z-index: 3;
+      }
+      .panel-head p {
+        margin-top: 4px;
+        color: #7e8997;
+      }
+      .filter-row {
+        display: flex;
+        gap: 8px;
+        flex-wrap: wrap;
+        justify-content: flex-end;
+      }
+      .pill {
+        min-height: 28px;
+        border-radius: 999px;
+        display: inline-flex;
+        align-items: center;
+        padding: 0 10px;
+        background: rgba(255,255,255,.07);
+        color: #98a4b2;
+        font-size: 12px;
+        font-weight: 850;
+      }
+      .pill.on {
+        color: #06100d;
+        background: #9bf4d2;
+      }
+      .graph {
+        position: absolute;
+        left: 17px;
+        right: 17px;
+        top: 92px;
+        bottom: 17px;
+        border-radius: 18px;
+        overflow: hidden;
+        background:
+          radial-gradient(circle, rgba(155,244,210,.18) 0 2px, transparent 2.8px) 0 0 / 42px 36px,
+          radial-gradient(circle, rgba(155,244,210,.10) 0 1.8px, transparent 2.6px) 21px 18px / 42px 36px,
+          linear-gradient(180deg, rgba(255,255,255,.028), rgba(255,255,255,.012));
+      }
+      .graph svg {
+        position: absolute;
+        inset: 0;
+        width: 100%;
+        height: 100%;
+      }
+      .node {
+        position: absolute;
+        width: 112px;
+        min-height: 84px;
+        border-radius: 24px;
+        padding: 13px;
+        display: grid;
+        align-content: center;
+        gap: 5px;
+        background: rgba(8, 13, 19, .78);
+        border: 1px solid rgba(255,255,255,.12);
+        box-shadow: 0 18px 54px rgba(0,0,0,.35);
+      }
+      .node.main {
+        background: linear-gradient(150deg, #f1e7cf, #91afff 50%, #9bf4d2);
+        color: #06100d;
+        border-color: rgba(255,255,255,.4);
+        box-shadow: 0 26px 72px rgba(101,137,255,.28);
+      }
+      .node strong, .node span { display: block; }
+      .node span { color: #8793a1; font-size: 12px; font-weight: 800; }
+      .node.main span { color: rgba(6,16,13,.66); }
+      .inspector {
+        display: grid;
+        gap: 14px;
+        min-height: 0;
+      }
+      .panel {
+        padding: 16px;
+      }
+      .strategy-head {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        gap: 10px;
+      }
+      .modes {
+        display: grid;
+        gap: 9px;
+        margin-top: 13px;
+      }
+      .mode {
+        height: 46px;
+        display: grid;
+        grid-template-columns: 72px 1fr 34px;
+        gap: 10px;
+        align-items: center;
+        border-radius: 14px;
+        padding: 0 11px;
+        background: rgba(255,255,255,.042);
+        border: 1px solid rgba(255,255,255,.06);
+      }
+      .mode.active {
+        background: rgba(155,244,210,.105);
+        border-color: rgba(155,244,210,.35);
+      }
+      .meter {
+        height: 7px;
+        border-radius: 999px;
+        overflow: hidden;
+        background: rgba(255,255,255,.08);
+      }
+      .meter span {
+        display: block;
+        height: 100%;
+        border-radius: inherit;
+        background: #9bf4d2;
+      }
+      .mode em {
+        font-style: normal;
+        color: #8e9aa8;
+        text-align: right;
+      }
+      .custom-box {
+        margin-top: 11px;
+        border-radius: 14px;
+        padding: 12px;
+        background: rgba(137, 162, 255, .09);
+        border: 1px solid rgba(137,162,255,.16);
+      }
+      .custom-box p { color: #8f9aaa; margin-top: 4px; }
+      .memory-list {
+        display: grid;
+        gap: 9px;
+        margin-top: 13px;
+      }
+      .memory {
+        border-radius: 14px;
+        padding: 12px;
+        background: rgba(255,255,255,.042);
+        border: 1px solid rgba(255,255,255,.06);
+      }
+      .memory strong, .memory span { display: block; }
+      .memory span { color: #8f9aaa; margin-top: 4px; }
+      .tag-row { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 9px; }
+      .tag {
+        min-height: 24px;
+        border-radius: 999px;
+        padding: 0 8px;
+        display: inline-flex;
+        align-items: center;
+        color: #9bf4d2;
+        background: rgba(155,244,210,.1);
+        font-size: 12px;
+        font-weight: 850;
+      }
+    </style>
+  </head>
+  <body>
+    <section class="screen">
+      <aside class="sidebar">
+        <div class="brand">
+          <div class="logo">微</div>
+          <div>
+            <h1>微信 Agent</h1>
+            <p>记忆控制台</p>
+          </div>
+        </div>
+        <nav class="nav">
+          <button class="active">总览 <span>1</span></button>
+          <button>模型 <span>13</span></button>
+          <button>人格 <span></span></button>
+          <button>接话 <span>4</span></button>
+          <button>记忆 <span>1</span></button>
+          <button>状态 <span></span></button>
+        </nav>
+        <div></div>
+        <div class="group-card">
+          <strong>PT站看片狂魔小群</strong>
+          <span>348 条消息已索引</span>
+          <span>DeepSeek-V4-Flash · 连通</span>
+        </div>
+      </aside>
+
+      <main class="main">
+        <header class="topbar">
+          <div>
+            <h2>群记忆与接话策略</h2>
+            <p>用一张可审阅图谱管理群摘要、人物偏好、长期事实和自动接话阈值。</p>
+          </div>
+          <div class="top-actions">
+            <div class="btn">抽取记忆</div>
+            <div class="btn primary">保存策略</div>
+          </div>
+        </header>
+
+        <section class="status-grid">
+          <article class="card stat"><label>消息索引</label><strong>348 / 348</strong><small>5 秒增量同步</small></article>
+          <article class="card stat"><label>模型状态</label><strong>连通</strong><small>DeepSeek · 3.5s</small></article>
+          <article class="card stat"><label>当前接话</label><strong>正常</strong><small>阈值 50</small></article>
+          <article class="card stat"><label>长期记忆</label><strong>1</strong><small>群摘要已入库</small></article>
+        </section>
+
+        <section class="work">
+          <article class="card graph-panel">
+            <div class="panel-head">
+              <div>
+                <h3>蜂窝点阵知识图谱</h3>
+                <p>点击节点查看证据、置信度和来源消息；关系线按记忆类型分层。</p>
+              </div>
+              <div class="filter-row">
+                <span class="pill on">全部</span>
+                <span class="pill">人物</span>
+                <span class="pill">偏好</span>
+                <span class="pill">事实</span>
+              </div>
+            </div>
+            <div class="graph">
+              <svg viewBox="0 0 800 610" preserveAspectRatio="none">
+                <defs>
+                  <linearGradient id="edgeA" x1="0" y1="0" x2="1" y2="0">
+                    <stop offset="0" stop-color="rgba(155,244,210,0)" />
+                    <stop offset=".5" stop-color="rgba(155,244,210,.82)" />
+                    <stop offset="1" stop-color="rgba(155,244,210,0)" />
+                  </linearGradient>
+                  <linearGradient id="edgeB" x1="0" y1="0" x2="1" y2="0">
+                    <stop offset="0" stop-color="rgba(139,162,255,0)" />
+                    <stop offset=".5" stop-color="rgba(139,162,255,.78)" />
+                    <stop offset="1" stop-color="rgba(139,162,255,0)" />
+                  </linearGradient>
+                </defs>
+                <path d="M290 282 C390 210 490 170 610 120" stroke="url(#edgeA)" stroke-width="2" fill="none" />
+                <path d="M290 282 C420 300 522 346 648 418" stroke="url(#edgeB)" stroke-width="2" fill="none" />
+                <path d="M404 466 C480 412 550 386 648 418" stroke="url(#edgeA)" stroke-width="2" fill="none" />
+                <path d="M610 120 C674 196 710 274 696 352" stroke="url(#edgeB)" stroke-width="2" fill="none" />
+              </svg>
+              <div class="node main" style="left:224px;top:216px"><strong>群摘要</strong><span>summary · 1</span></div>
+              <div class="node" style="left:584px;top:74px"><strong>人物偏好</strong><span>pending</span></div>
+              <div class="node" style="left:678px;top:330px"><strong>长期事实</strong><span>0 facts</span></div>
+              <div class="node main" style="left:354px;top:432px"><strong>接话策略</strong><span>score 50</span></div>
+              <div class="node" style="left:558px;top:470px"><strong>回答上下文</strong><span>RAG</span></div>
+            </div>
+          </article>
+
+          <aside class="inspector">
+            <article class="card panel">
+              <div class="strategy-head">
+                <div>
+                  <h3>接话模式</h3>
+                  <p class="muted">四个预设可选，也可保存自定义策略。</p>
+                </div>
+                <span class="pill on">正常</span>
+              </div>
+              <div class="modes">
+                <div class="mode"><strong>安静</strong><div class="meter"><span style="width:75%"></span></div><em>75</em></div>
+                <div class="mode active"><strong>正常</strong><div class="meter"><span style="width:50%"></span></div><em>50</em></div>
+                <div class="mode"><strong>活跃</strong><div class="meter"><span style="width:35%"></span></div><em>35</em></div>
+                <div class="mode"><strong>发疯</strong><div class="meter"><span style="width:20%"></span></div><em>20</em></div>
+              </div>
+              <div class="custom-box">
+                <strong>自定义策略</strong>
+                <p>复制任一预设后编辑阈值、间隔、群白名单和静默规则。</p>
+              </div>
+            </article>
+
+            <article class="card panel">
+              <div class="strategy-head">
+                <div>
+                  <h3>可审阅记忆</h3>
+                  <p class="muted">进入回答上下文前先看来源与置信度。</p>
+                </div>
+              </div>
+              <div class="memory-list">
+                <div class="memory"><strong>群摘要</strong><span>投注盈亏、比分接口、IPTV 源需求与群内互动。</span><div class="tag-row"><span class="tag">博彩投注</span><span class="tag">世界杯</span><span class="tag">IPTV源</span></div></div>
+                <div class="memory"><strong>人物偏好</strong><span>暂无高置信记录，等待更多证据。</span></div>
+                <div class="memory"><strong>知识图谱</strong><span>暂无关系边，抽取到实体关系后显示。</span></div>
+              </div>
+            </article>
+          </aside>
+        </section>
+      </main>
+    </section>
+  </body>
+</html>

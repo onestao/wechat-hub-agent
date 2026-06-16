@@ -141,6 +141,24 @@ def init_ai_db(conn: sqlite3.Connection) -> None:
     ensure_fts(conn)
 
 
+def prune_ai_index_runs(conn: sqlite3.Connection, keep: int = 1000) -> int:
+    keep = max(100, int(keep or 1000))
+    before = conn.execute("SELECT COUNT(*) AS n FROM ai_index_runs").fetchone()["n"]
+    conn.execute(
+        """
+        DELETE FROM ai_index_runs
+        WHERE id NOT IN (
+            SELECT id FROM ai_index_runs
+            ORDER BY id DESC
+            LIMIT ?
+        )
+        """,
+        (keep,),
+    )
+    after = conn.execute("SELECT COUNT(*) AS n FROM ai_index_runs").fetchone()["n"]
+    return max(0, int(before or 0) - int(after or 0))
+
+
 def ensure_fts(conn: sqlite3.Connection) -> bool:
     row = conn.execute(
         "SELECT 1 FROM sqlite_master WHERE type='table' AND name='ai_chunks_fts'"
@@ -473,6 +491,7 @@ def index_once(
                 run_id,
             ),
         )
+        pruned_runs = prune_ai_index_runs(ai_conn)
 
     return {
         "ok": True,
@@ -483,6 +502,7 @@ def index_once(
         "scanned_messages": scanned,
         "indexed_messages": indexed,
         "skipped_messages": skipped,
+        "pruned_index_runs": pruned_runs,
         **details,
     }
 

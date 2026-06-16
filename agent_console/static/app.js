@@ -2947,6 +2947,7 @@ async function mutateSkill(action) {
     return;
   } else if (action === "delete") {
     url = "/api/skills/delete";
+    body.confirm_action = true;
     state.skillConfigDirty = false;
   }
   await fetchJson(url, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
@@ -3000,6 +3001,7 @@ async function runSkillTest(send = false) {
   const payload = {
     skill_id: skillId,
     send,
+    confirm_action: send,
     text: $("skillTestInput").value.trim(),
     keyword: $("skillTestInput").value.trim(),
     url: $("skillTestInput").value.trim(),
@@ -3142,6 +3144,7 @@ function renderServices(services) {
 function renderSuiteOverview() {
   const payload = state.suite || {};
   const counts = payload.counts || {};
+  const memory = state.memory || {};
   const sync = payload.sync || {};
   const ai = payload.ai || {};
   const syncHealth = (payload.services || []).find((item) => item.id === "wechat-memory-sync")?.health;
@@ -3166,9 +3169,45 @@ function renderSuiteOverview() {
   $("syncSummary").textContent = syncHealth ? `${healthText(syncHealth)}，${fmtAge(syncHealth.age_seconds)}` : "--";
   $("viewerSummary").textContent = `${fmtNumber(counts.messages)} 条消息可查看`;
   $("aiSummary").textContent = `${fmtNumber(counts.indexed_messages)} 条消息已索引`;
+  const logTotal =
+    Number(memory.ingest_runs || 0) +
+    Number(memory.ai_index_runs || 0) +
+    Number(memory.ai_memory_extract_runs || 0) +
+    Number(memory.agent_skill_runs || 0) +
+    Number(memory.reply_outbox || 0);
+  setText(
+    "cleanupLogsState",
+    `运行日志 ${fmtNumber(logTotal)} 条 · 同步 ${fmtNumber(memory.ingest_runs)} / 索引 ${fmtNumber(memory.ai_index_runs)} / 技能 ${fmtNumber(memory.agent_skill_runs)}`
+  );
   $("syncLog").textContent = compactJson(sync);
   $("aiLog").textContent = compactJson(ai.worker || ai.last_run || ai);
   renderContainers(payload.containers || {});
+}
+
+async function cleanupLogs() {
+  const button = $("cleanupLogsBtn");
+  if (!button) return;
+  const original = button.textContent;
+  button.disabled = true;
+  button.textContent = "清理中";
+  setText("cleanupLogsState", "正在清理运行日志，不会删除消息、记忆或媒体文件...");
+  try {
+    const payload = await fetchJson("/api/maintenance/cleanup", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ confirm_action: true }),
+    });
+    const totalDeleted = Object.values(payload.deleted || {}).reduce((sum, value) => sum + Number(value || 0), 0);
+    state.memory = payload.after || state.memory;
+    setText("cleanupLogsState", `已清理 ${fmtNumber(totalDeleted)} 条运行日志`);
+    updateTop();
+    await loadSuiteStatus();
+  } catch (error) {
+    setText("cleanupLogsState", `清理失败：${error.message}`);
+  } finally {
+    button.disabled = false;
+    button.textContent = original;
+  }
 }
 
 function renderContainers(containers) {
@@ -3530,7 +3569,7 @@ async function pushReplyToWechat(send = false) {
     const result = await fetchJson(send ? "/api/reply/send" : "/api/reply/draft", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(payload),
+      body: JSON.stringify({ ...payload, confirm_action: send }),
     });
     state.lastOutbox = result.outbox || null;
     const outboxId = result.outbox?.outbox_id ? ` · ${result.outbox.outbox_id.slice(0, 8)}` : "";
@@ -3648,6 +3687,7 @@ function bindEvents() {
   $("saveTalkBtn").addEventListener("click", () => saveAll($("saveTalkBtn"), "保存接话设置"));
   $("saveAutoReplyBtn")?.addEventListener("click", () => saveAll($("saveAutoReplyBtn"), "保存自动发送"));
   $("saveMemoryBtn").addEventListener("click", () => saveAll($("saveMemoryBtn"), "保存记忆设置"));
+  $("cleanupLogsBtn")?.addEventListener("click", cleanupLogs);
   $("modelsBtn").addEventListener("click", fetchModels);
   $("checkBtn").addEventListener("click", checkLLM);
   $("testBtn").addEventListener("click", testLLM);

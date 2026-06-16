@@ -2339,6 +2339,18 @@ mark {
 .metrics span, .metrics strong { display: block; }
 .metrics span { color: var(--muted); font-size: 12px; }
 .metrics strong { margin-top: 3px; font-size: 18px; }
+.maintenance-actions {
+  margin-top: 14px;
+  display: grid;
+  gap: 8px;
+  padding-top: 12px;
+  border-top: 1px solid rgba(255,255,255,.08);
+}
+.maintenance-actions span {
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.55;
+}
 .log-grid {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));

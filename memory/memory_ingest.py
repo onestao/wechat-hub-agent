@@ -264,6 +264,24 @@ def init_memory_db(conn: sqlite3.Connection) -> None:
     )
 
 
+def prune_ingest_runs(conn: sqlite3.Connection, keep: int = 1000) -> int:
+    keep = max(100, int(keep or 1000))
+    before = conn.execute("SELECT COUNT(*) FROM ingest_runs").fetchone()[0]
+    conn.execute(
+        """
+        DELETE FROM ingest_runs
+        WHERE id NOT IN (
+            SELECT id FROM ingest_runs
+            ORDER BY id DESC
+            LIMIT ?
+        )
+        """,
+        (keep,),
+    )
+    after = conn.execute("SELECT COUNT(*) FROM ingest_runs").fetchone()[0]
+    return max(0, int(before or 0) - int(after or 0))
+
+
 def iter_message_tables(message_db: Path):
     table_to_username = load_name2id(message_db)
     with open_readonly(message_db) as conn:
@@ -516,6 +534,7 @@ def ingest_memory(decrypted_dir: Path, memory_db: Path, dry_run: bool = False) -
                 run_id,
             ),
         )
+        pruned_runs = prune_ingest_runs(out_conn)
 
     os.chmod(memory_db, 0o600)
     return {
@@ -523,6 +542,7 @@ def ingest_memory(decrypted_dir: Path, memory_db: Path, dry_run: bool = False) -
         "chats": chat_count,
         "messages": message_count,
         "changed_rows": total,
+        "pruned_ingest_runs": pruned_runs,
         "type_counts": dict(type_rows),
     }
 

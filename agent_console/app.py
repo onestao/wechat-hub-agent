@@ -1053,12 +1053,109 @@ def memory_status() -> dict:
         "ai_chunks": db_count(AI_DB, "SELECT COUNT(*) FROM ai_chunks"),
         "ai_vectors": db_count(AI_DB, "SELECT COUNT(*) FROM ai_vectors"),
         "ai_indexed_messages": db_count(AI_DB, "SELECT COUNT(*) FROM ai_indexed_messages"),
+        "ingest_runs": db_count(MEMORY_DB, "SELECT COUNT(*) FROM ingest_runs"),
+        "ai_index_runs": db_count(AI_DB, "SELECT COUNT(*) FROM ai_index_runs"),
+        "ai_memory_extract_runs": db_count(AI_DB, "SELECT COUNT(*) FROM ai_memory_extract_runs"),
+        "agent_skill_runs": db_count(AI_DB, "SELECT COUNT(*) FROM agent_skill_runs"),
         "facts": db_count(AI_DB, "SELECT COUNT(*) FROM ai_facts"),
         "people_profiles": db_count(AI_DB, "SELECT COUNT(*) FROM ai_people_profiles"),
         "group_summaries": db_count(AI_DB, "SELECT COUNT(*) FROM ai_group_summaries"),
         "graph_edges": db_count(AI_DB, "SELECT COUNT(*) FROM ai_graph_edges"),
         "reply_outbox": db_count(AI_DB, "SELECT COUNT(*) FROM reply_outbox"),
     }
+
+
+RETENTION_LIMITS = {
+    "ingest_runs": 1000,
+    "ai_index_runs": 1000,
+    "ai_memory_extract_runs": 300,
+    "agent_skill_runs": 500,
+    "reply_outbox": 300,
+}
+
+
+def prune_table_by_recent_ids(conn: sqlite3.Connection, table: str, id_column: str, keep: int) -> int:
+    if not table_exists(conn, table):
+        return 0
+    keep = max(50, int(keep or 0))
+    before = int(conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] or 0)
+    conn.execute(
+        f"""
+        DELETE FROM {table}
+        WHERE {id_column} NOT IN (
+            SELECT {id_column}
+            FROM {table}
+            ORDER BY {id_column} DESC
+            LIMIT ?
+        )
+        """,
+        (keep,),
+    )
+    after = int(conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] or 0)
+    return max(0, before - after)
+
+
+def prune_table_by_recent_created(conn: sqlite3.Connection, table: str, id_column: str, keep: int) -> int:
+    if not table_exists(conn, table):
+        return 0
+    keep = max(50, int(keep or 0))
+    before = int(conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] or 0)
+    conn.execute(
+        f"""
+        DELETE FROM {table}
+        WHERE {id_column} NOT IN (
+            SELECT {id_column}
+            FROM {table}
+            ORDER BY created_at DESC, {id_column} DESC
+            LIMIT ?
+        )
+        """,
+        (keep,),
+    )
+    after = int(conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] or 0)
+    return max(0, before - after)
+
+
+def cleanup_runtime_logs(payload: dict | None = None) -> dict:
+    payload = payload or {}
+    limits = dict(RETENTION_LIMITS)
+    raw_limits = payload.get("limits") if isinstance(payload.get("limits"), dict) else {}
+    for key in limits:
+        if key in raw_limits:
+            limits[key] = clamp_int(raw_limits[key], limits[key], 50, 10000)
+    dry_run = bool(payload.get("dry_run", False))
+    before = memory_status()
+    deleted = {key: 0 for key in limits}
+    if not dry_run:
+        if MEMORY_DB.exists():
+            with db_connect(MEMORY_DB) as conn:
+                deleted["ingest_runs"] = prune_table_by_recent_ids(conn, "ingest_runs", "id", limits["ingest_runs"])
+        if AI_DB.exists():
+            with db_connect(AI_DB) as conn:
+                deleted["ai_index_runs"] = prune_table_by_recent_ids(conn, "ai_index_runs", "id", limits["ai_index_runs"])
+                deleted["ai_memory_extract_runs"] = prune_table_by_recent_ids(
+                    conn, "ai_memory_extract_runs", "run_id", limits["ai_memory_extract_runs"]
+                )
+                deleted["agent_skill_runs"] = prune_table_by_recent_created(
+                    conn, "agent_skill_runs", "run_id", limits["agent_skill_runs"]
+                )
+                deleted["reply_outbox"] = prune_table_by_recent_created(conn, "reply_outbox", "outbox_id", limits["reply_outbox"])
+    after = memory_status()
+    return {"ok": True, "dry_run": dry_run, "limits": limits, "deleted": deleted, "before": before, "after": after}
+
+
+def dangerous_action_confirmed(payload: dict, handler: BaseHTTPRequestHandler) -> bool:
+    if bool(payload.get("confirm_action")):
+        return True
+    header = str(handler.headers.get("X-WeChatAgent-Confirm") or "").strip().lower()
+    return header in {"1", "true", "yes"}
+
+
+def require_dangerous_confirmation(handler: BaseHTTPRequestHandler, payload: dict, action: str) -> bool:
+    if dangerous_action_confirmed(payload, handler):
+        return True
+    json_response(handler, {"ok": False, "error": f"{action} 需要显式确认"}, 403)
+    return False
 
 
 def llm_request(profile: dict, payload: dict, endpoint: str = "/chat/completions") -> tuple[int, dict | str, int]:
@@ -11137,6 +11234,11 @@ class Handler(BaseHTTPRequestHandler):
                 profile_id = payload.get("profile_id") or config.get("active_llm_profile_id")
                 profile = next((p for p in config.get("llm_profiles") or [] if p.get("id") == profile_id), active_profile(config))
                 json_response(self, run_health_check(profile, force=True))
+            elif parsed.path == "/api/maintenance/cleanup":
+                if not require_dangerous_confirmation(self, payload, "清理运行日志"):
+                    return
+                result = cleanup_runtime_logs(payload)
+                json_response(self, result, 200 if result.get("ok") else 400)
             elif parsed.path == "/api/extract-memory":
                 json_response(self, extract_memory(payload), 200)
             elif parsed.path == "/api/evaluate-talk":
@@ -11149,6 +11251,8 @@ class Handler(BaseHTTPRequestHandler):
                 result = execute_reply_to_wechat(payload, send=False)
                 json_response(self, result, 200 if result.get("ok") else 400 if result.get("status") == "rejected" else 502)
             elif parsed.path == "/api/reply/send":
+                if not require_dangerous_confirmation(self, payload, "发送到微信"):
+                    return
                 result = execute_reply_to_wechat(payload, send=True)
                 json_response(self, result, 200 if result.get("ok") else 400 if result.get("status") == "rejected" else 502)
             elif parsed.path == "/api/skills/import":
@@ -11164,12 +11268,18 @@ class Handler(BaseHTTPRequestHandler):
                 result = update_skill_config(str(payload.get("skill_id") or ""), payload)
                 json_response(self, result, 200 if result.get("ok") else 400)
             elif parsed.path == "/api/skills/test" or parsed.path == "/api/skills/run":
+                if parsed.path == "/api/skills/run" and not require_dangerous_confirmation(self, payload, "运行并发送技能"):
+                    return
                 result = run_skill(payload)
                 json_response(self, result, 200 if result.get("ok") else 400)
             elif parsed.path == "/api/skills/delete":
+                if not require_dangerous_confirmation(self, payload, "删除技能"):
+                    return
                 result = delete_skill(str(payload.get("skill_id") or ""))
                 json_response(self, result, 200 if result.get("ok") else 400)
             elif parsed.path == "/api/reports/group-daily":
+                if bool(payload.get("send", True)) and not require_dangerous_confirmation(self, payload, "发送群聊日报"):
+                    return
                 source_text = str(payload.get("source_chat") or payload.get("chat") or payload.get("text") or "").strip()
                 target_text = str(payload.get("target_chat") or payload.get("target") or "").strip()
                 source = resolve_group_chat(source_text, str(payload.get("source_chat_username") or ""), str(payload.get("source_chat_display_name") or ""))

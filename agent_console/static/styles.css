@@ -2423,6 +2423,11 @@ textarea { resize: vertical; }
   align-items: end;
 }
 .auto-reply-grid .span-2 { grid-column: span 2; }
+.maintenance-toggle {
+  border-color: rgba(255,211,123,.34);
+  background: rgba(255,211,123,.09);
+  color: #ffe0a0;
+}
 .auto-reply-grid select[multiple] {
   min-height: 118px;
   padding: 8px;

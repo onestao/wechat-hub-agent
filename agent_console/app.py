@@ -107,6 +107,7 @@ DEFAULT_CONFIG = {
     },
     "reply_sender": {
         "enabled": False,
+        "maintenance_paused": False,
         "mode": "draft_only",
         "allowed_chats": [],
         "send_to_active_chat_only": False,
@@ -397,6 +398,7 @@ def normalize_config(config: dict) -> dict:
         sender_streak_limit = 0
     config["reply_sender"] = {
         "enabled": bool(sender.get("enabled", sender_defaults["enabled"])),
+        "maintenance_paused": bool(sender.get("maintenance_paused", sender_defaults.get("maintenance_paused", False))),
         "mode": mode,
         "allowed_chats": [str(item).strip() for item in allowed_chats if str(item).strip()],
         "send_to_active_chat_only": False,
@@ -596,6 +598,7 @@ def sanitize_config(payload: dict, current: dict) -> dict:
         allowed = raw.get("allowed_chats") if isinstance(raw.get("allowed_chats"), list) else current_sender.get("allowed_chats", [])
         result["reply_sender"] = {
             "enabled": bool(raw.get("enabled", current_sender.get("enabled", False))),
+            "maintenance_paused": bool(raw.get("maintenance_paused", current_sender.get("maintenance_paused", False))),
             "mode": mode,
             "allowed_chats": [str(item).strip() for item in allowed if str(item).strip()],
             "send_to_active_chat_only": False,
@@ -720,6 +723,9 @@ def sanitize_skills_config(raw: dict, current: dict | None = None) -> dict:
     image_key = str(image_raw.get("api_key") or "").strip()
     if not image_key and image_raw.get("api_key_configured"):
         image_key = str(image_current.get("api_key") or "").strip()
+    meme_probability = clamp_float(meme_raw.get("probability"), meme_current.get("probability", 0.0), 0.0, 1.0)
+    if abs(meme_probability - 0.35) < 0.0001:
+        meme_probability = 0.0
     return {
         "enabled": bool(raw.get("enabled", current.get("enabled", defaults["enabled"]))),
         "blue_mention_enabled": bool(
@@ -728,7 +734,7 @@ def sanitize_skills_config(raw: dict, current: dict | None = None) -> dict:
         "meme_sender": {
             "enabled": bool(meme_raw.get("enabled", meme_current.get("enabled", True))),
             "auto_enabled": bool(meme_raw.get("auto_enabled", meme_current.get("auto_enabled", True))),
-            "probability": clamp_float(meme_raw.get("probability"), meme_current.get("probability", 0.35), 0.0, 1.0),
+            "probability": meme_probability,
             "default_keyword": str(meme_raw.get("default_keyword") or meme_current.get("default_keyword") or "笑死").strip()[:24],
             "api_url": str(meme_raw.get("api_url") or meme_current.get("api_url") or defaults["meme_sender"]["api_url"]).strip(),
             "page": clamp_int(meme_raw.get("page"), meme_current.get("page", 1), 1, 99),
@@ -2419,28 +2425,6 @@ def skills_rows(include_body: bool = False) -> list[dict]:
     return [skill_public_row(row, include_body=include_body) for row in rows]
 
 
-def skill_run_rows(limit: int = 30, skill_id: str = "") -> list[dict]:
-    init_semantic_memory()
-    params: list = []
-    where = ""
-    if skill_id:
-        where = "WHERE skill_id=?"
-        params.append(safe_id(skill_id))
-    with db_connect(AI_DB, readonly=True) as conn:
-        rows = conn.execute(
-            f"SELECT * FROM agent_skill_runs {where} ORDER BY created_at DESC LIMIT ?",
-            (*params, clamp_int(limit, 30, 1, 200)),
-        ).fetchall()
-    output = []
-    for row in rows:
-        item = dict(row)
-        item["input"] = parse_json_value(item.pop("input_json", None), {})
-        item["output"] = parse_json_value(item.pop("output_json", None), {})
-        item["artifacts"] = parse_json_value(item.pop("artifacts_json", None), [])
-        output.append(item)
-    return output
-
-
 def json_safe_payload(value, *, max_text: int = 2000):
     if value is None or isinstance(value, (bool, int, float)):
         return value
@@ -2474,9 +2458,73 @@ def json_safe_payload(value, *, max_text: int = 2000):
     return str(value)
 
 
+def compact_skill_payload(value, *, max_text: int = 360, max_items: int = 8):
+    safe = json_safe_payload(value, max_text=max_text)
+    if isinstance(safe, dict):
+        output = {}
+        for key, item in safe.items():
+            key_text = str(key)
+            if key_text.lower() in {"xml", "raw_xml", "content_xml", "image_data", "data", "base64", "bytes"}:
+                output[key_text] = {"type": "redacted", "reason": "large_or_raw_payload"}
+            else:
+                output[key_text] = compact_skill_payload(item, max_text=max_text, max_items=max_items)
+        return output
+    if isinstance(safe, list):
+        items = [compact_skill_payload(item, max_text=max_text, max_items=max_items) for item in safe[:max_items]]
+        if len(safe) > max_items:
+            items.append({"type": "truncated_list", "remaining": len(safe) - max_items})
+        return items
+    return safe
+
+
+def skill_run_summary(item: dict) -> dict:
+    output = item.get("output") if isinstance(item.get("output"), dict) else {}
+    input_payload = item.get("input") if isinstance(item.get("input"), dict) else {}
+    summary = output.get("summary") or output.get("reply_text") or output.get("text") or output.get("message") or item.get("error") or ""
+    if not summary and isinstance(output.get("result"), dict):
+        summary = output["result"].get("summary") or output["result"].get("text") or ""
+    return {
+        "run_id": item.get("run_id") or "",
+        "skill_id": item.get("skill_id") or "",
+        "created_at": item.get("created_at") or "",
+        "chat_username": item.get("chat_username") or "",
+        "chat_display_name": item.get("chat_display_name") or "",
+        "message_uid": item.get("message_uid") or "",
+        "status": item.get("status") or "",
+        "elapsed_ms": item.get("elapsed_ms") or 0,
+        "error": item.get("error") or "",
+        "summary": str(summary or "")[:260],
+        "input": compact_skill_payload(input_payload, max_text=220, max_items=5),
+        "output": compact_skill_payload(output, max_text=360, max_items=6),
+        "artifacts": compact_skill_payload(item.get("artifacts") or [], max_text=220, max_items=6),
+    }
+
+
+def skill_run_rows(limit: int = 30, skill_id: str = "", compact: bool = True) -> list[dict]:
+    init_semantic_memory()
+    params: list = []
+    where = ""
+    if skill_id:
+        where = "WHERE skill_id=?"
+        params.append(safe_id(skill_id))
+    with db_connect(AI_DB, readonly=True) as conn:
+        rows = conn.execute(
+            f"SELECT * FROM agent_skill_runs {where} ORDER BY created_at DESC LIMIT ?",
+            (*params, clamp_int(limit, 30, 1, 200)),
+        ).fetchall()
+    output = []
+    for row in rows:
+        item = dict(row)
+        item["input"] = parse_json_value(item.pop("input_json", None), {})
+        item["output"] = parse_json_value(item.pop("output_json", None), {})
+        item["artifacts"] = parse_json_value(item.pop("artifacts_json", None), [])
+        output.append(skill_run_summary(item) if compact else item)
+    return output
+
+
 def skills_status() -> dict:
     rows = skills_rows()
-    runs = skill_run_rows(40)
+    runs = skill_run_rows(40, compact=True)
     today = datetime.now(DISPLAY_TZ).date().isoformat()
     today_runs = [run for run in runs if str(run.get("created_at") or "").startswith(today)]
     return {
@@ -2556,6 +2604,18 @@ def set_skill_enabled(skill_id: str, enabled: bool) -> dict:
     return {"ok": True, "skill": skill_public_row(row, include_body=True, public=True)}
 
 
+def sync_builtin_skill_config_to_runtime(skill_id: str, config: dict) -> None:
+    config_key = safe_id(skill_id).replace("-", "_")
+    if config_key not in DEFAULT_CONFIG["skills"]:
+        return
+    runtime_config = read_config()
+    skills = runtime_config.get("skills") if isinstance(runtime_config.get("skills"), dict) else {}
+    current_skill = skills.get(config_key) if isinstance(skills.get(config_key), dict) else {}
+    skills[config_key] = {**current_skill, **(config or {})}
+    runtime_config["skills"] = sanitize_skills_config(skills, skills)
+    write_json(CONFIG_FILE, normalize_config(runtime_config))
+
+
 def update_skill_config(skill_id: str, payload: dict) -> dict:
     skill = skill_by_id(skill_id)
     if not skill:
@@ -2582,6 +2642,7 @@ def update_skill_config(skill_id: str, payload: dict) -> dict:
             ),
         )
         row = conn.execute("SELECT * FROM agent_skills WHERE skill_id=?", (safe_id(skill_id),)).fetchone()
+    sync_builtin_skill_config_to_runtime(skill_id, config)
     return {"ok": True, "skill": skill_public_row(row, include_body=True, public=True)}
 
 
@@ -2697,11 +2758,11 @@ def delete_skill(skill_id: str) -> dict:
 def effective_skill_settings(skill_id: str, config: dict) -> dict:
     config_key = safe_id(skill_id).replace("-", "_")
     settings = {}
-    if isinstance(config.get("skills"), dict) and isinstance(config["skills"].get(config_key), dict):
-        settings.update(config["skills"][config_key])
     skill = skill_by_id(skill_id) or {}
     if isinstance(skill.get("config"), dict):
         settings.update(skill["config"])
+    if isinstance(config.get("skills"), dict) and isinstance(config["skills"].get(config_key), dict):
+        settings.update(config["skills"][config_key])
     if safe_id(skill_id) == "official-account-reader":
         for key in list(settings.keys()):
             if key.startswith("tavily_") or key in {"max_article_chars", "min_real_content_chars"}:
@@ -4329,7 +4390,7 @@ def should_trigger_meme(
         return {"trigger": False, "reason": "mention_without_meme_request", "keyword": keyword}
     if not (explicit_request or pure_laugh):
         return {"trigger": False, "reason": "no_meme_signal", "keyword": keyword}
-    probability = clamp_float(settings.get("probability"), 0.35, 0.0, 1.0)
+    probability = clamp_float(settings.get("probability"), 0.0, 0.0, 1.0)
     if explicit_request or pure_laugh or (playful_hit and keyword_hit and random.random() < probability):
         return {
             "trigger": True,
@@ -4956,6 +5017,7 @@ def add_auto_reply_event(kind: str, message: str, details: dict | None = None) -
 AUTO_REPLY_PHASE_TEXT = {
     "idle": "等待新消息",
     "disabled": "自动回复未生效",
+    "paused": "维修暂停中",
     "candidate": "发现待回复消息",
     "scoring": "正在评分",
     "silent": "评分未达阈值",
@@ -5003,16 +5065,19 @@ def auto_reply_public_state(config: dict | None = None) -> dict:
     config = config or read_config()
     state = auto_reply_state()
     sender = config.get("reply_sender", {})
+    paused = bool(sender.get("maintenance_paused", False))
     active = bool(
         config.get("agent", {}).get("enabled", True)
         and config.get("agent", {}).get("auto_reply_enabled", False)
         and sender.get("enabled", False)
+        and not paused
         and sender.get("mode") == "auto_send"
     )
     return {
         **state,
         "active": active,
         "enabled": bool(sender.get("enabled", False)),
+        "maintenance_paused": paused,
         "mode": sender.get("mode") or "draft_only",
         "poll_interval_seconds": sender.get("poll_interval_seconds", 5),
         "allowed_chats": sender.get("allowed_chats") or [],
@@ -10803,10 +10868,12 @@ def auto_reply_loop() -> None:
             config = read_config()
             sender = config.get("reply_sender", {})
             sleep_seconds = clamp_float(sender.get("poll_interval_seconds"), 5, 1.0, 300.0)
+            paused = bool(sender.get("maintenance_paused", False))
             active = bool(
                 config.get("agent", {}).get("enabled", True)
                 and config.get("agent", {}).get("auto_reply_enabled", False)
                 and sender.get("enabled", False)
+                and not paused
                 and sender.get("mode") == "auto_send"
             )
             write_auto_reply_state(
@@ -10819,17 +10886,19 @@ def auto_reply_loop() -> None:
             if not active:
                 state = auto_reply_state()
                 live = state.get("live") if isinstance(state.get("live"), dict) else {}
-                if live.get("phase") not in {"disabled", "sent", "failed"}:
+                phase = "paused" if paused else "disabled"
+                if live.get("phase") != phase and live.get("phase") not in {"sent", "failed"}:
                     set_auto_reply_live(
-                        "disabled",
+                        phase,
                         details={
                             "agent_enabled": bool(config.get("agent", {}).get("enabled", True)),
                             "agent_auto_reply_enabled": bool(config.get("agent", {}).get("auto_reply_enabled", False)),
                             "sender_enabled": bool(sender.get("enabled", False)),
+                            "maintenance_paused": paused,
                             "sender_mode": sender.get("mode") or "",
                         },
                     )
-                write_auto_reply_state({"last_skip_reason": "disabled"})
+                write_auto_reply_state({"last_skip_reason": "maintenance_paused" if paused else "disabled"})
                 time.sleep(min(5.0, sleep_seconds))
                 continue
             result = auto_reply_once(config)
@@ -10865,6 +10934,19 @@ def api_status(chat: str = "") -> dict:
         "semantic_runs": semantic_runs(8),
         "auto_reply": auto_reply_public_state(config),
         "last_test": last_test,
+    }
+
+
+def api_status_lite() -> dict:
+    config = read_config()
+    return {
+        "ok": True,
+        "generated_at": now_iso(),
+        "config": public_config(config),
+        "memory": memory_status(),
+        "semantic_runs": semantic_runs(5),
+        "auto_reply": auto_reply_public_state(config),
+        "last_test": read_json(STATUS_FILE, {}),
     }
 
 
@@ -10962,6 +11044,8 @@ class Handler(BaseHTTPRequestHandler):
         try:
             if parsed.path == "/api/status":
                 json_response(self, api_status(str(query.get("chat", [""])[0] or "").strip()))
+            elif parsed.path == "/api/status-lite":
+                json_response(self, api_status_lite())
             elif parsed.path == "/api/models":
                 config = read_config()
                 json_response(self, list_models(active_profile(config)))
@@ -10996,6 +11080,7 @@ class Handler(BaseHTTPRequestHandler):
             elif parsed.path == "/api/skills":
                 json_response(self, skills_status())
             elif parsed.path == "/api/skills/runs":
+                detail_runs = str(query.get("detail", [""])[0] or "").lower() in {"1", "true", "yes"}
                 json_response(
                     self,
                     {
@@ -11003,6 +11088,7 @@ class Handler(BaseHTTPRequestHandler):
                         "runs": skill_run_rows(
                             clamp_int(query.get("limit", ["30"])[0], 30, 1, 200),
                             str(query.get("skill_id", [""])[0] or ""),
+                            compact=not detail_runs,
                         ),
                     },
                 )

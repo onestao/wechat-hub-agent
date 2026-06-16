@@ -162,6 +162,10 @@ function statusUrl() {
   return `/api/status${query ? `?${query}` : ""}`;
 }
 
+function statusLiteUrl() {
+  return "/api/status-lite";
+}
+
 function activeMemoryChat() {
   return state.chats.find((chat) => chat.username === state.memoryChat) || null;
 }
@@ -227,7 +231,7 @@ function updateTop() {
   renderModeCards();
   renderOverviewServices();
   renderOverviewMemory();
-  renderGraph(semantic.graph || { nodes: [], edges: [] });
+  if (semantic.graph) renderGraph(semantic.graph || { nodes: [], edges: [] });
   renderAutoReplyLive();
 }
 
@@ -319,7 +323,7 @@ function mergeRuntimeStatus(payload) {
     if (healthById[profile.id]) profile.health = healthById[profile.id];
   }
   state.memory = payload.memory;
-  state.semantic = payload.semantic_memory;
+  if (payload.semantic_memory) state.semantic = payload.semantic_memory;
   state.semanticRuns = payload.semantic_runs || state.semanticRuns;
   state.autoReply = payload.auto_reply || state.autoReply;
   renderAutoReplyStatus();
@@ -336,7 +340,7 @@ async function setMemoryChat(username, options = {}) {
   resetMemorySelection();
   renderMemoryChatSelects();
   if (options.fetch !== false) {
-    await refreshStatus();
+    await refreshFullStatus();
   }
 }
 
@@ -559,6 +563,7 @@ function fillReplySenderForm() {
   const sender = state.config?.reply_sender || {};
   if (!$("replySenderEnabled")) return;
   $("replySenderEnabled").checked = Boolean(sender.enabled);
+  if ($("replySenderPaused")) $("replySenderPaused").checked = Boolean(sender.maintenance_paused);
   $("replySenderMode").value = sender.mode || "draft_only";
   $("replyPollInterval").value = sender.poll_interval_seconds ?? 5;
   $("replyMaxPerCycle").value = sender.max_messages_per_cycle ?? 8;
@@ -591,6 +596,7 @@ function syncReplySenderFromForm() {
   state.config.reply_sender = {
     ...(state.config.reply_sender || {}),
     enabled: $("replySenderEnabled").checked,
+    maintenance_paused: Boolean($("replySenderPaused")?.checked),
     mode: $("replySenderMode").value || "draft_only",
     allowed_chats: selected,
     send_to_active_chat_only: false,
@@ -613,8 +619,9 @@ function renderAutoReplyStatus() {
   if (!root) return;
   const auto = state.autoReply || {};
   const active = Boolean(auto.active);
-  const statusClass = active ? "ok" : auto.ok === false ? "bad" : "warn";
-  const statusText = active ? "自动发送运行中" : auto.ok === false ? "自动发送异常" : "自动发送未生效";
+  const paused = Boolean(auto.maintenance_paused);
+  const statusClass = active ? "ok" : auto.ok === false ? "bad" : paused ? "warn" : "warn";
+  const statusText = active ? "自动发送运行中" : auto.ok === false ? "自动发送异常" : paused ? "维修暂停中" : "自动发送未生效";
   const events = (auto.recent_events || []).slice(0, 4);
   const lastBits = [
     `模式 ${auto.mode || "--"}`,
@@ -2455,6 +2462,17 @@ async function load() {
 }
 
 async function refreshStatus() {
+  const payload = await fetchJson(statusLiteUrl());
+  mergeRuntimeStatus(payload);
+  updateTop();
+  renderProfiles();
+  renderSemanticRuns();
+  if (state.view === "services") await loadSuiteStatus();
+  if (state.view === "chat") await loadChats(true);
+  if (state.view === "skills") await loadSkills();
+}
+
+async function refreshFullStatus() {
   const payload = await fetchJson(statusUrl());
   mergeRuntimeStatus(payload);
   updateTop();
@@ -3612,7 +3630,7 @@ function bindEvents() {
     if ($("graphViewport").hasPointerCapture(event.pointerId)) $("graphViewport").releasePointerCapture(event.pointerId);
     $("graphViewport").classList.remove("dragging");
   });
-  $("refreshBtn").addEventListener("click", () => refreshStatus().catch((error) => alert(error.message)));
+  $("refreshBtn").addEventListener("click", () => refreshFullStatus().catch((error) => alert(error.message)));
   $("extractMemoryBtn").addEventListener("click", extractMemory);
   $("memoryChat")?.addEventListener("change", (event) => setMemoryChat(event.target.value).catch((error) => alert(error.message)));
   $("memoryChatPanel")?.addEventListener("change", (event) => setMemoryChat(event.target.value).catch((error) => alert(error.message)));

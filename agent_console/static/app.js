@@ -19,6 +19,7 @@ const state = {
   debug: null,
   preview: null,
   lastOutbox: null,
+  talkSettingsDirty: false,
   memoryUi: {
     tab: "people",
     selectedPersonId: null,
@@ -322,6 +323,12 @@ function mergeRuntimeStatus(payload) {
   for (const profile of state.config?.llm_profiles || []) {
     if (healthById[profile.id]) profile.health = healthById[profile.id];
   }
+  if (payload.config && !state.talkSettingsDirty) {
+    state.config.agent = payload.config.agent || state.config.agent;
+    state.config.talk_modes = payload.config.talk_modes || state.config.talk_modes;
+    state.config.talk_scoring = payload.config.talk_scoring || state.config.talk_scoring;
+    state.config.reply_sender = payload.config.reply_sender || state.config.reply_sender;
+  }
   state.memory = payload.memory;
   if (payload.semantic_memory) state.semantic = payload.semantic_memory;
   state.semanticRuns = payload.semantic_runs || state.semanticRuns;
@@ -463,6 +470,7 @@ async function setReplyMode(key) {
       body: JSON.stringify(collectConfig()),
     });
     state.config = payload.config;
+    state.talkSettingsDirty = false;
     state.activeProfileId = payload.config.active_llm_profile_id;
     fillAgent();
     renderTalkModes();
@@ -551,6 +559,7 @@ function syncTalkFromForm() {
 
 function markTalkSettingsDirty() {
   if (!state.config) return;
+  state.talkSettingsDirty = true;
   syncTalkFromForm();
   renderDebugModeOptions();
   renderModeCards();
@@ -3241,6 +3250,7 @@ async function saveAll(button, label = "保存") {
       body: JSON.stringify(collectConfig()),
     });
     state.config = payload.config;
+    state.talkSettingsDirty = false;
     state.activeProfileId = payload.config.active_llm_profile_id;
     $("apiKey").value = "";
     renderProfiles();

@@ -348,15 +348,18 @@ def normalize_config(config: dict) -> dict:
     }
     if config.get("agent", {}).get("reply_mode") not in config.get("talk_modes", {}):
         config["agent"]["reply_mode"] = "normal"
-    preferred_thresholds = {"quiet": 65, "normal": 38, "active": 24, "wild": 12}
-    old_or_too_strict = {"quiet": {75}, "normal": {50}, "active": {35}, "wild": {20}}
-    for key, preferred in preferred_thresholds.items():
-        mode = config.get("talk_modes", {}).get(key)
-        if not isinstance(mode, dict):
-            continue
-        current_threshold = clamp_int(mode.get("threshold"), preferred, 0, 100)
-        if current_threshold in old_or_too_strict.get(key, set()) or current_threshold > DEFAULT_CONFIG["talk_modes"][key]["threshold"]:
-            mode["threshold"] = preferred
+    talk_modes = config.get("talk_modes") if isinstance(config.get("talk_modes"), dict) else {}
+    normalized_modes = {}
+    for key, defaults in DEFAULT_CONFIG["talk_modes"].items():
+        raw = talk_modes.get(key) if isinstance(talk_modes.get(key), dict) else {}
+        normalized_modes[key] = {
+            "label": str(raw.get("label") or defaults["label"]),
+            "threshold": clamp_int(raw.get("threshold"), defaults["threshold"], 0, 100),
+            "min_interval_seconds": clamp_int(raw.get("min_interval_seconds"), defaults["min_interval_seconds"], 0, 86400),
+            "hourly_limit": clamp_int(raw.get("hourly_limit"), defaults["hourly_limit"], 0, 1000),
+            "streak_limit": clamp_int(raw.get("streak_limit"), defaults["streak_limit"], 0, 1000),
+        }
+    config["talk_modes"] = normalized_modes
     if not isinstance(config.get("talk_scoring"), dict) or any(
         item.get("name") == "明显两个人连续私聊" and item.get("score") == -35
         for item in config.get("talk_scoring", {}).get("negative", [])

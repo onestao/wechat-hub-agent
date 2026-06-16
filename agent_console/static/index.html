@@ -24,6 +24,7 @@
           <button type="button" data-view="models">模型 <span id="navModelCount">--</span></button>
           <button type="button" data-view="persona">人格 <span></span></button>
           <button type="button" data-view="talk">接话 <span>4</span></button>
+          <button type="button" data-view="skills">技能 <span id="navSkillCount">--</span></button>
           <button type="button" data-view="memory">群记忆 <span id="navMemoryCount">--</span></button>
           <button type="button" data-view="test">测试 <span></span></button>
         </nav>
@@ -51,10 +52,23 @@
         </header>
 
         <section class="status-grid">
+          <article id="autoReplyLiveCard" class="card auto-live-card">
+            <div class="auto-live-head">
+              <span id="autoLiveDot" class="auto-orb warn"></span>
+              <div>
+                <label>自动回复实时状态</label>
+                <strong id="autoLivePhase">等待状态</strong>
+              </div>
+              <em id="autoLiveUpdated">--</em>
+            </div>
+            <div id="autoLiveMeta" class="auto-live-meta">等待自动回复线程上报</div>
+            <div id="autoLiveReply" class="auto-live-reply">暂无回复内容</div>
+            <div id="autoLiveTimeline" class="auto-live-timeline"></div>
+          </article>
           <article class="card stat"><label>消息索引</label><strong id="memoryBadge">--</strong><small id="syncHint">5 秒增量同步</small></article>
-          <article class="card stat"><label>模型状态</label><strong id="modelHealth">--</strong><small id="modelHint">等待检测</small></article>
-          <article class="card stat"><label>服务运行</label><strong id="runMode">--</strong><small id="talkHint">等待检测</small></article>
-          <article class="card stat"><label>长期记忆</label><strong id="memoryObjectCount">--</strong><small id="memoryHint">群摘要/人物/事实/关系</small></article>
+          <article class="card stat"><label>模型</label><strong id="modelHealth">--</strong><small id="modelHint">等待检测</small></article>
+          <article class="card stat"><label>服务</label><strong id="runMode">--</strong><small id="talkHint">等待检测</small></article>
+          <article class="card stat"><label>记忆</label><strong id="memoryObjectCount">--</strong><small id="memoryHint">群摘要/人物/事实/关系</small></article>
         </section>
 
         <section class="page active" data-page="overview">
@@ -255,6 +269,7 @@
               <label class="switch-label"><input id="autoReplyEnabled" type="checkbox" /><span>允许自动回复判定</span></label>
               <select id="replyMode"></select>
             </div>
+            <label class="textarea-label"><span>机器人别名</span><textarea id="agentAliases" rows="3"></textarea></label>
             <label class="textarea-label"><span>人格提示词</span><textarea id="personality" rows="10"></textarea></label>
             <label class="textarea-label"><span>安全边界</span><textarea id="safetyPolicy" rows="4"></textarea></label>
           </section>
@@ -337,6 +352,70 @@
                   <div id="replySendState" class="reply-send-state">未创建发送记录</div>
                 </div>
               </div>
+            </article>
+          </section>
+        </section>
+
+        <section class="page" data-page="skills">
+          <section class="skills-console">
+            <article class="card panel span-2 skill-command">
+              <div class="panel-head">
+                <div>
+                  <h3>技能中心</h3>
+                  <p>管理 SKILL.md、OpenAPI/HTTP 和内置技能；自动回复只调用已启用且权限通过的技能。</p>
+                </div>
+                <div class="button-row">
+                  <button id="refreshSkillsBtn" class="btn" type="button">刷新技能</button>
+                  <button id="importSkillBtn" class="btn primary" type="button">导入技能</button>
+                </div>
+              </div>
+              <div class="skill-stats">
+                <div><span>已安装</span><strong id="skillInstalled">--</strong></div>
+                <div><span>已启用</span><strong id="skillEnabled">--</strong></div>
+                <div><span>今日运行</span><strong id="skillRunsToday">--</strong></div>
+                <div><span>失败</span><strong id="skillFailedToday">--</strong></div>
+              </div>
+            </article>
+            <article class="card panel skill-import-panel">
+              <div class="panel-head compact-head"><h3>导入</h3><span class="pill">默认禁用</span></div>
+              <label><span>导入类型</span><select id="skillImportType"><option value="skill_md">SKILL.md</option><option value="openapi_json">OpenAPI JSON</option><option value="openapi_yaml">OpenAPI YAML</option><option value="zip_base64">ZIP Base64</option></select></label>
+              <label><span>技能名</span><input id="skillImportName" placeholder="custom-skill" autocomplete="off" /></label>
+              <label class="textarea-label"><span>内容</span><textarea id="skillImportContent" rows="8" placeholder="粘贴 SKILL.md / OpenAPI / ZIP base64"></textarea></label>
+              <button id="submitSkillImportBtn" class="btn primary" type="button">安装导入</button>
+            </article>
+            <article class="card panel skill-list-panel">
+              <div class="panel-head compact-head"><h3>已安装技能</h3><span id="skillListHint" class="muted">--</span></div>
+              <div id="skillGrid" class="skill-grid"></div>
+            </article>
+            <aside class="card panel skill-detail-panel">
+              <div class="panel-head compact-head">
+                <h3 id="skillDetailTitle">技能详情</h3>
+                <span id="skillDetailState" class="pill">--</span>
+              </div>
+              <div id="skillDetail" class="skill-detail-body"></div>
+            </aside>
+            <article class="card panel span-2 skill-test-panel">
+              <div class="panel-head">
+                <div>
+                  <h3>技能测试</h3>
+                  <p>公众号技能只识别标题；网络搜索技能查公开资讯；斗图技能会按关键词测试，发送开关打开时会直接发图片。</p>
+                </div>
+                <div class="button-row">
+                  <button id="testSkillBtn" class="btn" type="button">仅测试</button>
+                  <button id="runSkillSendBtn" class="btn danger" type="button">运行并发送</button>
+                </div>
+              </div>
+              <div class="debug-grid">
+                <label><span>技能</span><select id="skillTestSelect"></select></label>
+                <label><span>目标会话</span><select id="skillTestChat"></select></label>
+                <label id="skillImageUploadLabel" class="skill-upload-label span-2"><span>上传图片测试</span><input id="skillImageUpload" type="file" accept="image/png,image/jpeg,image/gif,image/webp" /></label>
+                <label class="span-2"><span>测试输入</span><textarea id="skillTestInput" rows="4" placeholder="公众号链接、搜索问题、聊天文本、斗图关键词"></textarea></label>
+              </div>
+              <pre id="skillTestOutput" class="skill-test-output">等待测试</pre>
+            </article>
+            <article class="card panel span-2 skill-log-panel">
+              <div class="panel-head compact-head"><h3>运行日志</h3><span id="skillLogHint" class="muted">最近 20 条</span></div>
+              <div id="skillRunList" class="skill-run-list"></div>
             </article>
           </section>
         </section>

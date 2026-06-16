@@ -88,12 +88,26 @@ def parse_app_message(body: str | None) -> dict:
     title = xml_node_text(appmsg, "title")
     description = xml_node_text(appmsg, "des")
     app_type = xml_node_text(appmsg, "type")
+    url = xml_node_text(appmsg, "url")
+    source_name = xml_node_text(appmsg, "sourcedisplayname")
+    app_name = xml_node_text(appmsg, "appname")
+    source_username = xml_node_text(appmsg, "sourceusername")
+    app_id = xml_node_text(appmsg, "appid") or xml_node_text(appmsg, "weappinfo/appid")
     display = title or description or extract_xml_text(body)
     semantic_parts = [display]
+    if source_name:
+        semantic_parts.append(f"来源 {source_name}")
+    if description and description != display:
+        semantic_parts.append(description)
     result = {
         "display_content": display,
         "semantic_text": display,
         "app_type": app_type,
+        "app_url": url,
+        "app_source_name": source_name,
+        "app_name": app_name,
+        "app_source_username": source_username,
+        "app_id": app_id,
     }
 
     refer = appmsg.find("refermsg") if appmsg is not None else None

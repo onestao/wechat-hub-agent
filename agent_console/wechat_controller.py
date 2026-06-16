@@ -12,6 +12,7 @@ import argparse
 import base64
 import json
 import os
+import shutil
 import subprocess
 import sys
 import time
@@ -133,6 +134,20 @@ def start_clipboard(text: str) -> subprocess.Popen:
     return proc
 
 
+def start_image_clipboard(path: str) -> subprocess.Popen:
+    if not os.path.exists(path):
+        raise RuntimeError(f"图片文件不存在: {path}")
+    mime = "image/png" if path.lower().endswith(".png") else "image/jpeg"
+    proc = subprocess.Popen(
+        ["xclip", "-selection", "clipboard", "-target", mime, "-loops", "8", "-i", path],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        text=True,
+        env={**os.environ, "DISPLAY": DISPLAY},
+    )
+    return proc
+
+
 def finish_clipboard(proc: subprocess.Popen) -> None:
     try:
         proc.wait(timeout=0.6)
@@ -162,6 +177,21 @@ def paste_text(text: str) -> None:
     finish_clipboard(proc)
 
 
+def type_text(text: str, delay_ms: int = 18) -> None:
+    if not text:
+        return
+    xdotool("type", "--clearmodifiers", "--delay", str(max(0, delay_ms)), text)
+    sleep_seconds(0.12)
+
+
+def paste_image(path: str) -> None:
+    proc = start_image_clipboard(path)
+    sleep_seconds(0.18)
+    key("ctrl+v")
+    sleep_seconds(0.6)
+    finish_clipboard(proc)
+
+
 def read_clipboard_text() -> str:
     try:
         result = subprocess.run(
@@ -188,6 +218,32 @@ def verify_focused_text(expected: str) -> dict:
         "copied_length": len(copied),
         "expected_length": len(expected),
         "copied_preview": copied[:80],
+    }
+
+
+def verify_mention_text(display_name: str, alias: str, body: str) -> dict:
+    key("ctrl+a")
+    sleep_seconds(0.08)
+    key("ctrl+c")
+    sleep_seconds(0.18)
+    copied = read_clipboard_text()
+    key("Right")
+    compact = copied.replace("\u2005", " ").replace("\u2004", " ").strip()
+    display = display_name.strip()
+    alias_text = alias.strip().lstrip("@")
+    body_text = body.strip()
+    has_body = bool(body_text and body_text in compact)
+    has_display_mention = bool(display and f"@{display}" in compact)
+    has_raw_alias = bool(alias_text and f"@{alias_text}" in compact)
+    return {
+        "ok": bool(has_body and has_display_mention and not has_raw_alias),
+        "copied_length": len(copied),
+        "copied_preview": copied[:120],
+        "has_body": has_body,
+        "has_display_mention": has_display_mention,
+        "has_raw_alias": has_raw_alias,
+        "expected_display": display,
+        "alias": alias_text,
     }
 
 
@@ -302,6 +358,87 @@ def paste_active(text: str, send: bool, send_delay: float) -> dict:
     }
 
 
+def strip_plain_mention_prefix(text: str, display_name: str) -> str:
+    body = text.strip()
+    name = display_name.strip()
+    if name and body.startswith(f"@{name}"):
+        body = body[len(name) + 1 :].lstrip(" \t\r\n:：,，")
+    return body
+
+
+def paste_mention_active(text: str, mention_alias: str, mention_display: str, send: bool, send_delay: float) -> dict:
+    body = strip_plain_mention_prefix(text, mention_display)
+    if not body:
+        raise RuntimeError("回复内容为空")
+    alias = mention_alias.strip().lstrip("@")
+    if not alias:
+        raise RuntimeError("缺少可用于蓝色@的 alias")
+    window = find_main_window()
+    activate(window)
+    width = int(window["width"])
+    height = int(window["height"])
+    input_x = max(80, int(width * 0.57))
+    input_y = max(120, height - 70)
+    click(window, input_x, input_y)
+    sleep_seconds(0.12)
+    clear_focused_text()
+
+    type_text("@", delay_ms=20)
+    sleep_seconds(0.45)
+    type_text(alias, delay_ms=22)
+    sleep_seconds(0.65)
+    key("Return")
+    sleep_seconds(0.45)
+    paste_text(f" {body}")
+    sleep_seconds(0.15)
+    input_verify = verify_mention_text(mention_display, alias, body)
+    if not input_verify.get("ok"):
+        clear_focused_text()
+        raise RuntimeError("微信蓝色@校验失败，已清空输入框，拒绝发送裸 alias")
+
+    if send:
+        sleep_seconds(max(send_delay, 0))
+        key("Return")
+    return {
+        "window": window,
+        "sent": bool(send),
+        "send_delay_seconds": send_delay if send else 0,
+        "input": {"x": input_x, "y": input_y},
+        "mention": {
+            "alias": alias,
+            "display": mention_display,
+            "body_length": len(body),
+            "strategy": "type_alias_tab_then_body",
+        },
+        "input_verify": input_verify,
+    }
+
+
+def paste_image_active(path: str, send: bool, send_delay: float) -> dict:
+    if not os.path.exists(path):
+        raise RuntimeError(f"图片文件不存在: {path}")
+    window = find_main_window()
+    activate(window)
+    width = int(window["width"])
+    height = int(window["height"])
+    input_x = max(80, int(width * 0.57))
+    input_y = max(120, height - 70)
+    click(window, input_x, input_y)
+    sleep_seconds(0.12)
+    clear_focused_text()
+    paste_image(path)
+    if send:
+        sleep_seconds(max(send_delay, 0))
+        key("Return")
+    return {
+        "window": window,
+        "sent": bool(send),
+        "send_delay_seconds": send_delay if send else 0,
+        "input": {"x": input_x, "y": input_y},
+        "image_path": path,
+    }
+
+
 def submit_active(send_delay: float) -> dict:
     window = find_main_window()
     activate(window)
@@ -329,9 +466,12 @@ def clear_active() -> dict:
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("action", choices=["open", "paste", "submit", "focus", "clear"])
+    parser.add_argument("action", choices=["open", "paste", "mention-paste", "image", "submit", "focus", "clear"])
     parser.add_argument("--chat-name-b64", default="")
     parser.add_argument("--text-b64", default="")
+    parser.add_argument("--mention-alias-b64", default="")
+    parser.add_argument("--mention-display-b64", default="")
+    parser.add_argument("--image-path-b64", default="")
     parser.add_argument("--send", action="store_true")
     parser.add_argument("--switch-delay", type=float, default=1.0)
     parser.add_argument("--send-delay", type=float, default=0.0)
@@ -341,6 +481,16 @@ def main() -> int:
             payload = open_chat(b64_decode(args.chat_name_b64), args.switch_delay)
         elif args.action == "paste":
             payload = paste_active(b64_decode(args.text_b64), args.send, args.send_delay)
+        elif args.action == "mention-paste":
+            payload = paste_mention_active(
+                b64_decode(args.text_b64),
+                b64_decode(args.mention_alias_b64),
+                b64_decode(args.mention_display_b64),
+                args.send,
+                args.send_delay,
+            )
+        elif args.action == "image":
+            payload = paste_image_active(b64_decode(args.image_path_b64), args.send, args.send_delay)
         elif args.action == "submit":
             payload = submit_active(args.send_delay)
         elif args.action == "focus":

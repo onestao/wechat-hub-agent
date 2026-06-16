@@ -13,6 +13,9 @@ const state = {
   suite: null,
   semanticRuns: null,
   autoReply: null,
+  skills: { skills: [], runs: [], stats: {} },
+  selectedSkillId: "",
+  skillConfigDirty: false,
   debug: null,
   preview: null,
   lastOutbox: null,
@@ -52,6 +55,7 @@ const pageMeta = {
   models: ["模型配置", "新增、保存、检测和选择 OpenAI-compatible 模型。"],
   persona: ["人格设置", "Agent 性格、安全边界和自动回复判定开关。"],
   talk: ["接话策略", "四种接话模式、阈值、随机发送延迟和评分标准。"],
+  skills: ["技能中心", "导入、安装、启停、测试和导出 SKILL.md / OpenAPI / 内置技能。"],
   memory: ["群记忆中枢", "人物画像、长期事实、群故事线和聚焦关系都来自 AI 记忆库。"],
   test: ["模型测试", "向当前活跃模型发送一次短测试。"],
 };
@@ -118,6 +122,20 @@ function fmtAge(seconds) {
   if (value < 60) return `${Math.round(value)} 秒前`;
   if (value < 3600) return `${Math.round(value / 60)} 分钟前`;
   return `${Math.round(value / 3600)} 小时前`;
+}
+
+function fmtDuration(ms) {
+  const value = Number(ms);
+  if (!Number.isFinite(value) || value <= 0) return "";
+  if (value < 1000) return `${Math.round(value)}ms`;
+  return `${(value / 1000).toFixed(value < 10_000 ? 1 : 0)}s`;
+}
+
+function fmtIsoTime(value) {
+  if (!value) return "--";
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return String(value);
+  return date.toLocaleTimeString("zh-CN", { hour12: false });
 }
 
 async function fetchJson(url, options) {
@@ -187,6 +205,7 @@ function updateTop() {
   $("navChatCount").textContent = fmtNumber(memory.chats);
   $("navMemoryCount").textContent = fmtNumber(memoryObjects);
   $("navModelCount").textContent = fmtNumber((config.llm_profiles || []).length);
+  if ($("navSkillCount")) $("navSkillCount").textContent = fmtNumber(state.skills?.stats?.enabled ?? state.skills?.skills?.length ?? 0);
 
   if (health.ok) {
     $("modelHealth").textContent = "连通";
@@ -209,6 +228,7 @@ function updateTop() {
   renderOverviewServices();
   renderOverviewMemory();
   renderGraph(semantic.graph || { nodes: [], edges: [] });
+  renderAutoReplyLive();
 }
 
 function serviceCounts() {
@@ -288,6 +308,7 @@ function switchView(view) {
   $("pageSubtitle").textContent = subtitle;
   if (state.view === "chat" && !state.chats.length) loadChats();
   if (state.view === "services") loadSuiteStatus();
+  if (state.view === "skills") loadSkills().catch((error) => console.warn(error));
   if (state.view === "overview") setTimeout(fitGraph, 0);
 }
 
@@ -376,6 +397,7 @@ function fillAgent() {
   const agent = config.agent || {};
   $("agentEnabled").checked = Boolean(agent.enabled);
   $("autoReplyEnabled").checked = Boolean(agent.auto_reply_enabled);
+  if ($("agentAliases")) $("agentAliases").value = (agent.aliases || []).join("\n");
   $("personality").value = agent.personality || "";
   $("safetyPolicy").value = agent.safety_policy || "";
   const select = $("replyMode");
@@ -397,6 +419,7 @@ function syncAgentFromForm() {
     enabled: $("agentEnabled").checked,
     auto_reply_enabled: $("autoReplyEnabled").checked,
     reply_mode: $("replyMode").value,
+    aliases: $("agentAliases") ? $("agentAliases").value.split(/\n|,/).map((item) => item.trim()).filter(Boolean) : state.config.agent?.aliases || [],
     personality: $("personality").value,
     safety_policy: $("safetyPolicy").value,
   };
@@ -415,14 +438,41 @@ function renderModeCards() {
   }
 }
 
-function setReplyMode(key) {
+async function setReplyMode(key) {
   if (!state.config?.talk_modes?.[key]) return;
+  syncTalkFromForm();
   state.config.agent = { ...(state.config.agent || {}), reply_mode: key };
   const select = $("replyMode");
   if (select) select.value = key;
   renderTalkModePicker();
   renderTalkModes();
   updateTop();
+  const activeButton = document.querySelector(`.talk-mode-card[data-mode="${CSS.escape(key)}"]`);
+  if (activeButton) {
+    activeButton.classList.add("saving");
+    activeButton.setAttribute("aria-busy", "true");
+  }
+  try {
+    const payload = await fetchJson("/api/config", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(collectConfig()),
+    });
+    state.config = payload.config;
+    state.activeProfileId = payload.config.active_llm_profile_id;
+    fillAgent();
+    renderTalkModes();
+    updateTop();
+  } catch (error) {
+    console.warn("模式保存失败", error);
+    const saveButton = $("saveTalkBtn");
+    if (saveButton) saveButton.textContent = "模式保存失败";
+  } finally {
+    if (activeButton) {
+      activeButton.classList.remove("saving");
+      activeButton.removeAttribute("aria-busy");
+    }
+  }
 }
 
 function renderTalkModePicker() {
@@ -434,6 +484,7 @@ function renderTalkModePicker() {
     const button = document.createElement("button");
     button.type = "button";
     button.className = `talk-mode-card ${key === active ? "active" : ""}`;
+    button.dataset.mode = key;
     button.innerHTML = `
       <span class="mode-title">${escapeHtml(mode.label || modeNames[key] || key)}</span>
       <strong>${escapeHtml(mode.threshold)}</strong>
@@ -475,6 +526,10 @@ function renderTalkModes() {
       <label><span>连续上限</span><input data-mode="${key}" data-field="streak_limit" type="number" min="0" value="${mode.streak_limit}"></label>`;
     root.appendChild(row);
   }
+  root.querySelectorAll("[data-mode][data-field]").forEach((input) => {
+    input.addEventListener("input", markTalkSettingsDirty);
+  });
+  if ($("freeTaskTtl")) $("freeTaskTtl").oninput = markTalkSettingsDirty;
   renderScores();
 }
 
@@ -488,6 +543,16 @@ function syncTalkFromForm() {
   if (select) state.config.agent.reply_mode = select.value || state.config.agent.reply_mode || "normal";
   state.config.talk_scoring.free_task_ttl_seconds = Number($("freeTaskTtl").value || 0);
   renderTalkModePicker();
+}
+
+function markTalkSettingsDirty() {
+  if (!state.config) return;
+  syncTalkFromForm();
+  renderDebugModeOptions();
+  renderModeCards();
+  updateTop();
+  const button = $("saveTalkBtn");
+  if (button && !button.disabled) button.textContent = "保存并立即生效";
 }
 
 function fillReplySenderForm() {
@@ -573,6 +638,61 @@ function renderAutoReplyStatus() {
       </div>
     </div>
   `;
+}
+
+function autoLiveTone(auto, live) {
+  if (auto?.ok === false || live?.phase === "failed") return "bad";
+  if (!auto?.active) return "warn";
+  if (["candidate", "scoring", "thinking", "ready", "sending", "confirming"].includes(live?.phase)) return "busy";
+  if (live?.phase === "silent" || live?.phase === "skipped") return "warn";
+  if (live?.phase === "sent") return "ok";
+  return "ok";
+}
+
+function autoLivePhaseText(auto, live) {
+  if (auto?.ok === false) return "自动回复异常";
+  if (!auto?.active) return "自动回复未生效";
+  return live?.phase_label || "自动回复运行中";
+}
+
+function renderAutoReplyLive() {
+  const card = $("autoReplyLiveCard");
+  if (!card) return;
+  const auto = state.autoReply || {};
+  const live = auto.live || {};
+  const details = live.details || {};
+  const tone = autoLiveTone(auto, live);
+  const dot = $("autoLiveDot");
+  card.classList.toggle("busy", tone === "busy");
+  card.classList.toggle("ok", tone === "ok");
+  card.classList.toggle("warn", tone === "warn");
+  card.classList.toggle("bad", tone === "bad");
+  if (dot) dot.className = `auto-orb ${tone === "busy" ? "ok busy" : tone}`;
+  $("autoLivePhase").textContent = autoLivePhaseText(auto, live);
+  $("autoLiveUpdated").textContent = live.updated_at ? `更新 ${fmtIsoTime(live.updated_at)}` : `轮询 ${fmtNumber(auto.poll_interval_seconds ?? 5)}s`;
+  const metaBits = [
+    live.chat_display_name ? `群 ${live.chat_display_name}` : "",
+    live.sender_hint ? `发言人 ${live.sender_hint}` : "",
+    live.decision ? `判定 ${live.decision}` : "",
+    live.score || live.threshold ? `评分 ${fmtNumber(live.score || 0)}/${fmtNumber(live.threshold || 0)}` : "",
+    details.llm_elapsed_ms ? `模型 ${fmtDuration(details.llm_elapsed_ms)}` : "",
+    details.preview_elapsed_ms ? `生成 ${fmtDuration(details.preview_elapsed_ms)}` : "",
+    details.send_elapsed_ms ? `发送 ${fmtDuration(details.send_elapsed_ms)}` : "",
+    details.delays?.switch_delay_seconds ? `切群等待 ${fmtDuration(details.delays.switch_delay_seconds * 1000)}` : "",
+    details.delays?.send_delay_seconds ? `发送等待 ${fmtDuration(details.delays.send_delay_seconds * 1000)}` : "",
+    details.confirmed === true ? "已同步确认" : details.confirmed === false ? "未确认同步" : "",
+    details.reason === "no_new_messages" ? "无新消息" : "",
+    details.sender_mode ? `模式 ${details.sender_mode}` : "",
+    live.error ? `错误 ${live.error}` : "",
+  ].filter(Boolean);
+  $("autoLiveMeta").textContent = metaBits.length ? metaBits.join(" · ") : "自动发送器正在等待新消息";
+  const source = live.source_text ? `触发：${live.source_text}` : "";
+  const reply = live.reply_text ? `回复：${live.reply_text}` : source || "暂无触发消息";
+  $("autoLiveReply").textContent = reply;
+  const events = (auto.recent_events || []).slice(0, 3);
+  $("autoLiveTimeline").innerHTML = events.length
+    ? events.map((event) => `<span>${escapeHtml(fmtIsoTime(event.at))} · ${escapeHtml(event.message || event.kind || "")}</span>`).join("")
+    : `<span>暂无自动回复事件</span>`;
 }
 
 function replyDelayText(details) {
@@ -2329,7 +2449,9 @@ async function load() {
   renderDebugModeOptions();
   renderSemanticRuns();
   renderAutoReplyStatus();
+  renderAutoReplyLive();
   renderMemoryChatSelects();
+  await loadSkills();
 }
 
 async function refreshStatus() {
@@ -2341,6 +2463,14 @@ async function refreshStatus() {
   renderSemanticRuns();
   if (state.view === "services") await loadSuiteStatus();
   if (state.view === "chat") await loadChats(true);
+  if (state.view === "skills") await loadSkills();
+}
+
+async function refreshAutoReplyLive() {
+  const payload = await fetchJson("/api/reply/auto-state");
+  state.autoReply = payload.auto_reply || state.autoReply;
+  renderAutoReplyStatus();
+  renderAutoReplyLive();
 }
 
 async function loadChats(refreshMessages = false) {
@@ -2502,12 +2632,24 @@ function renderMessages(messages, term = $("messageSearch")?.value.trim() || "")
     const quote = renderQuote(msg.quote, term);
     const source = msg.source && msg.source !== msg.display_content ? msg.source : "";
     const showBody = !(msg.media_url && ["image", "sticker", "video"].includes(msg.type_label));
+    const actions = [];
+    if (msg.type_label === "link_or_file") {
+      actions.push(`<button class="mini-btn" type="button" data-article-message="${escapeAttr(msg.message_uid || "")}">识别公众号标题</button>`);
+    }
+    if (msg.quote && ["3", "43", "47"].includes(String(msg.quote.type || ""))) {
+      actions.push(`<button class="mini-btn" type="button" data-image-message="${escapeAttr(msg.message_uid || "")}">理解引用图片</button>`);
+    }
+    if (["image", "sticker"].includes(msg.type_label) && msg.media_status === "ready") {
+      actions.push(`<button class="mini-btn" type="button" data-image-message="${escapeAttr(msg.message_uid || "")}">理解图片</button>`);
+    }
+    const messageActions = actions.length ? `<div class="message-actions">${actions.join("")}</div>` : "";
     item.innerHTML = `
       <div class="message-meta">${escapeHtml(msg.sender_hint || (msg.is_outgoing ? "我" : ""))} · ${fmtTime(msg.create_time)} · ${escapeHtml(msg.semantic_type || msg.type_label || "")}</div>
       ${showBody ? `<div class="message-content">${renderInlineContent(msg.display_content || "", term)}</div>` : ""}
       ${quote}
       ${media}
       ${source ? `<div class="message-source">${renderInlineContent(source, term)}</div>` : ""}
+      ${messageActions}
     `;
     root.appendChild(item);
   }
@@ -2536,6 +2678,403 @@ function renderMedia(msg) {
     return `<div class="message-media-status">${escapeHtml(reason)}</div>`;
   }
   return "";
+}
+
+async function loadSkills() {
+  const payload = await fetchJson("/api/skills");
+  state.skills = payload;
+  if (!state.selectedSkillId || !(payload.skills || []).some((skill) => skill.skill_id === state.selectedSkillId)) {
+    state.selectedSkillId = (payload.skills || [])[0]?.skill_id || "";
+  }
+  renderSkills({ preserveDetail: isSkillConfigEditing() });
+  updateTop();
+}
+
+function selectedSkill() {
+  return (state.skills?.skills || []).find((skill) => skill.skill_id === state.selectedSkillId) || null;
+}
+
+function isSkillConfigEditing() {
+  return Boolean(state.skillConfigDirty && state.view === "skills");
+}
+
+function markSkillConfigDirty() {
+  state.skillConfigDirty = true;
+}
+
+function renderSkills(options = {}) {
+  if (!$("skillGrid")) return;
+  const stats = state.skills?.stats || {};
+  $("skillInstalled").textContent = fmtNumber(stats.installed || 0);
+  $("skillEnabled").textContent = fmtNumber(stats.enabled || 0);
+  $("skillRunsToday").textContent = fmtNumber(stats.today_runs || 0);
+  $("skillFailedToday").textContent = fmtNumber(stats.failed || 0);
+  $("skillListHint").textContent = `${fmtNumber((state.skills?.skills || []).length)} 个技能`;
+  renderSkillGrid();
+  if (!options.preserveDetail) renderSkillDetail();
+  renderSkillTestSelects();
+  renderSkillRuns();
+}
+
+function renderSkillGrid() {
+  const root = $("skillGrid");
+  root.innerHTML = "";
+  const skills = state.skills?.skills || [];
+  if (!skills.length) return renderEmpty(root, "暂无技能");
+  for (const skill of skills) {
+    const card = document.createElement("button");
+    card.type = "button";
+    card.className = `skill-card ${skill.skill_id === state.selectedSkillId ? "active" : ""} ${skill.enabled ? "enabled" : ""}`;
+    const perms = (skill.permissions || []).map((item) => `<span>${escapeHtml(permissionLabel(item))}</span>`).join("");
+    card.innerHTML = `
+      <div class="skill-card-top">
+        <div class="skill-icon">${escapeHtml(skillIcon(skill))}</div>
+        <div><strong>${escapeHtml(skill.name || skill.skill_id)}</strong><em>${escapeHtml(skill.skill_type || "skill")}</em></div>
+        <i class="${skill.enabled ? "ok" : ""}">${skill.enabled ? "启用" : "禁用"}</i>
+      </div>
+      <p>${escapeHtml(skill.description || "暂无描述")}</p>
+      <div class="skill-perms">${perms}</div>
+    `;
+    card.addEventListener("click", () => {
+      state.selectedSkillId = skill.skill_id;
+      state.skillConfigDirty = false;
+      renderSkills();
+    });
+    root.appendChild(card);
+  }
+}
+
+function skillIcon(skill) {
+  if (skill.skill_id === "meme-sender") return "图";
+  if (skill.skill_id === "official-account-reader") return "题";
+  if (skill.skill_id === "web-search") return "搜";
+  if (skill.skill_id === "image-understanding") return "识";
+  if (skill.skill_type === "openapi") return "API";
+  return "技";
+}
+
+function permissionLabel(value) {
+  return {
+    read_messages: "读消息",
+    network: "联网",
+    llm: "模型",
+    send_text: "发文字",
+    send_image: "发图片",
+    script_exec: "脚本",
+  }[value] || value;
+}
+
+function renderSkillDetail() {
+  const skill = selectedSkill();
+  const root = $("skillDetail");
+  if (!skill) {
+    $("skillDetailTitle").textContent = "技能详情";
+    $("skillDetailState").textContent = "--";
+    root.innerHTML = `<p class="muted">选择一个技能查看详情。</p>`;
+    return;
+  }
+  $("skillDetailTitle").textContent = skill.name || skill.skill_id;
+  $("skillDetailState").textContent = skill.enabled ? "已启用" : "已禁用";
+  $("skillDetailState").className = `pill ${skill.enabled ? "ok" : ""}`;
+  const triggers = (skill.triggers || []).map((item) => `<span class="memory-tag topic">${escapeHtml(item)}</span>`).join("");
+  const perms = (skill.permissions || []).map((item) => `<span class="memory-tag ${item === "script_exec" ? "risk" : "person"}">${escapeHtml(permissionLabel(item))}</span>`).join("");
+  const configHtml = skill.skill_id === "image-understanding" ? renderImageSkillConfig(skill.config || {}) : `
+    <section class="skill-detail-section"><h4>配置 JSON</h4><textarea id="skillConfigJson" rows="7">${escapeHtml(JSON.stringify(skill.config || {}, null, 2))}</textarea></section>
+  `;
+  root.innerHTML = `
+    <section class="skill-detail-section"><h4>说明</h4><p>${escapeHtml(skill.description || "暂无描述")}</p></section>
+    <section class="skill-detail-section"><h4>触发词</h4><div class="memory-tag-row">${triggers || `<span class="muted">暂无</span>`}</div></section>
+    <section class="skill-detail-section"><h4>权限</h4><div class="memory-tag-row">${perms || `<span class="muted">暂无</span>`}</div></section>
+    ${configHtml}
+    <section class="skill-detail-actions">
+      <button class="btn" type="button" data-skill-action="toggle">${skill.enabled ? "禁用技能" : "启用技能"}</button>
+      <button class="btn primary" type="button" data-skill-action="save">保存配置</button>
+      <button class="btn" type="button" data-skill-action="export">导出</button>
+      ${skill.source === "builtin" ? "" : `<button class="btn danger" type="button" data-skill-action="delete">删除</button>`}
+    </section>
+  `;
+}
+
+function renderImageSkillConfig(config) {
+  const keyState = config.api_key_configured ? `Key 已配置 · ${escapeHtml(config.api_key_tail || "")}` : "Key 未配置";
+  return `
+    <section class="skill-detail-section image-skill-config">
+      <h4>图片理解模型</h4>
+      <div class="form-grid skill-config-grid">
+        <label class="switch-label tight"><input id="imageSkillEnabled" type="checkbox" ${config.enabled !== false ? "checked" : ""} /><span>启用图片理解</span></label>
+        <label class="switch-label tight"><input id="imageSkillAutoEnabled" type="checkbox" ${config.auto_enabled !== false ? "checked" : ""} /><span>允许自动触发</span></label>
+        <label class="switch-label tight"><input id="imageSkillAutoImages" type="checkbox" ${config.auto_analyze_image_messages ? "checked" : ""} /><span>收到图片自动解析</span></label>
+        <label class="switch-label tight"><input id="imageSkillUseActive" type="checkbox" ${config.use_active_profile ? "checked" : ""} /><span>复用当前主模型</span></label>
+        <label><span>Base URL</span><input id="imageSkillBaseUrl" value="${escapeAttr(config.base_url || "")}" autocomplete="off" placeholder="https://api.example.com/v1 或本地地址" /></label>
+        <label><span>模型</span><input id="imageSkillModel" value="${escapeAttr(config.model || "")}" autocomplete="off" placeholder="gpt-4o-mini / qwen-vl / 本地视觉模型" /></label>
+        <label><span>API Key</span><input id="imageSkillApiKey" type="password" autocomplete="off" placeholder="${escapeAttr(keyState)}" /></label>
+        <label class="switch-label tight"><input id="imageSkillAllowEmptyKey" type="checkbox" ${config.allow_empty_api_key ? "checked" : ""} /><span>本地模型允许空 Key</span></label>
+        <label><span>Temperature</span><input id="imageSkillTemperature" type="number" min="0" max="2" step="0.1" value="${escapeAttr(config.temperature ?? 0.2)}" /></label>
+        <label><span>输出上限</span><input id="imageSkillMaxTokens" type="number" min="64" max="8192" step="64" value="${escapeAttr(config.max_tokens ?? 700)}" /></label>
+        <label><span>超时秒</span><input id="imageSkillTimeout" type="number" min="3" max="180" step="1" value="${escapeAttr(config.timeout_seconds ?? 45)}" /></label>
+        <label><span>缓存小时</span><input id="imageSkillCacheHours" type="number" min="0" max="8760" step="1" value="${escapeAttr(config.cache_hours ?? 720)}" /></label>
+        <label class="span-2 textarea-label"><span>图片理解提示词</span><textarea id="imageSkillPrompt" rows="6">${escapeHtml(config.prompt || "")}</textarea></label>
+      </div>
+      <p class="muted">图片模型走 OpenAI-compatible /chat/completions 的 image_url 格式；本地模型可填本地 Base URL 并开启空 Key。</p>
+    </section>
+    <section class="skill-detail-section compact-json"><h4>配置 JSON</h4><textarea id="skillConfigJson" rows="5">${escapeHtml(JSON.stringify(config || {}, null, 2))}</textarea></section>
+  `;
+}
+
+function collectImageSkillConfig(fallback = {}) {
+  if (!$("imageSkillBaseUrl")) {
+    return JSON.parse($("skillConfigJson")?.value || "{}");
+  }
+  const config = {
+    ...fallback,
+    enabled: $("imageSkillEnabled").checked,
+    auto_enabled: $("imageSkillAutoEnabled").checked,
+    auto_analyze_image_messages: $("imageSkillAutoImages").checked,
+    use_active_profile: $("imageSkillUseActive").checked,
+    base_url: $("imageSkillBaseUrl").value.trim(),
+    model: $("imageSkillModel").value.trim(),
+    allow_empty_api_key: $("imageSkillAllowEmptyKey").checked,
+    temperature: Number($("imageSkillTemperature").value || 0.2),
+    max_tokens: Number($("imageSkillMaxTokens").value || 700),
+    timeout_seconds: Number($("imageSkillTimeout").value || 45),
+    cache_hours: Number($("imageSkillCacheHours").value || 720),
+    prompt: $("imageSkillPrompt").value.trim(),
+  };
+  const key = $("imageSkillApiKey").value.trim();
+  if (key) config.api_key = key;
+  else if (fallback.api_key_configured) config.api_key_configured = true;
+  $("skillConfigJson").value = JSON.stringify(config, null, 2);
+  return config;
+}
+
+function renderSkillTestSelects() {
+  const select = $("skillTestSelect");
+  const chatSelect = $("skillTestChat");
+  if (!select || !chatSelect) return;
+  const currentSkill = select.value || state.selectedSkillId;
+  select.innerHTML = (state.skills?.skills || []).map((skill) => `<option value="${escapeAttr(skill.skill_id)}">${escapeHtml(skill.name || skill.skill_id)}</option>`).join("");
+  if ([...select.options].some((option) => option.value === currentSkill)) select.value = currentSkill;
+  renderChatSelect("skillTestChat", chatSelect.value || state.memoryChat || state.selectedChat?.username || "", false, "选择会话");
+  updateSkillUploadVisibility();
+}
+
+function updateSkillUploadVisibility() {
+  const visible = $("skillTestSelect")?.value === "image-understanding";
+  if ($("skillImageUploadLabel")) $("skillImageUploadLabel").hidden = !visible;
+}
+
+function renderSkillRuns() {
+  const root = $("skillRunList");
+  if (!root) return;
+  root.innerHTML = "";
+  const runs = state.skills?.runs || [];
+  if (!runs.length) return renderEmpty(root, "暂无运行日志");
+  for (const run of runs) {
+    const item = document.createElement("article");
+    item.className = `skill-run ${run.status === "failed" ? "failed" : ""}`;
+    item.innerHTML = `
+      <div><strong>${escapeHtml(run.skill_id)}</strong><span>${escapeHtml(run.status)} · ${escapeHtml(run.created_at || "")}</span></div>
+      <p>${escapeHtml(run.error || JSON.stringify(run.output || {}).slice(0, 160))}</p>
+    `;
+    root.appendChild(item);
+  }
+}
+
+async function importSkill() {
+  const button = $("submitSkillImportBtn");
+  button.disabled = true;
+  button.textContent = "导入中";
+  try {
+    const payload = await fetchJson("/api/skills/import", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        source_type: $("skillImportType").value,
+        name: $("skillImportName").value.trim(),
+        content: $("skillImportContent").value,
+      }),
+    });
+    state.selectedSkillId = payload.skill?.skill_id || state.selectedSkillId;
+    $("skillImportContent").value = "";
+    await loadSkills();
+  } catch (error) {
+    alert(error.message);
+  } finally {
+    button.disabled = false;
+    button.textContent = "安装导入";
+  }
+}
+
+async function mutateSkill(action) {
+  const skill = selectedSkill();
+  if (!skill) return;
+  let url = "/api/skills/config";
+  let body = { skill_id: skill.skill_id };
+  if (action === "toggle") {
+    url = "/api/skills/enable";
+    body.enabled = !skill.enabled;
+    state.skillConfigDirty = false;
+  } else if (action === "save") {
+    try {
+      body.config = skill.skill_id === "image-understanding"
+        ? collectImageSkillConfig(skill.config || {})
+        : JSON.parse($("skillConfigJson").value || "{}");
+    } catch (error) {
+      alert(`配置 JSON 不合法：${error.message}`);
+      return;
+    }
+  } else if (action === "export") {
+    const payload = await fetchJson("/api/skills/export", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+    $("skillTestOutput").textContent = `导出文件：${payload.filename}\n\nbase64:\n${payload.zip_base64}`;
+    return;
+  } else if (action === "delete") {
+    url = "/api/skills/delete";
+    state.skillConfigDirty = false;
+  }
+  await fetchJson(url, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+  if (action === "save") state.skillConfigDirty = false;
+  await loadSkills();
+}
+
+function readImageUploadPayload() {
+  const file = $("skillImageUpload")?.files?.[0];
+  if (!file) return Promise.resolve(null);
+  if (!file.type.startsWith("image/")) return Promise.reject(new Error("请选择图片文件"));
+  if (file.size > 8 * 1024 * 1024) return Promise.reject(new Error("图片不能超过 8MB"));
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => {
+      const dataUrl = String(reader.result || "");
+      resolve({
+        filename: file.name,
+        mime_type: file.type || "image/jpeg",
+        size: file.size,
+        data: dataUrl.includes(",") ? dataUrl.split(",", 2)[1] : dataUrl,
+      });
+    };
+    reader.onerror = () => reject(reader.error || new Error("读取图片失败"));
+    reader.readAsDataURL(file);
+  });
+}
+
+function skillResultForDisplay(result) {
+  if (result?.summary) {
+    return [
+      result.summary,
+      "",
+      JSON.stringify({
+        ok: result.ok,
+        cached: result.cached,
+        model: result.model,
+        message_uid: result.message_uid,
+        media_path: result.media_path,
+        resolve_method: result.resolve_method,
+        llm: result.details?.llm || result.llm || {},
+      }, null, 2),
+    ].join("\n");
+  }
+  return JSON.stringify(result, null, 2);
+}
+
+async function runSkillTest(send = false) {
+  const skillId = $("skillTestSelect").value;
+  const chat = state.chats.find((item) => item.username === $("skillTestChat").value) || {};
+  const payload = {
+    skill_id: skillId,
+    send,
+    text: $("skillTestInput").value.trim(),
+    keyword: $("skillTestInput").value.trim(),
+    url: $("skillTestInput").value.trim(),
+    message_uid: $("skillTestInput").dataset.messageUid || "",
+    chat_username: chat.username || "",
+    chat_display_name: chat.display_name || "",
+  };
+  $("skillTestOutput").textContent = "运行中...";
+  try {
+    if (skillId === "image-understanding") {
+      const upload = await readImageUploadPayload();
+      if (upload) {
+        payload.image_upload = upload;
+        payload.message_uid = "";
+      }
+    }
+    const result = await fetchJson(send ? "/api/skills/run" : "/api/skills/test", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    $("skillTestOutput").textContent = skillResultForDisplay(result);
+    await loadSkills();
+  } catch (error) {
+    $("skillTestOutput").textContent = error.message;
+  }
+}
+
+async function recognizeArticleMessage(messageUid) {
+  const msg = (state.lastMessages || []).find((item) => String(item.message_uid || "") === String(messageUid || ""));
+  if (!msg) return;
+  await loadSkills();
+  state.selectedSkillId = "official-account-reader";
+  switchView("skills");
+  $("skillTestSelect").value = "official-account-reader";
+  $("skillTestChat").value = state.selectedChat?.username || msg.chat_username || "";
+  $("skillTestInput").value = msg.app_url || msg.source || msg.display_content || "";
+  $("skillTestOutput").textContent = "识别公众号标题中...";
+  try {
+    const result = await fetchJson("/api/skills/test", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        skill_id: "official-account-reader",
+        send: false,
+        text: msg.display_content || "",
+        url: msg.app_url || "",
+        message: msg,
+        chat_username: state.selectedChat?.username || msg.chat_username || "",
+        chat_display_name: state.selectedChat?.display_name || msg.chat_display_name || "",
+        message_uid: msg.message_uid || "",
+      }),
+    });
+    $("skillTestOutput").textContent = JSON.stringify(result, null, 2);
+    await loadSkills();
+  } catch (error) {
+    $("skillTestOutput").textContent = error.message;
+  }
+}
+
+async function recognizeImageMessage(messageUid) {
+  const msg = (state.lastMessages || []).find((item) => String(item.message_uid || "") === String(messageUid || ""));
+  if (!msg) return;
+  await loadSkills();
+  state.selectedSkillId = "image-understanding";
+  switchView("skills");
+  $("skillTestSelect").value = "image-understanding";
+  $("skillTestChat").value = state.selectedChat?.username || msg.chat_username || "";
+  const quotedImage = msg.quote && ["3", "43", "47"].includes(String(msg.quote.type || ""));
+  $("skillTestInput").value = quotedImage
+    ? `理解这张被引用的图片：${msg.quote.content || msg.display_content || "[引用图片]"}`
+    : `理解这张图片：${msg.display_content || "[图片]"}`;
+  $("skillTestInput").dataset.messageUid = msg.message_uid || "";
+  $("skillTestOutput").textContent = "图片理解中...";
+  try {
+    const result = await fetchJson("/api/skills/test", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        skill_id: "image-understanding",
+        send: false,
+        text: $("skillTestInput").value.trim(),
+        message_uid: msg.message_uid || "",
+        message: msg,
+        chat_username: state.selectedChat?.username || msg.chat_username || "",
+        chat_display_name: state.selectedChat?.display_name || msg.chat_display_name || "",
+      }),
+    });
+    $("skillTestOutput").textContent = JSON.stringify(result, null, 2);
+    await loadSkills();
+  } catch (error) {
+    $("skillTestOutput").textContent = error.message;
+  }
 }
 
 async function loadSuiteStatus() {
@@ -3098,6 +3637,25 @@ function bindEvents() {
   $("previewReplyBtn").addEventListener("click", previewReply);
   $("draftReplyBtn").addEventListener("click", () => pushReplyToWechat(false));
   $("sendReplyBtn").addEventListener("click", () => pushReplyToWechat(true));
+  $("refreshSkillsBtn")?.addEventListener("click", () => loadSkills().catch((error) => alert(error.message)));
+  $("importSkillBtn")?.addEventListener("click", () => $("skillImportContent")?.focus());
+  $("submitSkillImportBtn")?.addEventListener("click", importSkill);
+  $("testSkillBtn")?.addEventListener("click", () => runSkillTest(false));
+  $("runSkillSendBtn")?.addEventListener("click", () => runSkillTest(true));
+  $("skillTestSelect")?.addEventListener("change", (event) => {
+    state.selectedSkillId = event.target.value;
+    state.skillConfigDirty = false;
+    if ($("skillTestInput")) $("skillTestInput").dataset.messageUid = "";
+    if (event.target.value !== "image-understanding" && $("skillImageUpload")) $("skillImageUpload").value = "";
+    updateSkillUploadVisibility();
+    renderSkills();
+  });
+  $("skillDetail")?.addEventListener("input", markSkillConfigDirty);
+  $("skillDetail")?.addEventListener("change", markSkillConfigDirty);
+  document.addEventListener("click", (event) => {
+    const skillAction = event.target.closest("[data-skill-action]");
+    if (skillAction) mutateSkill(skillAction.dataset.skillAction).catch((error) => alert(error.message));
+  });
   document.querySelectorAll("[data-memory-tab]").forEach((button) => button.addEventListener("click", () => {
     state.memoryUi.tab = button.dataset.memoryTab || "people";
     document.querySelectorAll("[data-memory-tab]").forEach((item) => item.classList.toggle("active", item === button));
@@ -3109,6 +3667,10 @@ function bindEvents() {
   document.addEventListener("click", (event) => {
     const button = event.target.closest("[data-memory-action]");
     if (button) mutateMemory(button);
+    const articleButton = event.target.closest("[data-article-message]");
+    if (articleButton) recognizeArticleMessage(articleButton.dataset.articleMessage).catch((error) => alert(error.message));
+    const imageButton = event.target.closest("[data-image-message]");
+    if (imageButton) recognizeImageMessage(imageButton.dataset.imageMessage).catch((error) => alert(error.message));
   });
   window.addEventListener("resize", () => {
     if (state.view === "overview") fitGraph();
@@ -3123,3 +3685,4 @@ load().catch((error) => {
   $("testState").textContent = "加载失败";
 });
 setInterval(() => refreshStatus().catch(() => {}), 5000);
+setInterval(() => refreshAutoReplyLive().catch(() => {}), 1500);

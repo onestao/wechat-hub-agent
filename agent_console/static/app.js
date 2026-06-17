@@ -14,6 +14,8 @@ const state = {
   semanticRuns: null,
   autoReply: null,
   skills: { skills: [], runs: [], stats: {} },
+  database: null,
+  photos: { items: [], stats: {}, auto: {}, status: "all", selectedUid: "" },
   selectedSkillId: "",
   skillConfigDirty: false,
   debug: null,
@@ -50,7 +52,7 @@ const state = {
 const $ = (id) => document.getElementById(id);
 
 const pageMeta = {
-  overview: ["群记忆总览", "查看服务运行、聊天同步、长期记忆和知识图谱。"],
+  overview: ["", ""],
   chat: ["聊天记录", "在 8078 内查看会话、消息、图片、表情、引用和搜索。"],
   services: ["服务状态", "在 8078 内查看容器、端口、同步和索引健康。"],
   models: ["模型配置", "新增、保存、检测和选择 OpenAI-compatible 模型。"],
@@ -58,6 +60,8 @@ const pageMeta = {
   talk: ["接话策略", "四种接话模式、阈值、随机发送延迟和评分标准。"],
   skills: ["技能中心", "导入、安装、启停、测试和导出 SKILL.md / OpenAPI / 内置技能。"],
   memory: ["群记忆中枢", "人物画像、长期事实、群故事线和聚焦关系都来自 AI 记忆库。"],
+  database: ["记忆数据库", "查看当前群组的数据库容量、模块记录数，并执行按群备份/导入。"],
+  photos: ["照片数据库", "按群展示图片记忆、视觉解析结果、标签和失败重试。"],
   test: ["模型测试", "向当前活跃模型发送一次短测试。"],
 };
 
@@ -139,10 +143,39 @@ function fmtIsoTime(value) {
   return date.toLocaleTimeString("zh-CN", { hour12: false });
 }
 
+function compactServerError(payload) {
+  if (!payload || typeof payload !== "object") return "请求失败";
+  const parts = [];
+  if (payload.error) parts.push(String(payload.error));
+  else if (payload.last_error) parts.push(String(payload.last_error));
+  else if (payload.reason) parts.push(String(payload.reason));
+  const results = Array.isArray(payload.results) ? payload.results : [];
+  const failed = results.filter((item) => item && item.ok === false);
+  if (failed.length) {
+    const sample = failed
+      .slice(0, 3)
+      .map((item) => item.error || item.summary || item.message_uid || "")
+      .filter(Boolean)
+      .join("；");
+    parts.push(`${failed.length} 项失败${sample ? `：${sample}` : ""}`);
+  }
+  return parts.filter(Boolean).join("；") || "请求失败";
+}
+
 async function fetchJson(url, options) {
   const response = await fetch(url, options);
-  const payload = await response.json();
-  if (!response.ok) throw new Error(payload.error || JSON.stringify(payload));
+  const text = await response.text();
+  let payload = {};
+  try {
+    payload = text ? JSON.parse(text) : {};
+  } catch (_) {
+    payload = { ok: false, error: text || response.statusText };
+  }
+  if (!response.ok) {
+    const error = new Error(compactServerError(payload));
+    error.payload = payload;
+    throw error;
+  }
   return payload;
 }
 
@@ -306,6 +339,7 @@ function compactJson(value) {
 
 function switchView(view) {
   state.view = pageMeta[view] ? view : "overview";
+  document.body.dataset.view = state.view;
   document.querySelectorAll(".page").forEach((page) => page.classList.toggle("active", page.dataset.page === state.view));
   document.querySelectorAll(".nav button").forEach((item) => item.classList.toggle("active", item.dataset.view === state.view));
   const [title, subtitle] = pageMeta[state.view];
@@ -314,6 +348,8 @@ function switchView(view) {
   if (state.view === "chat" && !state.chats.length) loadChats();
   if (state.view === "services") loadSuiteStatus();
   if (state.view === "skills") loadSkills().catch((error) => console.warn(error));
+  if (state.view === "database") loadDatabaseOverview().catch((error) => console.warn(error));
+  if (state.view === "photos") loadPhotos().catch((error) => console.warn(error));
   if (state.view === "overview") setTimeout(fitGraph, 0);
 }
 
@@ -349,6 +385,8 @@ async function setMemoryChat(username, options = {}) {
   if (options.fetch !== false) {
     await refreshFullStatus();
   }
+  if (state.view === "database") await loadDatabaseOverview();
+  if (state.view === "photos") await loadPhotos();
 }
 
 function fillProfileForm(profile) {
@@ -888,7 +926,7 @@ function renderOverviewMemory() {
   for (const summary of semantic.summaries || []) items.push({ title: "群摘要", meta: summary.chat_display_name || "群聊", text: summary.summary, tags: summary.topics || [] });
   for (const person of semantic.people || []) items.push({ title: "人物偏好", meta: person.display_name || person.person_key, text: formatObjectValue(person.preferences || person.traits || "已识别人物"), tags: [] });
   for (const fact of semantic.facts || []) items.push({ title: "长期事实", meta: fact.subject, text: `${fact.predicate}：${fact.object}`, tags: [fact.category].filter(Boolean) });
-  if (!items.length) items.push({ title: "可管理记忆", meta: "等待抽取", text: "暂无长期记忆，点击抽取记忆后会自动生成摘要、人物偏好、事实和关系边。", tags: [] });
+  if (!items.length) items.push({ title: "可管理记忆", meta: "等待自动抽取", text: "暂无长期记忆，后台会自动生成摘要、人物偏好、事实和关系边。", tags: [] });
   root.innerHTML = "";
   for (const item of items.slice(0, 4)) {
     const card = document.createElement("details");
@@ -1114,7 +1152,7 @@ function renderMemoryPersonDetail(person, facts, edges) {
   if (!person) {
     setText("memoryProfileHint", "暂无可展示成员");
     setText("memoryProfileConfidence", "--");
-    return renderEmpty(root, "暂无人物画像。可以先等待自动抽取，或点击顶部抽取记忆。");
+    return renderEmpty(root, "暂无人物画像。后台会自动抽取并生成画像。");
   }
   setText("memoryProfileHint", person.display_name || person.person_key || "群成员");
   const confidence = $("memoryProfileConfidence");
@@ -1601,6 +1639,331 @@ function uniqueStrings(items) {
     output.push(text);
   }
   return output;
+}
+
+function formatSize(bytes, fallback = "--") {
+  const value = Number(bytes);
+  if (!Number.isFinite(value) || value < 0) return fallback;
+  const units = ["B", "KB", "MB", "GB", "TB"];
+  let size = value;
+  let index = 0;
+  while (size >= 1024 && index < units.length - 1) {
+    size /= 1024;
+    index += 1;
+  }
+  return index === 0 ? `${Math.round(size)} B` : `${size.toFixed(1)} ${units[index]}`;
+}
+
+function ensureScopedChat() {
+  if (state.memoryChat) return state.memoryChat;
+  const fallback = state.selectedChat?.username || state.chats.find((chat) => chat.is_group)?.username || state.chats[0]?.username || "";
+  if (fallback) state.memoryChat = fallback;
+  return state.memoryChat;
+}
+
+async function loadDatabaseOverview() {
+  const chat = ensureScopedChat();
+  renderMemoryChatSelects();
+  const root = $("databaseModuleList");
+  if (!chat) {
+    if (root) renderEmpty(root, "先选择一个群组");
+    return;
+  }
+  const payload = await fetchJson(`/api/memory/databases?chat=${encodeURIComponent(chat)}`);
+  state.database = payload;
+  renderDatabaseConsole();
+}
+
+function renderDatabaseConsole() {
+  const data = state.database || {};
+  renderMemoryChatSelects();
+  setText("databaseScopeName", data.chat_display_name || activeMemoryChat()?.display_name || state.memoryChat || "--");
+  setText("databaseTotalSize", data.total_size || formatSize(data.total_bytes));
+  const dbGrid = $("databaseDbGrid");
+  if (dbGrid) {
+    dbGrid.innerHTML = (data.databases || []).map((db) => `
+      <div class="db-card">
+        <div><strong>${db.type === "memory" ? "原始微信记忆库" : "AI 派生记忆库"}</strong><span>${escapeHtml(db.path || "")}</span></div>
+        <b>${escapeHtml(db.size || formatSize(db.bytes))}</b>
+        <small>当前群估算 ${escapeHtml(db.scoped_estimated_size || formatSize(db.scoped_estimated_bytes))}</small>
+      </div>
+    `).join("") || `<div class="empty">等待数据库信息</div>`;
+  }
+  const moduleRoot = $("databaseModuleList");
+  if (moduleRoot) {
+    moduleRoot.innerHTML = (data.modules || []).map((item) => `
+      <label class="db-module-row">
+        <input type="checkbox" data-db-module="${escapeAttr(item.key)}" ${item.scoped_rows ? "checked" : ""} />
+        <span>
+          <strong>${escapeHtml(item.label)}</strong>
+          <small>${escapeHtml(item.table)} · ${item.database === "memory" ? "原始库" : "AI库"}</small>
+        </span>
+        <em>${fmtNumber(item.scoped_rows)} / ${fmtNumber(item.total_rows)}</em>
+        <b>${formatSize(item.estimated_bytes)}</b>
+      </label>
+    `).join("") || `<div class="empty">暂无模块</div>`;
+  }
+  setText("navDatabaseCount", fmtNumber((data.modules || []).reduce((sum, item) => sum + Number(item.scoped_rows || 0), 0)));
+}
+
+function selectedDatabaseModules(all = false) {
+  if (all) return (state.database?.export_modules || []).map((item) => item.key);
+  return [...document.querySelectorAll("[data-db-module]:checked")].map((input) => input.dataset.dbModule).filter(Boolean);
+}
+
+function downloadJson(filename, text) {
+  const blob = new Blob([text], { type: "application/json;charset=utf-8" });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = filename;
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  URL.revokeObjectURL(url);
+}
+
+async function exportMemoryBackup(all = false) {
+  const chat = ensureScopedChat();
+  if (!chat) throw new Error("请先选择群组");
+  const items = selectedDatabaseModules(all);
+  if (!items.length) throw new Error("至少选择一个导出模块");
+  const button = all ? $("exportDatabaseFullBtn") : $("exportDatabaseSelectedBtn");
+  const original = button?.textContent || "";
+  if (button) {
+    button.disabled = true;
+    button.textContent = "导出中";
+  }
+  try {
+    const payload = await fetchJson("/api/memory/export", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ chat, scope: all ? "full" : "selected", items }),
+    });
+    $("databaseExportOutput").value = payload.json || JSON.stringify(payload.backup || {}, null, 2);
+    const safeName = (payload.manifest?.chat_display_name || chat).replace(/[\\/:*?"<>|\s]+/g, "_");
+    downloadJson(`wechat-agent-${safeName}-${Date.now()}.json`, $("databaseExportOutput").value);
+    setText("databaseImportState", `导出完成：${payload.size || formatSize(payload.bytes)}`);
+  } finally {
+    if (button) {
+      button.disabled = false;
+      button.textContent = original;
+    }
+  }
+}
+
+async function importMemoryBackup(photoOnly = false) {
+  const chat = ensureScopedChat();
+  const input = photoOnly ? $("photoImportInput") : $("databaseImportInput");
+  const text = input?.value.trim();
+  if (!chat) throw new Error("请先选择群组");
+  if (!text) throw new Error("请粘贴备份 JSON");
+  const endpoint = photoOnly ? "/api/photos/import" : "/api/memory/import";
+  const stateNode = photoOnly ? "photoImportState" : "databaseImportState";
+  setText(stateNode, "导入中");
+  const payload = await fetchJson(endpoint, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "X-WeChatAgent-Confirm": "1" },
+    body: JSON.stringify({ chat, backup_json: text, confirm_action: true }),
+  });
+  setText(stateNode, `${payload.message || "导入完成"} · ${Object.entries(payload.imported || {}).map(([key, value]) => `${key}:${value}`).join(" ")}`);
+  await refreshFullStatus();
+  if (state.view === "database") await loadDatabaseOverview();
+  if (state.view === "photos") await loadPhotos();
+}
+
+function renderPhotoStatusPills(stats = {}) {
+  const root = $("photoStatusFilters");
+  if (!root) return;
+  const options = [
+    ["all", "全部", stats.total],
+    ["success", "已解析", stats.success],
+    ["pending", "待解析", stats.pending],
+    ["failed", "失败", stats.failed],
+  ];
+  root.innerHTML = options.map(([key, label, count]) => `
+    <button class="${state.photos.status === key ? "active" : ""}" type="button" data-photo-status="${key}">
+      ${label}<span>${fmtNumber(count || 0)}</span>
+    </button>
+  `).join("");
+}
+
+function renderPhotoAutoState() {
+  const auto = state.photos.auto || {};
+  const settings = state.config?.skills?.image_understanding || {};
+  const enabledChats = Array.isArray(settings.auto_analyze_chats) ? settings.auto_analyze_chats : [];
+  const enabledForChat = enabledChats.includes(state.memoryChat || "");
+  const toggle = $("photoAutoIngestEnabled");
+  if (toggle) {
+    toggle.checked = Boolean(enabledForChat && settings.auto_analyze_image_messages);
+  }
+  const bits = [];
+  if (auto.running) bits.push("自动入库运行中");
+  else if (toggle?.checked) bits.push("自动入库已开启");
+  else bits.push("自动入库未开启");
+  if (auto.last_processed) bits.push(`上轮 ${fmtNumber(auto.last_processed)} 张，成功 ${fmtNumber(auto.last_success)}，失败 ${fmtNumber(auto.last_failed)}`);
+  if (auto.last_skip_reason && toggle?.checked) bits.push(`状态 ${auto.last_skip_reason}`);
+  if (auto.last_error) bits.push(`错误 ${auto.last_error}`);
+  setText("photoActionState", bits.join(" · "));
+}
+
+async function loadPhotos() {
+  const chat = ensureScopedChat();
+  renderMemoryChatSelects();
+  if (!chat) {
+    renderEmpty($("photoGallery"), "先选择一个群组");
+    return;
+  }
+  const params = new URLSearchParams({ chat, status: state.photos.status || "all", limit: "120" });
+  const payload = await fetchJson(`/api/photos?${params.toString()}`);
+  state.photos.items = payload.items || [];
+  state.photos.stats = payload.stats || {};
+  state.photos.auto = payload.auto || {};
+  if (!state.photos.selectedUid || !state.photos.items.some((item) => item.message_uid === state.photos.selectedUid)) {
+    state.photos.selectedUid = state.photos.items[0]?.message_uid || "";
+  }
+  renderPhotoConsole(payload);
+}
+
+function renderPhotoConsole(payload = {}) {
+  renderMemoryChatSelects();
+  setText("photoScopeName", payload.chat_display_name || activeMemoryChat()?.display_name || state.memoryChat || "--");
+  renderPhotoStatusPills(state.photos.stats || {});
+  renderPhotoAutoState();
+  setText("navPhotoCount", fmtNumber(state.photos.stats?.success || 0));
+  const root = $("photoGallery");
+  if (!root) return;
+  root.innerHTML = "";
+  if (!state.photos.items.length) {
+    renderEmpty(root, "当前筛选没有图片");
+  } else {
+    for (const item of state.photos.items) {
+      const card = document.createElement("article");
+      card.tabIndex = 0;
+      card.role = "button";
+      card.className = `photo-card ${item.analysis_status || "pending"} ${state.photos.selectedUid === item.message_uid ? "active" : ""}`;
+      card.dataset.photoUid = item.message_uid;
+      const tags = (item.tags || []).slice(0, 4).map((tag) => `<span>${escapeHtml(tag)}</span>`).join("");
+      card.innerHTML = `
+        <div class="photo-thumb">${item.thumb_url || item.media_url ? `<img src="${escapeAttr(item.thumb_url || item.media_url)}" loading="lazy" alt="photo">` : `<span>无预览</span>`}</div>
+        <div class="photo-card-body">
+          <strong>${escapeHtml(item.sender_name || "未知成员")}</strong>
+          <small>${fmtTime(item.create_time)} · ${escapeHtml(item.media_type || item.type_label || "")}</small>
+          <p>${escapeHtml(item.summary || item.media_error || "等待图片解析入库")}</p>
+          <div class="photo-tags">${tags}</div>
+        </div>
+        <i>${item.analysis_status === "success" ? "已解析" : item.analysis_status === "failed" ? "失败" : "待解析"}</i>
+      `;
+      card.addEventListener("click", () => {
+        state.photos.selectedUid = item.message_uid;
+        renderPhotoConsole(payload);
+      });
+      card.addEventListener("keydown", (event) => {
+        if (event.key !== "Enter" && event.key !== " ") return;
+        event.preventDefault();
+        state.photos.selectedUid = item.message_uid;
+        renderPhotoConsole(payload);
+      });
+      root.appendChild(card);
+    }
+  }
+  renderPhotoDetail();
+}
+
+function renderPhotoDetail() {
+  const root = $("photoDetail");
+  if (!root) return;
+  const item = state.photos.items.find((photo) => photo.message_uid === state.photos.selectedUid);
+  if (!item) return renderEmpty(root, "选择一张图片查看解析内容");
+  const details = item.details && Object.keys(item.details).length ? JSON.stringify(item.details, null, 2) : "暂无详细 JSON";
+  root.innerHTML = `
+    <div class="photo-detail-image">${item.media_url ? `<img src="${escapeAttr(item.media_url)}" alt="photo detail">` : `<span>无预览</span>`}</div>
+    <div class="photo-detail-meta">
+      <strong>${escapeHtml(item.sender_name || "未知成员")}</strong>
+      <span>${fmtTime(item.create_time)} · ${escapeHtml(item.message_uid || "")}</span>
+      <span class="pill ${item.analysis_status === "success" ? "ok" : item.analysis_status === "failed" ? "bad" : ""}">${item.analysis_status === "success" ? "解析成功" : item.analysis_status === "failed" ? "解析失败" : "待解析"}</span>
+    </div>
+    <h4>解析内容</h4>
+    <p class="photo-summary">${escapeHtml(item.summary || item.media_error || "还没有解析内容")}</p>
+    <h4>标签</h4>
+    <div class="photo-tags strong">${(item.tags || []).map((tag) => `<span>${escapeHtml(tag)}</span>`).join("") || "<span>暂无标签</span>"}</div>
+    <h4>原消息文字</h4>
+    <p class="photo-summary">${escapeHtml(item.text || "[图片消息]")}</p>
+    <h4>详情 JSON</h4>
+    <pre class="photo-json">${escapeHtml(details)}</pre>
+    <div class="button-row"><button class="btn primary" type="button" data-photo-retry-one="${escapeAttr(item.message_uid)}">重新解析这张</button></div>
+  `;
+}
+
+async function retryPhotos(options = {}) {
+  const chat = ensureScopedChat();
+  if (!chat) throw new Error("请先选择群组");
+  const body = { chat, limit: options.limit || 20 };
+  if (options.message_uid) body.message_uids = [options.message_uid];
+  if (options.failed_only) body.failed_only = true;
+  if (options.pending_only) body.pending_only = true;
+  const button = options.button;
+  const original = button?.textContent || "";
+  if (button) {
+    button.disabled = true;
+    button.textContent = "解析中";
+  }
+  setText("photoActionState", "正在调用图片理解模型");
+  try {
+    const payload = await fetchJson("/api/photos/retry", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    setText("photoActionState", `完成 ${fmtNumber(payload.processed)} 张 · 成功 ${fmtNumber(payload.success)} · 失败 ${fmtNumber(payload.failed)}`);
+    await loadPhotos();
+  } finally {
+    if (button) {
+      button.disabled = false;
+      button.textContent = original;
+    }
+  }
+}
+
+async function exportPhotoBackup() {
+  const chat = ensureScopedChat();
+  if (!chat) throw new Error("请先选择群组");
+  const payload = await fetchJson("/api/photos/export", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ chat }),
+  });
+  $("photoExportOutput").value = payload.json || JSON.stringify(payload.backup || {}, null, 2);
+  const safeName = (payload.manifest?.chat_display_name || chat).replace(/[\\/:*?"<>|\s]+/g, "_");
+  downloadJson(`wechat-agent-photos-${safeName}-${Date.now()}.json`, $("photoExportOutput").value);
+  setText("photoImportState", `照片记忆导出完成：${payload.size || formatSize(payload.bytes)}`);
+}
+
+async function setPhotoAutoIngest(enabled) {
+  const chat = ensureScopedChat();
+  if (!chat) throw new Error("请先选择群组");
+  setText("photoActionState", enabled ? "正在开启当前群自动入库" : "正在关闭当前群自动入库");
+  const payload = await fetchJson("/api/photos/auto-config", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ chat, enabled }),
+  });
+  if (state.config?.skills) state.config.skills.image_understanding = payload.settings || state.config.skills.image_understanding;
+  if (enabled) {
+    const run = await fetchJson("/api/photos/auto-run", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({}) });
+    if (run.skipped) {
+      setText("photoActionState", `自动入库已开启：${run.reason || "暂无待解析图片"}`);
+    } else {
+      setText(
+        "photoActionState",
+        `自动入库已执行 ${fmtNumber(run.last_processed || 0)} 张 · 成功 ${fmtNumber(run.last_success || 0)} · 失败 ${fmtNumber(run.last_failed || 0)}`
+      );
+    }
+  } else {
+    setText("photoActionState", "当前群自动入库已关闭");
+  }
+  await refreshFullStatus();
+  await loadPhotos();
 }
 
 function renderSummaries(items) {
@@ -2488,6 +2851,39 @@ function zoomGraph(delta) {
   applyGraphTransform(true);
 }
 
+function graphFullscreenPanel() {
+  return document.querySelector(".graph-panel");
+}
+
+function graphFullscreenActive() {
+  const panel = graphFullscreenPanel();
+  return Boolean(panel && (document.fullscreenElement === panel || panel.classList.contains("fullscreen-fallback")));
+}
+
+function updateGraphFullscreenButton() {
+  const button = $("graphFullscreenBtn");
+  if (button) button.textContent = graphFullscreenActive() ? "退出" : "全屏";
+  if (state.view === "overview") setTimeout(fitGraph, 80);
+}
+
+async function toggleGraphFullscreen() {
+  const panel = graphFullscreenPanel();
+  if (!panel) return;
+  try {
+    if (graphFullscreenActive()) {
+      if (document.fullscreenElement) await document.exitFullscreen();
+      panel.classList.remove("fullscreen-fallback");
+    } else if (panel.requestFullscreen) {
+      await panel.requestFullscreen();
+    } else {
+      panel.classList.add("fullscreen-fallback");
+    }
+  } catch (_) {
+    panel.classList.toggle("fullscreen-fallback");
+  }
+  updateGraphFullscreenButton();
+}
+
 async function load() {
   const payload = await fetchJson(statusUrl());
   state.config = payload.config;
@@ -2522,6 +2918,8 @@ async function refreshStatus() {
   if (state.view === "services") await loadSuiteStatus();
   if (state.view === "chat") await loadChats(true);
   if (state.view === "skills") await loadSkills();
+  if (state.view === "database") await loadDatabaseOverview();
+  if (state.view === "photos") await loadPhotos();
 }
 
 async function refreshFullStatus() {
@@ -2621,6 +3019,8 @@ function renderChatSelect(id, selected = "", includeAll = false, allLabel = "全
 function renderMemoryChatSelects() {
   renderChatSelect("memoryChat", state.memoryChat, true, "全部记忆");
   renderChatSelect("memoryChatPanel", state.memoryChat, true, "全部记忆");
+  renderChatSelect("databaseChat", state.memoryChat, false, "选择群组");
+  renderChatSelect("photosChat", state.memoryChat, false, "选择群组");
   const scope = state.semantic?.scope || {};
   const chat = activeMemoryChat();
   const label = state.memoryChat
@@ -2865,11 +3265,20 @@ function renderSkillDetail() {
       ${skill.source === "builtin" ? "" : `<button class="btn danger" type="button" data-skill-action="delete">删除</button>`}
     </section>
   `;
+  if (skill.skill_id === "image-understanding") bindImageSkillConfig();
   if (skill.skill_id === "meme-sender") bindMemeSkillConfig();
 }
 
 function renderImageSkillConfig(config) {
   const keyState = config.api_key_configured ? `Key 已配置 · ${escapeHtml(config.api_key_tail || "")}` : "Key 未配置";
+  const profileOptions = [
+    `<option value="">手动填写 Base URL / Key</option>`,
+    ...(state.config?.llm_profiles || []).map((profile) => {
+      const selected = String(config.profile_id || "") === String(profile.id || "") ? "selected" : "";
+      const label = `${profile.name || profile.id || "模型"} · ${profile.model || ""}`;
+      return `<option value="${escapeAttr(profile.id || "")}" ${selected}>${escapeHtml(label)}</option>`;
+    }),
+  ].join("");
   return `
     <section class="skill-detail-section image-skill-config">
       <h4>图片理解模型</h4>
@@ -2878,20 +3287,135 @@ function renderImageSkillConfig(config) {
         <label class="switch-label tight"><input id="imageSkillAutoEnabled" type="checkbox" ${config.auto_enabled !== false ? "checked" : ""} /><span>允许自动触发</span></label>
         <label class="switch-label tight"><input id="imageSkillAutoImages" type="checkbox" ${config.auto_analyze_image_messages ? "checked" : ""} /><span>收到图片自动解析</span></label>
         <label class="switch-label tight"><input id="imageSkillUseActive" type="checkbox" ${config.use_active_profile ? "checked" : ""} /><span>复用当前主模型</span></label>
+        <label class="span-2"><span>使用模型页配置</span><select id="imageSkillProfileId">${profileOptions}</select></label>
         <label><span>Base URL</span><input id="imageSkillBaseUrl" value="${escapeAttr(config.base_url || "")}" autocomplete="off" placeholder="https://api.example.com/v1 或本地地址" /></label>
-        <label><span>模型</span><input id="imageSkillModel" value="${escapeAttr(config.model || "")}" autocomplete="off" placeholder="gpt-4o-mini / qwen-vl / 本地视觉模型" /></label>
+        <label><span>模型</span><input id="imageSkillModel" list="imageSkillModelOptions" value="${escapeAttr(config.model || "")}" autocomplete="off" placeholder="gpt-4o-mini / qwen-vl / 本地视觉模型" /><datalist id="imageSkillModelOptions"></datalist></label>
         <label><span>API Key</span><input id="imageSkillApiKey" type="password" autocomplete="off" placeholder="${escapeAttr(keyState)}" /></label>
         <label class="switch-label tight"><input id="imageSkillAllowEmptyKey" type="checkbox" ${config.allow_empty_api_key ? "checked" : ""} /><span>本地模型允许空 Key</span></label>
         <label><span>Temperature</span><input id="imageSkillTemperature" type="number" min="0" max="2" step="0.1" value="${escapeAttr(config.temperature ?? 0.2)}" /></label>
         <label><span>输出上限</span><input id="imageSkillMaxTokens" type="number" min="64" max="8192" step="64" value="${escapeAttr(config.max_tokens ?? 700)}" /></label>
         <label><span>超时秒</span><input id="imageSkillTimeout" type="number" min="3" max="180" step="1" value="${escapeAttr(config.timeout_seconds ?? 45)}" /></label>
         <label><span>缓存小时</span><input id="imageSkillCacheHours" type="number" min="0" max="8760" step="1" value="${escapeAttr(config.cache_hours ?? 720)}" /></label>
+        <div class="span-2 image-skill-actions">
+          <button id="imageSkillFetchModelsBtn" class="btn" type="button">获取模型列表</button>
+          <button id="imageSkillTestModelBtn" class="btn" type="button">测试模型通断</button>
+          <span id="imageSkillModelState" class="pill">待检测</span>
+        </div>
+        <div id="imageSkillModelList" class="span-2 image-skill-model-list"><span class="muted">未获取模型列表</span></div>
+        <pre id="imageSkillModelOutput" class="span-2 image-skill-model-output">等待模型检测</pre>
         <label class="span-2 textarea-label"><span>图片理解提示词</span><textarea id="imageSkillPrompt" rows="6">${escapeHtml(config.prompt || "")}</textarea></label>
       </div>
       <p class="muted">图片模型走 OpenAI-compatible /chat/completions 的 image_url 格式；本地模型可填本地 Base URL 并开启空 Key。</p>
     </section>
     <section class="skill-detail-section compact-json"><h4>配置 JSON</h4><textarea id="skillConfigJson" rows="5">${escapeHtml(JSON.stringify(config || {}, null, 2))}</textarea></section>
   `;
+}
+
+function renderImageSkillModelResult(result, mode = "test") {
+  const stateEl = $("imageSkillModelState");
+  const outputEl = $("imageSkillModelOutput");
+  if (!stateEl || !outputEl) return;
+  stateEl.className = result?.ok ? "pill ok" : "pill bad";
+  if (mode === "models") {
+    stateEl.textContent = result?.ok ? `模型 ${result.models?.length || 0} 个` : "获取失败";
+  } else {
+    stateEl.textContent = result?.ok ? "连接正常" : "连接失败";
+  }
+  outputEl.textContent = result?.ok
+    ? JSON.stringify({
+      ok: result.ok,
+      status: result.status,
+      model: result.model,
+      elapsed_ms: result.elapsed_ms,
+      message: result.message,
+      models: result.models,
+      usage: result.usage,
+      note: result.vision_note,
+      fetched_at: result.fetched_at,
+      tested_at: result.tested_at,
+    }, null, 2)
+    : JSON.stringify(result || {}, null, 2);
+}
+
+async function fetchImageSkillModels() {
+  if (!$("imageSkillFetchModelsBtn")) return;
+  const button = $("imageSkillFetchModelsBtn");
+  button.disabled = true;
+  button.textContent = "获取中";
+  try {
+    const config = collectImageSkillConfig(selectedSkill()?.config || {});
+    const result = await fetchJson("/api/skills/image-understanding/models", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ config }),
+    });
+    const datalist = $("imageSkillModelOptions");
+    const list = $("imageSkillModelList");
+    if (datalist) datalist.innerHTML = "";
+    if (list) list.innerHTML = "";
+    for (const model of result.models || []) {
+      if (datalist) {
+        const option = document.createElement("option");
+        option.value = model;
+        datalist.appendChild(option);
+      }
+      if (list) {
+        const chip = document.createElement("button");
+        chip.type = "button";
+        chip.className = "model-chip";
+        chip.textContent = model;
+        chip.addEventListener("click", () => {
+          $("imageSkillModel").value = model;
+          collectImageSkillConfig(selectedSkill()?.config || {});
+          markSkillConfigDirty();
+        });
+        list.appendChild(chip);
+      }
+    }
+    if (list && !(result.models || []).length) list.innerHTML = `<span class="model-chip">接口连通，但未返回模型列表</span>`;
+    renderImageSkillModelResult(result, "models");
+  } catch (error) {
+    renderImageSkillModelResult(error.payload || { ok: false, error: error.message }, "models");
+  } finally {
+    button.disabled = false;
+    button.textContent = "获取模型列表";
+  }
+}
+
+async function testImageSkillModel() {
+  if (!$("imageSkillTestModelBtn")) return;
+  const button = $("imageSkillTestModelBtn");
+  button.disabled = true;
+  button.textContent = "检测中";
+  try {
+    const config = collectImageSkillConfig(selectedSkill()?.config || {});
+    const result = await fetchJson("/api/skills/image-understanding/test-model", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ config }),
+    });
+    renderImageSkillModelResult(result, "test");
+  } catch (error) {
+    renderImageSkillModelResult(error.payload || { ok: false, error: error.message }, "test");
+  } finally {
+    button.disabled = false;
+    button.textContent = "测试模型通断";
+  }
+}
+
+function bindImageSkillConfig() {
+  $("imageSkillFetchModelsBtn")?.addEventListener("click", fetchImageSkillModels);
+  $("imageSkillTestModelBtn")?.addEventListener("click", testImageSkillModel);
+  $("imageSkillProfileId")?.addEventListener("change", () => {
+    const profile = (state.config?.llm_profiles || []).find((item) => String(item.id || "") === $("imageSkillProfileId").value);
+    if (profile) {
+      $("imageSkillBaseUrl").value = profile.base_url || "";
+      if (!$("imageSkillModel").value.trim()) $("imageSkillModel").value = profile.model || "";
+      $("imageSkillApiKey").value = "";
+    }
+    collectImageSkillConfig(selectedSkill()?.config || {});
+    markSkillConfigDirty();
+  });
 }
 
 function collectImageSkillConfig(fallback = {}) {
@@ -2903,7 +3427,12 @@ function collectImageSkillConfig(fallback = {}) {
     enabled: $("imageSkillEnabled").checked,
     auto_enabled: $("imageSkillAutoEnabled").checked,
     auto_analyze_image_messages: $("imageSkillAutoImages").checked,
+    auto_analyze_chats: Array.isArray(fallback.auto_analyze_chats) ? fallback.auto_analyze_chats : [],
+    auto_analyze_interval_seconds: fallback.auto_analyze_interval_seconds || 30,
+    auto_analyze_batch_size: fallback.auto_analyze_batch_size || 2,
+    auto_retry_failed_hours: fallback.auto_retry_failed_hours || 12,
     use_active_profile: $("imageSkillUseActive").checked,
+    profile_id: $("imageSkillProfileId")?.value || "",
     base_url: $("imageSkillBaseUrl").value.trim(),
     model: $("imageSkillModel").value.trim(),
     allow_empty_api_key: $("imageSkillAllowEmptyKey").checked,
@@ -3526,31 +4055,6 @@ async function testLLM() {
   }
 }
 
-async function extractMemory() {
-  $("extractMemoryBtn").disabled = true;
-  $("extractMemoryBtn").textContent = "抽取中";
-  try {
-    await fetchJson("/api/extract-memory", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ chat: state.memoryChat || "", limit: 80, batch_size: 5 }),
-    });
-    const payload = await fetchJson(statusUrl());
-    mergeRuntimeStatus(payload);
-    renderLayers();
-    updateTop();
-    $("extractMemoryBtn").textContent = "抽取完成";
-  } catch (error) {
-    alert(error.message);
-    $("extractMemoryBtn").textContent = "抽取失败";
-  } finally {
-    setTimeout(() => {
-      $("extractMemoryBtn").disabled = false;
-      $("extractMemoryBtn").textContent = "抽取记忆";
-    }, 1200);
-  }
-}
-
 async function mutateMemory(button) {
   const controls = button.closest("[data-memory-kind][data-memory-id]");
   if (!controls) return;
@@ -3777,6 +4281,8 @@ function bindEvents() {
   $("zoomOutBtn").addEventListener("click", () => zoomGraph(0.82));
   $("zoomInBtn").addEventListener("click", () => zoomGraph(1.22));
   $("zoomResetBtn").addEventListener("click", fitGraph);
+  $("graphFullscreenBtn")?.addEventListener("click", toggleGraphFullscreen);
+  document.addEventListener("fullscreenchange", updateGraphFullscreenButton);
   $("graphViewport").addEventListener("wheel", (event) => {
     event.preventDefault();
     zoomGraph(event.deltaY > 0 ? 0.9 : 1.1);
@@ -3821,9 +4327,35 @@ function bindEvents() {
     $("graphViewport").classList.remove("dragging");
   });
   $("refreshBtn").addEventListener("click", () => refreshFullStatus().catch((error) => alert(error.message)));
-  $("extractMemoryBtn").addEventListener("click", extractMemory);
   $("memoryChat")?.addEventListener("change", (event) => setMemoryChat(event.target.value).catch((error) => alert(error.message)));
   $("memoryChatPanel")?.addEventListener("change", (event) => setMemoryChat(event.target.value).catch((error) => alert(error.message)));
+  $("databaseChat")?.addEventListener("change", (event) => setMemoryChat(event.target.value).catch((error) => alert(error.message)));
+  $("photosChat")?.addEventListener("change", (event) => setMemoryChat(event.target.value).catch((error) => alert(error.message)));
+  $("refreshDatabaseBtn")?.addEventListener("click", () => loadDatabaseOverview().catch((error) => alert(error.message)));
+  $("exportDatabaseSelectedBtn")?.addEventListener("click", () => exportMemoryBackup(false).catch((error) => alert(error.message)));
+  $("exportDatabaseFullBtn")?.addEventListener("click", () => exportMemoryBackup(true).catch((error) => alert(error.message)));
+  $("importDatabaseBtn")?.addEventListener("click", () => importMemoryBackup(false).catch((error) => alert(error.message)));
+  $("refreshPhotosBtn")?.addEventListener("click", () => loadPhotos().catch((error) => alert(error.message)));
+  $("analyzePendingPhotosBtn")?.addEventListener("click", (event) => retryPhotos({ pending_only: true, button: event.currentTarget }).catch((error) => alert(error.message)));
+  $("retryFailedPhotosBtn")?.addEventListener("click", (event) => retryPhotos({ failed_only: true, button: event.currentTarget }).catch((error) => alert(error.message)));
+  $("exportPhotosBtn")?.addEventListener("click", () => exportPhotoBackup().catch((error) => alert(error.message)));
+  $("importPhotosBtn")?.addEventListener("click", () => importMemoryBackup(true).catch((error) => alert(error.message)));
+  $("photoAutoIngestEnabled")?.addEventListener("change", (event) => setPhotoAutoIngest(event.target.checked).catch((error) => {
+    event.target.checked = !event.target.checked;
+    alert(error.message);
+  }));
+  $("photoStatusFilters")?.addEventListener("click", (event) => {
+    const button = event.target.closest("[data-photo-status]");
+    if (!button) return;
+    state.photos.status = button.dataset.photoStatus || "all";
+    state.photos.selectedUid = "";
+    loadPhotos().catch((error) => alert(error.message));
+  });
+  $("photoDetail")?.addEventListener("click", (event) => {
+    const button = event.target.closest("[data-photo-retry-one]");
+    if (!button) return;
+    retryPhotos({ message_uid: button.dataset.photoRetryOne, button }).catch((error) => alert(error.message));
+  });
   $("chatSearch").addEventListener("input", renderChatList);
   $("messageSearchBtn").addEventListener("click", searchMessages);
   $("typeFilter").addEventListener("change", () => {

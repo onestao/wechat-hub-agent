@@ -9,7 +9,13 @@ This workspace runs browser-based WeChat plus a read-only local memory pipeline.
 - `wechat-ai-memory`: AI memory API and incremental indexer, exposed on `http://127.0.0.1:8090`.
 - `wechat-agent-console`: unified console for chat viewer, service status, LLM/persona/memory layers, exposed on `http://127.0.0.1:8078`.
 
-`wechat-memory-sync`, `wechat-ai-memory`, and `wechat-agent-console` use the same local image:
+`wechat-memory-sync`, `wechat-ai-memory`, and `wechat-agent-console` use the same project image. Release deployments pull:
+
+```bash
+docker.io/xiaoguiwucan/linux-wechat-agent:latest
+```
+
+Local development can still build:
 
 ```bash
 local/wechat-memory-suite:latest
@@ -31,8 +37,7 @@ docker compose up -d
 Rebuild after code changes:
 
 ```bash
-DOCKER_BUILDKIT=0 docker compose build wechat-memory-sync
-docker compose up -d wechat-memory-sync wechat-ai-memory wechat-agent-console
+./scripts/dev-up.sh
 ```
 
 ## Useful Checks

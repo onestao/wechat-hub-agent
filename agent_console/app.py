@@ -14,6 +14,7 @@ import mimetypes
 import os
 import random
 import re
+import shlex
 import shutil
 import socket
 import sqlite3
@@ -49,6 +50,7 @@ CONFIG_FILE = RUNTIME_DIR / "config.json"
 STATUS_FILE = RUNTIME_DIR / "status.json"
 SEMANTIC_STATE_FILE = RUNTIME_DIR / "semantic_extract_state.json"
 AUTO_REPLY_STATE_FILE = RUNTIME_DIR / "auto_reply_state.json"
+IMAGE_AUTO_STATE_FILE = RUNTIME_DIR / "image_auto_state.json"
 REPORT_LLM_CACHE_FILE = RUNTIME_DIR / "report_llm_cache.json"
 REPORT_LLM_CACHE_VERSION = "v10"
 SKILLS_DIR = RUNTIME_DIR / "skills"
@@ -74,6 +76,10 @@ try:
     DISPLAY_TZ = ZoneInfo("Asia/Shanghai")
 except ZoneInfoNotFoundError:
     DISPLAY_TZ = timezone(timedelta(hours=8), "Asia/Shanghai")
+
+
+def sh_quote(value: str | Path) -> str:
+    return shlex.quote(str(value))
 
 
 DEFAULT_LLM_PROFILE = {
@@ -208,7 +214,12 @@ DEFAULT_CONFIG = {
             "enabled": True,
             "auto_enabled": True,
             "auto_analyze_image_messages": False,
+            "auto_analyze_chats": [],
+            "auto_analyze_interval_seconds": 30,
+            "auto_analyze_batch_size": 2,
+            "auto_retry_failed_hours": 12,
             "use_active_profile": False,
+            "profile_id": "",
             "base_url": "http://host.docker.internal:8080/v1",
             "model": "qwen3vl-2b-q4km",
             "api_key": "local",
@@ -218,8 +229,11 @@ DEFAULT_CONFIG = {
             "timeout_seconds": 20,
             "cache_hours": 720,
             "prompt": (
-                "请极速理解这张微信群图片。用中文简洁输出：画面内容、可见文字/OCR、"
-                "可能的梗或语境、适合群聊的短回复。不要编造看不见的细节。"
+                "请认真理解这张微信群图片的真实内容，重点不是描述界面长相，而是读懂图里实际在说什么。"
+                "如果是截图、聊天记录、网页、公告、订单、表格、报错或数据看板，必须优先做 OCR/读文字，"
+                "提取标题、关键数字、人物、结论、问题和操作含义，再用自然中文总结。"
+                "只有确实无法辨认的文字才说具体哪部分看不清；不要只说“这是聊天/消息界面/电脑屏幕”。"
+                "最后给 3 到 6 个短标签，格式为 [标签]。"
             ),
         },
     },
@@ -229,6 +243,7 @@ HEALTH_CACHE: dict[str, dict] = {}
 HEALTH_LOCK = threading.Lock()
 SEMANTIC_LOCK = threading.Lock()
 AUTO_REPLY_STATE_LOCK = threading.RLock()
+IMAGE_AUTO_STATE_LOCK = threading.RLock()
 WECHAT_SEND_LOCK = threading.Lock()
 
 MEMORY_EXTRACT_SYSTEM_PROMPT = (
@@ -732,7 +747,18 @@ def sanitize_skills_config(raw: dict, current: dict | None = None) -> dict:
     image_key = str(image_raw.get("api_key") or "").strip()
     if not image_key and image_raw.get("api_key_configured"):
         image_key = str(image_current.get("api_key") or "").strip()
+    image_use_active_profile = bool(image_raw.get("use_active_profile", image_current.get("use_active_profile", False)))
+    image_profile_id = str(image_raw.get("profile_id") or image_current.get("profile_id") or "").strip()[:80]
     meme_probability = clamp_float(meme_raw.get("probability"), meme_current.get("probability", 0.0), 0.0, 1.0)
+    image_prompt = str(
+        image_raw.get("prompt")
+        or image_current.get("prompt")
+        or defaults["image_understanding"]["prompt"]
+    ).strip()
+    if image_prompt.startswith("请理解这张微信群图片。输出中文，包含：1. 图里有什么"):
+        image_prompt = str(defaults["image_understanding"]["prompt"]).strip()
+    if image_prompt.startswith("请像真实群友在整理图片记忆一样理解这张图"):
+        image_prompt = str(defaults["image_understanding"]["prompt"]).strip()
     return {
         "enabled": bool(raw.get("enabled", current.get("enabled", defaults["enabled"]))),
         "blue_mention_enabled": bool(
@@ -784,20 +810,65 @@ def sanitize_skills_config(raw: dict, current: dict | None = None) -> dict:
             "auto_analyze_image_messages": bool(
                 image_raw.get("auto_analyze_image_messages", image_current.get("auto_analyze_image_messages", False))
             ),
-            "use_active_profile": bool(image_raw.get("use_active_profile", image_current.get("use_active_profile", False))),
-            "base_url": str(image_raw.get("base_url") or image_current.get("base_url") or "").strip(),
-            "model": str(image_raw.get("model") or image_current.get("model") or "").strip(),
-            "api_key": image_key or str(image_current.get("api_key") or "").strip(),
-            "allow_empty_api_key": bool(image_raw.get("allow_empty_api_key", image_current.get("allow_empty_api_key", False))),
+            "auto_analyze_chats": unique_texts(
+                [
+                    str(item or "").strip()
+                    for item in (
+                        image_raw.get("auto_analyze_chats")
+                        if isinstance(image_raw.get("auto_analyze_chats"), list)
+                        else image_current.get("auto_analyze_chats", [])
+                    )
+                    if str(item or "").strip()
+                ]
+            )[:100],
+            "auto_analyze_interval_seconds": clamp_int(
+                image_raw.get("auto_analyze_interval_seconds"),
+                image_current.get("auto_analyze_interval_seconds", 30),
+                10,
+                86400,
+            ),
+            "auto_analyze_batch_size": clamp_int(
+                image_raw.get("auto_analyze_batch_size"),
+                image_current.get("auto_analyze_batch_size", 2),
+                1,
+                20,
+            ),
+            "auto_retry_failed_hours": clamp_int(
+                image_raw.get("auto_retry_failed_hours"),
+                image_current.get("auto_retry_failed_hours", 12),
+                0,
+                24 * 30,
+            ),
+            "use_active_profile": image_use_active_profile,
+            "profile_id": image_profile_id,
+            "base_url": str(
+                image_raw.get("base_url")
+                or image_current.get("base_url")
+                or defaults["image_understanding"]["base_url"]
+            ).strip(),
+            "model": str(
+                image_raw.get("model")
+                or image_current.get("model")
+                or defaults["image_understanding"]["model"]
+            ).strip(),
+            "api_key": ""
+            if image_use_active_profile or image_profile_id
+            else image_key
+            or str(image_current.get("api_key") or "").strip()
+            or defaults["image_understanding"]["api_key"],
+            "allow_empty_api_key": bool(
+                image_raw.get(
+                    "allow_empty_api_key",
+                    image_current.get("allow_empty_api_key", defaults["image_understanding"]["allow_empty_api_key"]),
+                )
+            )
+            if not (image_use_active_profile or image_profile_id)
+            else False,
             "temperature": clamp_float(image_raw.get("temperature"), image_current.get("temperature", 0.2), 0.0, 2.0),
             "max_tokens": clamp_int(image_raw.get("max_tokens"), image_current.get("max_tokens", 700), 64, 8192),
             "timeout_seconds": clamp_int(image_raw.get("timeout_seconds"), image_current.get("timeout_seconds", 45), 3, 180),
             "cache_hours": clamp_int(image_raw.get("cache_hours"), image_current.get("cache_hours", 720), 0, 24 * 365),
-            "prompt": str(
-                image_raw.get("prompt")
-                or image_current.get("prompt")
-                or defaults["image_understanding"]["prompt"]
-            ).strip()[:3000],
+            "prompt": image_prompt[:3000],
         },
     }
 
@@ -1072,6 +1143,1093 @@ def memory_status() -> dict:
     }
 
 
+MEMORY_EXPORT_MODULES = {
+    "chat": {"label": "群信息", "db": "memory", "table": "chats", "where": "username=?"},
+    "messages": {"label": "原始消息", "db": "memory", "table": "messages", "where": "chat_username=?"},
+    "media": {"label": "媒体索引", "db": "memory", "table": "message_media", "where": "chat_username=?"},
+    "chunks": {"label": "向量文本块", "db": "ai", "table": "ai_chunks", "where": "chat_username=?"},
+    "vectors": {
+        "label": "向量数据",
+        "db": "ai",
+        "table": "ai_vectors",
+        "where": "chunk_uid IN (SELECT chunk_uid FROM ai_chunks WHERE chat_username=?)",
+    },
+    "indexed_messages": {
+        "label": "消息索引映射",
+        "db": "ai",
+        "table": "ai_indexed_messages",
+        "where": "chunk_uid IN (SELECT chunk_uid FROM ai_chunks WHERE chat_username=?)",
+    },
+    "facts": {"label": "长期事实", "db": "ai", "table": "ai_facts", "where": "chat_username=?"},
+    "people": {"label": "人物画像", "db": "ai", "table": "ai_people_profiles", "where": "chat_username=?"},
+    "summaries": {"label": "群摘要", "db": "ai", "table": "ai_group_summaries", "where": "chat_username=?"},
+    "edges": {"label": "关系边", "db": "ai", "table": "ai_graph_edges", "where": "chat_username=?"},
+    "photos": {"label": "图片解析", "db": "ai", "table": "image_understanding_cache", "where": "chat_username=?"},
+}
+
+MEMORY_IMPORT_MODULES = set(MEMORY_EXPORT_MODULES)
+MEMORY_FULL_EXPORT_ITEMS = [
+    "chat",
+    "messages",
+    "media",
+    "chunks",
+    "vectors",
+    "indexed_messages",
+    "facts",
+    "people",
+    "summaries",
+    "edges",
+    "photos",
+]
+
+
+def file_size(path: Path) -> int:
+    try:
+        return path.stat().st_size if path.exists() else 0
+    except OSError:
+        return 0
+
+
+def format_bytes(value: int) -> str:
+    size = float(max(0, int(value or 0)))
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if size < 1024 or unit == "TB":
+            return f"{size:.1f} {unit}" if unit != "B" else f"{int(size)} B"
+        size /= 1024
+    return f"{size:.1f} TB"
+
+
+def table_count(conn: sqlite3.Connection, table: str, where: str = "", params: tuple = ()) -> int:
+    if not table_exists(conn, table):
+        return 0
+    sql = f"SELECT COUNT(*) FROM {table}"
+    if where:
+        sql += f" WHERE {where}"
+    return int(conn.execute(sql, params).fetchone()[0] or 0)
+
+
+def table_rows(conn: sqlite3.Connection, table: str, where: str = "", params: tuple = ()) -> list[dict]:
+    if not table_exists(conn, table):
+        return []
+    sql = f"SELECT * FROM {table}"
+    if where:
+        sql += f" WHERE {where}"
+    return [dict(row) for row in conn.execute(sql, params).fetchall()]
+
+
+def encode_backup_value(value):
+    if isinstance(value, bytes):
+        return {"__type": "bytes_base64", "value": base64.b64encode(value).decode("ascii")}
+    if isinstance(value, sqlite3.Row):
+        return encode_backup_value(dict(value))
+    if isinstance(value, dict):
+        return {str(key): encode_backup_value(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [encode_backup_value(item) for item in value]
+    return value
+
+
+def decode_backup_value(value):
+    if isinstance(value, dict):
+        if value.get("__type") == "bytes_base64":
+            try:
+                return base64.b64decode(str(value.get("value") or ""))
+            except (ValueError, binascii.Error):
+                return b""
+        return {str(key): decode_backup_value(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [decode_backup_value(item) for item in value]
+    return value
+
+
+def sqlite_table_size_estimate(path: Path, tables: list[str], where_by_table: dict[str, tuple[str, tuple]] | None = None) -> dict[str, int]:
+    if not path.exists():
+        return {table: 0 for table in tables}
+    where_by_table = where_by_table or {}
+    estimates: dict[str, int] = {}
+    try:
+        with db_connect(path, readonly=True) as conn:
+            total_rows = 0
+            table_rows_count: dict[str, int] = {}
+            for table in tables:
+                count = table_count(conn, table)
+                table_rows_count[table] = count
+                total_rows += count
+            db_size = file_size(path)
+            for table in tables:
+                where, params = where_by_table.get(table, ("", ()))
+                scoped_count = table_count(conn, table, where, params)
+                if total_rows <= 0:
+                    estimates[table] = 0
+                else:
+                    estimates[table] = int(db_size * (table_rows_count.get(table, 0) / total_rows) * (scoped_count / max(1, table_rows_count.get(table, 0))))
+    except sqlite3.Error:
+        return {table: 0 for table in tables}
+    return estimates
+
+
+def chat_display_name_for(username: str) -> str:
+    username = str(username or "").strip()
+    if not username:
+        return ""
+    if MEMORY_DB.exists():
+        try:
+            with db_connect(MEMORY_DB, readonly=True) as conn:
+                row = conn.execute(
+                    "SELECT COALESCE(display_name, username) AS display_name FROM chats WHERE username=?",
+                    (username,),
+                ).fetchone()
+                if row and row["display_name"]:
+                    return str(row["display_name"])
+                row = conn.execute(
+                    "SELECT COALESCE(MAX(chat_display_name), ?) AS display_name FROM messages WHERE chat_username=?",
+                    (username, username),
+                ).fetchone()
+                if row and row["display_name"]:
+                    return str(row["display_name"])
+        except sqlite3.Error:
+            pass
+    return username
+
+
+def media_public_url(path_value: str) -> str:
+    raw = str(path_value or "").strip()
+    if not raw:
+        return ""
+    path = media_path_from_record(raw)
+    try:
+        rel = path.relative_to(MEDIA_DIR.resolve())
+        return f"/media/{quote(str(rel).replace(os.sep, '/'), safe='/')}"
+    except ValueError:
+        pass
+    if raw.startswith("runtime/media/"):
+        return f"/media/{quote(raw.removeprefix('runtime/media/'), safe='/')}"
+    if raw.startswith("media/"):
+        return f"/media/{quote(raw.removeprefix('media/'), safe='/')}"
+    return ""
+
+
+def media_request_path(path_value: str) -> str:
+    url = media_public_url(path_value)
+    if not url:
+        return ""
+    return "/".join(quote(unquote(part)) for part in url.split("/"))
+
+
+def table_columns(path: Path, table: str) -> list[str]:
+    if not path.exists():
+        return []
+    try:
+        with db_connect(path, readonly=True) as conn:
+            if not table_exists(conn, table):
+                return []
+            return [str(row["name"]) for row in conn.execute(f"PRAGMA table_info({table})").fetchall()]
+    except sqlite3.Error:
+        return []
+
+
+def memory_database_overview(chat: str = "") -> dict:
+    init_semantic_memory()
+    chat = str(chat or "").strip()
+    memory_tables = ["chats", "messages", "message_media", "ingest_runs"]
+    ai_tables = [
+        "ai_chunks",
+        "ai_vectors",
+        "ai_indexed_messages",
+        "ai_facts",
+        "ai_people_profiles",
+        "ai_group_summaries",
+        "ai_graph_edges",
+        "image_understanding_cache",
+        "agent_skill_runs",
+        "reply_outbox",
+        "chat_member_identity_map",
+    ]
+    scoped_where = {
+        "chats": ("username=?", (chat,)) if chat else ("", ()),
+        "messages": ("chat_username=?", (chat,)) if chat else ("", ()),
+        "message_media": ("chat_username=?", (chat,)) if chat else ("", ()),
+        "ai_chunks": ("chat_username=?", (chat,)) if chat else ("", ()),
+        "ai_vectors": (
+            "chunk_uid IN (SELECT chunk_uid FROM ai_chunks WHERE chat_username=?)",
+            (chat,),
+        )
+        if chat
+        else ("", ()),
+        "ai_indexed_messages": (
+            "chunk_uid IN (SELECT chunk_uid FROM ai_chunks WHERE chat_username=?)",
+            (chat,),
+        )
+        if chat
+        else ("", ()),
+        "ai_facts": ("chat_username=?", (chat,)) if chat else ("", ()),
+        "ai_people_profiles": ("chat_username=?", (chat,)) if chat else ("", ()),
+        "ai_group_summaries": ("chat_username=?", (chat,)) if chat else ("", ()),
+        "ai_graph_edges": ("chat_username=?", (chat,)) if chat else ("", ()),
+        "image_understanding_cache": ("chat_username=?", (chat,)) if chat else ("", ()),
+        "agent_skill_runs": ("chat_username=?", (chat,)) if chat else ("", ()),
+        "reply_outbox": ("chat_username=?", (chat,)) if chat else ("", ()),
+        "chat_member_identity_map": ("chat_username=?", (chat,)) if chat else ("", ()),
+    }
+    memory_estimates = sqlite_table_size_estimate(MEMORY_DB, memory_tables, scoped_where)
+    ai_estimates = sqlite_table_size_estimate(AI_DB, ai_tables, scoped_where)
+
+    modules = []
+    for key, spec in MEMORY_EXPORT_MODULES.items():
+        path = MEMORY_DB if spec["db"] == "memory" else AI_DB
+        table = str(spec["table"])
+        where = str(spec.get("where") or "")
+        params = (chat,) if chat and where else ()
+        total = 0
+        scoped = 0
+        try:
+            if path.exists():
+                with db_connect(path, readonly=True) as conn:
+                    total = table_count(conn, table)
+                    scoped = table_count(conn, table, where, params) if chat and where else total
+        except sqlite3.Error:
+            pass
+        estimates = memory_estimates if spec["db"] == "memory" else ai_estimates
+        modules.append(
+            {
+                "key": key,
+                "label": spec["label"],
+                "database": spec["db"],
+                "table": table,
+                "total_rows": total,
+                "scoped_rows": scoped,
+                "estimated_bytes": estimates.get(table, 0),
+                "exportable": bool(chat),
+                "importable": key in MEMORY_IMPORT_MODULES,
+            }
+        )
+
+    databases = []
+    for kind, path, tables in (("memory", MEMORY_DB, memory_tables), ("ai", AI_DB, ai_tables)):
+        table_stats = []
+        try:
+            if path.exists():
+                with db_connect(path, readonly=True) as conn:
+                    for table in tables:
+                        where, params = scoped_where.get(table, ("", ()))
+                        table_stats.append(
+                            {
+                                "table": table,
+                                "rows": table_count(conn, table),
+                                "scoped_rows": table_count(conn, table, where, params) if chat and where else table_count(conn, table),
+                            }
+                        )
+        except sqlite3.Error as exc:
+            table_stats.append({"table": "error", "rows": 0, "scoped_rows": 0, "error": str(exc)})
+        size = file_size(path)
+        scoped_size = sum(item["estimated_bytes"] for item in modules if item["database"] == kind)
+        databases.append(
+            {
+                "type": kind,
+                "path": str(path),
+                "exists": path.exists(),
+                "bytes": size,
+                "size": format_bytes(size),
+                "scoped_estimated_bytes": scoped_size,
+                "scoped_estimated_size": format_bytes(scoped_size),
+                "tables": table_stats,
+            }
+        )
+    total_bytes = sum(file_size(path) for path in (MEMORY_DB, AI_DB))
+    return {
+        "ok": True,
+        "chat_username": chat,
+        "chat_display_name": chat_display_name_for(chat) if chat else "全部会话",
+        "generated_at": now_iso(),
+        "total_bytes": total_bytes,
+        "total_size": format_bytes(total_bytes),
+        "databases": databases,
+        "modules": modules,
+        "export_modules": [
+            {"key": key, "label": MEMORY_EXPORT_MODULES[key]["label"], "importable": key in MEMORY_IMPORT_MODULES}
+            for key in MEMORY_FULL_EXPORT_ITEMS
+        ],
+        "importable_modules": sorted(MEMORY_IMPORT_MODULES),
+    }
+
+
+def normalize_export_items(payload: dict) -> list[str]:
+    scope = str(payload.get("scope") or "").strip().lower()
+    raw_items = payload.get("items")
+    if scope in {"full", "all", "全部", "全量"} or raw_items in (None, "", []):
+        return list(MEMORY_FULL_EXPORT_ITEMS)
+    if isinstance(raw_items, str):
+        raw = [part.strip() for part in raw_items.split(",")]
+    elif isinstance(raw_items, list):
+        raw = [str(part or "").strip() for part in raw_items]
+    else:
+        raw = []
+    items = [item for item in dict.fromkeys(raw) if item in MEMORY_EXPORT_MODULES]
+    return items or list(MEMORY_FULL_EXPORT_ITEMS)
+
+
+def memory_backup_export(payload: dict) -> dict:
+    init_semantic_memory()
+    chat = str(payload.get("chat") or payload.get("chat_username") or "").strip()
+    if not chat:
+        return {"ok": False, "error": "必须先选择一个群组再导出，避免全局数据误用"}
+    items = normalize_export_items(payload)
+    data: dict[str, list[dict]] = {}
+    for item in items:
+        spec = MEMORY_EXPORT_MODULES.get(item)
+        if not spec:
+            continue
+        path = MEMORY_DB if spec["db"] == "memory" else AI_DB
+        table = str(spec["table"])
+        where = str(spec.get("where") or "")
+        rows: list[dict] = []
+        if path.exists():
+            try:
+                with db_connect(path, readonly=True) as conn:
+                    rows = table_rows(conn, table, where, (chat,) if where else ())
+            except sqlite3.Error as exc:
+                return {"ok": False, "error": f"导出 {table} 失败: {exc}"}
+        data[table] = encode_backup_value(rows)
+    manifest = {
+        "app": "wechat-agent",
+        "version": 1,
+        "created_at": now_iso(),
+        "chat_username": chat,
+        "chat_display_name": chat_display_name_for(chat),
+        "items": items,
+        "tables": {table: len(rows) for table, rows in data.items()},
+        "importable_items": [item for item in items if item in MEMORY_IMPORT_MODULES],
+        "note": "备份按群组隔离。导入时会校验 chat_username，只有同一群组的数据会写回。",
+    }
+    backup = {"manifest": manifest, "data": data}
+    raw = json.dumps(backup, ensure_ascii=False, indent=2)
+    return {
+        "ok": True,
+        "manifest": manifest,
+        "backup": backup,
+        "json": raw,
+        "bytes": len(raw.encode("utf-8")),
+        "size": format_bytes(len(raw.encode("utf-8"))),
+    }
+
+
+def parse_backup_payload(payload: dict) -> dict:
+    backup = payload.get("backup")
+    if isinstance(backup, dict):
+        return backup
+    raw = payload.get("backup_json") or payload.get("json") or payload.get("content") or ""
+    if not raw and payload.get("backup_base64"):
+        try:
+            raw = base64.b64decode(str(payload.get("backup_base64"))).decode("utf-8")
+        except (ValueError, UnicodeDecodeError, binascii.Error) as exc:
+            raise ValueError(f"备份 base64 无效: {exc}") from exc
+    if not str(raw or "").strip():
+        raise ValueError("缺少备份 JSON")
+    try:
+        parsed = json.loads(str(raw))
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"备份 JSON 格式错误: {exc}") from exc
+    if not isinstance(parsed, dict):
+        raise ValueError("备份内容必须是 JSON 对象")
+    return parsed
+
+
+def upsert_rows(conn: sqlite3.Connection, table: str, rows: list[dict], allowed_columns: list[str]) -> int:
+    if not rows or not allowed_columns:
+        return 0
+    count = 0
+    columns_set = set(allowed_columns)
+    pk_rows = [
+        (int(row["pk"] or 0), str(row["name"]))
+        for row in conn.execute(f"PRAGMA table_info({table})").fetchall()
+        if int(row["pk"] or 0) > 0
+    ]
+    primary_keys = [name for _, name in sorted(pk_rows)]
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        clean = {key: decode_backup_value(value) for key, value in row.items() if key in columns_set}
+        if not clean:
+            continue
+        columns = list(clean.keys())
+        placeholders = ",".join(f":{column}" for column in columns)
+        quoted = ",".join(columns)
+        update_columns = [column for column in columns if column not in set(primary_keys)]
+        if update_columns and primary_keys:
+            conflict = ",".join(primary_keys)
+            updates = ",".join(f"{column}=excluded.{column}" for column in update_columns)
+            sql = f"INSERT INTO {table} ({quoted}) VALUES ({placeholders}) ON CONFLICT({conflict}) DO UPDATE SET {updates}"
+        else:
+            sql = f"INSERT OR REPLACE INTO {table} ({quoted}) VALUES ({placeholders})"
+        conn.execute(sql, clean)
+        count += 1
+    return count
+
+
+def backup_rows_for_table(data: dict, table: str) -> list[dict]:
+    rows = data.get(table) or []
+    if not isinstance(rows, list):
+        return []
+    return [decode_backup_value(row) for row in rows if isinstance(row, dict)]
+
+
+def filter_import_rows(item: str, table: str, rows: list[dict], target_chat: str, valid: dict[str, set[str]]) -> list[dict]:
+    output = []
+    for row in rows:
+        if item == "chat":
+            if str(row.get("username") or "") == target_chat:
+                output.append(row)
+            continue
+        if item == "vectors":
+            if str(row.get("chunk_uid") or "") in valid.get("chunk_uids", set()):
+                output.append(row)
+            continue
+        if item == "indexed_messages":
+            chunk_uid = str(row.get("chunk_uid") or "")
+            message_uid = str(row.get("message_uid") or "")
+            if chunk_uid in valid.get("chunk_uids", set()) or message_uid in valid.get("message_uids", set()):
+                output.append(row)
+            continue
+        if str(row.get("chat_username") or "") == target_chat:
+            output.append(row)
+    return output
+
+
+def memory_backup_import(payload: dict) -> dict:
+    init_semantic_memory()
+    target_chat = str(payload.get("chat") or payload.get("chat_username") or "").strip()
+    if not target_chat:
+        return {"ok": False, "error": "必须选择目标群组"}
+    try:
+        backup = parse_backup_payload(payload)
+    except ValueError as exc:
+        return {"ok": False, "error": str(exc)}
+    manifest = backup.get("manifest") if isinstance(backup.get("manifest"), dict) else {}
+    source_chat = str(manifest.get("chat_username") or "").strip()
+    if not source_chat:
+        return {"ok": False, "error": "备份缺少 manifest.chat_username，无法确认群组归属"}
+    if source_chat != target_chat:
+        return {
+            "ok": False,
+            "error": f"群组不匹配：备份来自 {manifest.get('chat_display_name') or source_chat}，当前选择是 {chat_display_name_for(target_chat)}。已拒绝导入。",
+            "source_chat_username": source_chat,
+            "target_chat_username": target_chat,
+        }
+    data = backup.get("data") if isinstance(backup.get("data"), dict) else {}
+    if payload.get("items"):
+        requested = normalize_export_items(payload)
+    else:
+        requested = [item for item in manifest.get("items") or manifest.get("importable_items") or MEMORY_FULL_EXPORT_ITEMS]
+    items = [item for item in requested if item in MEMORY_IMPORT_MODULES]
+    if not items:
+        return {"ok": False, "error": "没有可导入的模块"}
+
+    valid = {"chunk_uids": set(), "message_uids": set()}
+    for row in backup_rows_for_table(data, "ai_chunks"):
+        if str(row.get("chat_username") or "") == target_chat and row.get("chunk_uid"):
+            valid["chunk_uids"].add(str(row.get("chunk_uid")))
+    for row in backup_rows_for_table(data, "messages"):
+        if str(row.get("chat_username") or "") == target_chat and row.get("message_uid"):
+            valid["message_uids"].add(str(row.get("message_uid")))
+    if not valid["message_uids"]:
+        for row in backup_rows_for_table(data, "message_media"):
+            if str(row.get("chat_username") or "") == target_chat and row.get("message_uid"):
+                valid["message_uids"].add(str(row.get("message_uid")))
+
+    imported: dict[str, int] = {}
+    memory_items = [item for item in items if MEMORY_EXPORT_MODULES[item]["db"] == "memory"]
+    ai_items = [item for item in items if MEMORY_EXPORT_MODULES[item]["db"] == "ai"]
+    if memory_items:
+        with db_connect(MEMORY_DB) as conn:
+            for item in memory_items:
+                table = str(MEMORY_EXPORT_MODULES[item]["table"])
+                rows = backup_rows_for_table(data, table)
+                safe_rows = filter_import_rows(item, table, rows, target_chat, valid)
+                imported[item] = upsert_rows(conn, table, safe_rows, table_columns(MEMORY_DB, table))
+    if ai_items:
+        with db_connect(AI_DB) as conn:
+            for item in ai_items:
+                table = str(MEMORY_EXPORT_MODULES[item]["table"])
+                rows = backup_rows_for_table(data, table)
+                safe_rows = filter_import_rows(item, table, rows, target_chat, valid)
+                imported[item] = upsert_rows(conn, table, safe_rows, table_columns(AI_DB, table))
+    return {
+        "ok": True,
+        "chat_username": target_chat,
+        "chat_display_name": chat_display_name_for(target_chat),
+        "imported": imported,
+        "message": "导入完成；只写入与当前群组匹配的数据。",
+    }
+
+
+def latest_image_run_by_message(conn: sqlite3.Connection, message_uid: str) -> dict:
+    if not message_uid or not table_exists(conn, "agent_skill_runs"):
+        return {}
+    row = conn.execute(
+        """
+        SELECT status, error, created_at, elapsed_ms, output_json
+        FROM agent_skill_runs
+        WHERE skill_id='image-understanding' AND message_uid=?
+        ORDER BY created_at DESC
+        LIMIT 1
+        """,
+        (message_uid,),
+    ).fetchone()
+    item = dict(row) if row else {}
+    if item.get("status") == "superseded":
+        item["error"] = ""
+    return item
+
+
+def image_run_error_is_retryable(error: str) -> bool:
+    text = str(error or "")
+    return any(
+        marker in text
+        for marker in (
+            "未配置 base_url/model",
+            "base_url/model",
+            "图片理解配置未启用",
+            "图片理解技能未启用",
+            "没有找到可解析的图片消息",
+            "读取图片失败",
+            "image not found",
+            "read image failed",
+        )
+    )
+
+
+def photo_analysis_state_sets(chat: str, media_rows: list[sqlite3.Row | dict]) -> tuple[dict, set[str], set[str]]:
+    uids = [str(row["message_uid"] if isinstance(row, sqlite3.Row) else row.get("message_uid") or "") for row in media_rows]
+    uids = [uid for uid in uids if uid]
+    media_status = {
+        str(row["message_uid"] if isinstance(row, sqlite3.Row) else row.get("message_uid") or ""): str(
+            row["status"] if isinstance(row, sqlite3.Row) and "status" in row.keys() else row.get("status") or row.get("media_status") or ""
+        )
+        for row in media_rows
+        if str(row["message_uid"] if isinstance(row, sqlite3.Row) else row.get("message_uid") or "")
+    }
+    success_uids: set[str] = set()
+    failed_uids: set[str] = {uid for uid, status in media_status.items() if status != "ready"}
+    if AI_DB.exists() and uids:
+        try:
+            with db_connect(AI_DB, readonly=True) as conn:
+                for index in range(0, len(uids), 400):
+                    batch = uids[index : index + 400]
+                    placeholders = ",".join("?" for _ in batch)
+                    rows = conn.execute(
+                        f"""
+                        SELECT message_uid, summary
+                        FROM image_understanding_cache
+                        WHERE chat_username=? AND summary<>'' AND message_uid IN ({placeholders})
+                        """,
+                        (chat, *batch),
+                    ).fetchall()
+                    success_uids.update(
+                        str(row["message_uid"])
+                        for row in rows
+                        if row["message_uid"] and not image_summary_is_stale_or_mechanical(row["summary"] or "")
+                    )
+                run_rows = conn.execute(
+                    """
+                    SELECT message_uid, status, error
+                    FROM agent_skill_runs
+                    WHERE skill_id='image-understanding' AND chat_username=?
+                    ORDER BY created_at DESC
+                    """,
+                    (chat,),
+                ).fetchall()
+                seen = set()
+                for row in run_rows:
+                    uid = str(row["message_uid"] or "")
+                    if not uid or uid in seen or uid in success_uids:
+                        continue
+                    seen.add(uid)
+                    if str(row["status"] or "") == "failed" and not image_run_error_is_retryable(row["error"] or ""):
+                        failed_uids.add(uid)
+        except sqlite3.Error:
+            pass
+    failed_uids -= success_uids
+    pending_uids = set(uids) - success_uids - failed_uids
+    stats = {
+        "total": len(uids),
+        "success": len(success_uids),
+        "failed": len(failed_uids),
+        "pending": len(pending_uids),
+        "media_error": sum(1 for status in media_status.values() if status != "ready"),
+    }
+    return stats, success_uids, failed_uids
+
+
+def photo_gallery(chat: str = "", status: str = "all", limit: int = 80, offset: int = 0) -> dict:
+    init_semantic_memory()
+    chat = str(chat or "").strip()
+    if not chat:
+        return {"ok": False, "error": "必须选择群组查看照片库"}
+    status = str(status or "all").lower()
+    limit = clamp_int(limit, 80, 1, 300)
+    offset = max(0, int(offset or 0))
+    if not MEMORY_DB.exists():
+        return {"ok": True, "items": [], "stats": {}, "chat_username": chat, "chat_display_name": chat_display_name_for(chat)}
+    all_media_rows: list[sqlite3.Row] = []
+    query_limit = limit
+    query_offset = offset
+    if status in {"success", "failed", "pending"}:
+        query_limit = 5000
+        query_offset = 0
+    try:
+        with db_connect(MEMORY_DB, readonly=True) as conn:
+            all_media_rows = conn.execute(
+                """
+                SELECT message_uid, status
+                FROM message_media
+                WHERE chat_username=? AND media_type IN ('image','sticker')
+                ORDER BY local_id DESC
+                """,
+                (chat,),
+            ).fetchall()
+            rows = conn.execute(
+                """
+                SELECT m.message_uid, m.chat_username, m.chat_display_name, m.type_label, m.create_time,
+                       m.local_id, m.source, m.message_content, m.compress_content,
+                       mm.media_type, mm.media_path, mm.thumb_path, mm.mime_type, mm.width, mm.height,
+                       mm.status AS media_status, mm.error AS media_error, mm.updated_at AS media_updated_at
+                FROM message_media mm
+                LEFT JOIN messages m ON m.message_uid=mm.message_uid
+                WHERE mm.chat_username=? AND mm.media_type IN ('image','sticker')
+                ORDER BY COALESCE(m.create_time, 0) DESC, mm.local_id DESC
+                LIMIT ? OFFSET ?
+                """,
+                (chat, query_limit, query_offset),
+            ).fetchall()
+    except sqlite3.Error as exc:
+        return {"ok": False, "error": str(exc)}
+    stats, success_uids, failed_uids = photo_analysis_state_sets(chat, all_media_rows)
+    message_uids = [str(row["message_uid"] or "") for row in rows if row["message_uid"]]
+    cache_by_uid: dict[str, dict] = {}
+    run_by_uid: dict[str, dict] = {}
+    if AI_DB.exists() and message_uids:
+        try:
+            with db_connect(AI_DB, readonly=True) as conn:
+                for uid in message_uids:
+                    cache = conn.execute(
+                        """
+                        SELECT *
+                        FROM image_understanding_cache
+                        WHERE message_uid=? AND chat_username=?
+                        ORDER BY updated_at DESC
+                        LIMIT 1
+                        """,
+                        (uid, chat),
+                    ).fetchone()
+                    if cache:
+                        cache_item = dict(cache)
+                        if not image_summary_is_stale_or_mechanical(cache_item.get("summary") or ""):
+                            cache_by_uid[uid] = cache_item
+                    run_by_uid[uid] = latest_image_run_by_message(conn, uid)
+        except sqlite3.Error:
+            pass
+    items = []
+    contacts = contact_directory(chat)
+    for row in rows:
+        item = dict(row)
+        uid = str(item.get("message_uid") or "")
+        cache = cache_by_uid.get(uid) or {}
+        latest_run = run_by_uid.get(uid) or {}
+        media_status = str(item.get("media_status") or "")
+        if uid in success_uids or cache.get("summary"):
+            analysis_status = "success"
+        elif (
+            uid in failed_uids
+            or (
+                latest_run.get("status") == "failed"
+                and not image_run_error_is_retryable(latest_run.get("error") or "")
+            )
+            or media_status != "ready"
+        ):
+            analysis_status = "failed"
+        else:
+            analysis_status = "pending"
+        sender_key, sender_name, text = message_sender_identity(item, contacts)
+        details = parse_json_value(cache.get("details_json"), {}) if cache else {}
+        tags = []
+        raw_tags = details.get("tags") if isinstance(details, dict) else []
+        if isinstance(raw_tags, list):
+            tags = clean_image_labels([clean_contact_text(tag) for tag in raw_tags if clean_contact_text(tag)])[:12]
+        if not tags and cache.get("summary"):
+            tags = image_understanding_tags(cache.get("summary") or "")[:8]
+        items.append(
+            {
+                "message_uid": uid,
+                "chat_username": item.get("chat_username") or chat,
+                "chat_display_name": item.get("chat_display_name") or chat_display_name_for(chat),
+                "sender_key": sender_key,
+                "sender_name": sender_name,
+                "text": clean_contact_text(text)[:500],
+                "type_label": item.get("type_label") or item.get("media_type") or "",
+                "media_type": item.get("media_type") or "",
+                "media_url": media_public_url(item.get("media_path") or item.get("thumb_path") or ""),
+                "thumb_url": media_public_url(item.get("thumb_path") or item.get("media_path") or ""),
+                "media_path": item.get("media_path") or "",
+                "mime_type": item.get("mime_type") or "",
+                "width": item.get("width") or 0,
+                "height": item.get("height") or 0,
+                "create_time": int(item.get("create_time") or 0),
+                "media_status": media_status,
+                "media_error": item.get("media_error") or "",
+                "analysis_status": analysis_status,
+                "summary": cache.get("summary") or "",
+                "details": compact_photo_details({**details, "tags": tags}),
+                "tags": tags,
+                "model": cache.get("model") or "",
+                "updated_at": cache.get("updated_at") or "",
+                "last_run": latest_run,
+            }
+        )
+    if status in {"success", "failed", "pending"}:
+        items = [item for item in items if item.get("analysis_status") == status][offset : offset + limit]
+    return {
+        "ok": True,
+        "chat_username": chat,
+        "chat_display_name": chat_display_name_for(chat),
+        "status": status,
+        "limit": limit,
+        "offset": offset,
+        "stats": stats,
+        "auto": image_auto_state(),
+        "items": items,
+    }
+
+
+def photo_retry(payload: dict) -> dict:
+    chat = str(payload.get("chat") or payload.get("chat_username") or "").strip()
+    if not chat:
+        return {"ok": False, "error": "必须选择群组"}
+    raw_uids = payload.get("message_uids")
+    if isinstance(raw_uids, str):
+        message_uids = [part.strip() for part in raw_uids.split(",") if part.strip()]
+    elif isinstance(raw_uids, list):
+        message_uids = [str(uid or "").strip() for uid in raw_uids if str(uid or "").strip()]
+    else:
+        message_uids = []
+    failed_only = bool(payload.get("failed_only"))
+    pending_only = bool(payload.get("pending_only"))
+    limit = clamp_int(payload.get("limit"), 20, 1, 100)
+    if not message_uids:
+        gallery = photo_gallery(chat, "all", limit=300, offset=0)
+        candidates = gallery.get("items") or []
+        if failed_only:
+            candidates = [item for item in candidates if item.get("analysis_status") == "failed"]
+        elif pending_only:
+            candidates = [item for item in candidates if item.get("analysis_status") == "pending"]
+        else:
+            candidates = [item for item in candidates if item.get("analysis_status") in {"failed", "pending"}]
+        message_uids = [item["message_uid"] for item in candidates[:limit]]
+    results = []
+    for uid in message_uids[:limit]:
+        message = message_by_uid(uid) or {}
+        if str(message.get("chat_username") or "") != chat:
+            results.append({"ok": False, "message_uid": uid, "error": "消息不属于当前群组，已跳过"})
+            continue
+        result = run_image_understanding({"message_uid": uid, "chat_username": chat, "message": message}, send=False)
+        results.append(result)
+    return {
+        "ok": True,
+        "chat_username": chat,
+        "chat_display_name": chat_display_name_for(chat),
+        "processed": len(results),
+        "success": sum(1 for item in results if item.get("ok")),
+        "failed": sum(1 for item in results if not item.get("ok")),
+        "results": results,
+    }
+
+
+def image_auto_state() -> dict:
+    return read_json(
+        IMAGE_AUTO_STATE_FILE,
+        {
+            "ok": True,
+            "running": False,
+            "enabled": False,
+            "last_checked_at": "",
+            "last_run_at": "",
+            "last_skip_reason": "",
+            "last_error": "",
+            "last_processed": 0,
+            "last_success": 0,
+            "last_failed": 0,
+            "allowed_chats": [],
+            "results": [],
+        },
+    )
+
+
+def write_image_auto_state(payload: dict) -> None:
+    with IMAGE_AUTO_STATE_LOCK:
+        current = image_auto_state()
+        current.update(payload or {})
+        write_json(IMAGE_AUTO_STATE_FILE, current)
+
+
+def image_auto_candidates(chats: list[str], limit: int, retry_failed_hours: int) -> list[dict]:
+    chats = [str(chat or "").strip() for chat in chats if str(chat or "").strip()]
+    if not chats or not MEMORY_DB.exists():
+        return []
+    limit = clamp_int(limit, 2, 1, 20)
+    scan_limit = max(500, limit * 120)
+    candidates: list[dict] = []
+    try:
+        with db_connect(MEMORY_DB, readonly=True) as conn:
+            for chat in chats:
+                rows = conn.execute(
+                    """
+                    SELECT m.message_uid, m.chat_username, m.chat_display_name, m.type_label,
+                           m.create_time, m.local_id, m.source, m.message_content, m.compress_content,
+                           mm.media_type, mm.media_path, mm.thumb_path, mm.mime_type, mm.status, mm.width, mm.height
+                    FROM message_media mm
+                    JOIN messages m ON m.message_uid=mm.message_uid
+                    WHERE mm.chat_username=? AND mm.media_type IN ('image','sticker') AND mm.status='ready'
+                    ORDER BY COALESCE(m.create_time, 0) DESC, mm.local_id DESC
+                    LIMIT ?
+                    """,
+                    (chat, scan_limit),
+                ).fetchall()
+                candidates.extend(dict(row) for row in rows)
+    except sqlite3.Error:
+        return []
+    if not candidates:
+        return []
+    uids = [str(row.get("message_uid") or "") for row in candidates if row.get("message_uid")]
+    cached_uids: set[str] = set()
+    blocked_failed_uids: set[str] = set()
+    if AI_DB.exists() and uids:
+        cutoff = ""
+        if retry_failed_hours > 0:
+            cutoff = (datetime.now(DISPLAY_TZ) - timedelta(hours=retry_failed_hours)).isoformat(timespec="seconds")
+        try:
+            with db_connect(AI_DB, readonly=True) as conn:
+                for index in range(0, len(uids), 400):
+                    batch = uids[index : index + 400]
+                    placeholders = ",".join("?" for _ in batch)
+                    rows = conn.execute(
+                        f"""
+                        SELECT message_uid, summary
+                        FROM image_understanding_cache
+                        WHERE summary<>'' AND message_uid IN ({placeholders})
+                        """,
+                        tuple(batch),
+                    ).fetchall()
+                    cached_uids.update(
+                        str(row["message_uid"])
+                        for row in rows
+                        if row["message_uid"] and not image_summary_is_stale_or_mechanical(row["summary"] or "")
+                    )
+                failed_rows = conn.execute(
+                    """
+                        SELECT message_uid, error, MAX(created_at) AS latest_failed_at
+                        FROM agent_skill_runs
+                        WHERE skill_id='image-understanding' AND status='failed'
+                        GROUP BY message_uid
+                    """,
+                ).fetchall()
+                for row in failed_rows:
+                    uid = str(row["message_uid"] or "")
+                    if not uid or uid not in uids:
+                        continue
+                    if image_run_error_is_retryable(row["error"] or ""):
+                        continue
+                    if retry_failed_hours <= 0 or str(row["latest_failed_at"] or "") >= cutoff:
+                        blocked_failed_uids.add(uid)
+        except sqlite3.Error:
+            pass
+    output = []
+    seen = set()
+    for row in candidates:
+        uid = str(row.get("message_uid") or "")
+        if not uid or uid in seen or uid in cached_uids or uid in blocked_failed_uids:
+            continue
+        seen.add(uid)
+        output.append(row)
+        if len(output) >= limit:
+            break
+    return output
+
+
+def image_auto_once(config: dict | None = None) -> dict:
+    config = config or read_config()
+    skill = skill_by_id("image-understanding") or {}
+    settings = effective_skill_settings("image-understanding", config)
+    enabled = bool(
+        skill.get("enabled")
+        and settings.get("enabled", True)
+        and settings.get("auto_enabled", True)
+        and settings.get("auto_analyze_image_messages", False)
+    )
+    allowed_chats = [
+        str(chat or "").strip()
+        for chat in (settings.get("auto_analyze_chats") if isinstance(settings.get("auto_analyze_chats"), list) else [])
+        if str(chat or "").strip()
+    ]
+    if not enabled:
+        write_image_auto_state(
+            {
+                "ok": True,
+                "running": False,
+                "enabled": False,
+                "last_checked_at": now_iso(),
+                "last_skip_reason": "disabled",
+                "allowed_chats": allowed_chats,
+            }
+        )
+        return {"ok": True, "skipped": True, "reason": "disabled"}
+    if not allowed_chats:
+        write_image_auto_state(
+            {
+                "ok": True,
+                "running": False,
+                "enabled": True,
+                "last_checked_at": now_iso(),
+                "last_skip_reason": "no_allowed_chats",
+                "allowed_chats": [],
+            }
+        )
+        return {"ok": True, "skipped": True, "reason": "no_allowed_chats"}
+    batch_size = clamp_int(settings.get("auto_analyze_batch_size"), 2, 1, 20)
+    retry_hours = clamp_int(settings.get("auto_retry_failed_hours"), 12, 0, 24 * 30)
+    candidates = image_auto_candidates(allowed_chats, batch_size, retry_hours)
+    if not candidates:
+        write_image_auto_state(
+            {
+                "ok": True,
+                "running": False,
+                "enabled": True,
+                "last_checked_at": now_iso(),
+                "last_skip_reason": "no_pending_images",
+                "last_error": "",
+                "allowed_chats": allowed_chats,
+                "last_processed": 0,
+                "last_success": 0,
+                "last_failed": 0,
+                "results": [],
+            }
+        )
+        return {"ok": True, "skipped": True, "reason": "no_pending_images", "allowed_chats": allowed_chats}
+    write_image_auto_state(
+        {
+            "ok": True,
+            "running": True,
+            "enabled": True,
+            "last_checked_at": now_iso(),
+            "last_skip_reason": "",
+            "allowed_chats": allowed_chats,
+        }
+    )
+    results = []
+    for message in candidates:
+        result = run_image_understanding(
+            {
+                "message_uid": message.get("message_uid") or "",
+                "chat_username": message.get("chat_username") or "",
+                "chat_display_name": message.get("chat_display_name") or "",
+                "message": message,
+                "text": "[自动图片入库]",
+                "trigger": "auto_photo_ingest",
+            },
+            send=False,
+        )
+        results.append(
+            {
+                "ok": bool(result.get("ok")),
+                "message_uid": message.get("message_uid") or "",
+                "chat_username": message.get("chat_username") or "",
+                "chat_display_name": message.get("chat_display_name") or "",
+                "summary": str(result.get("summary") or result.get("error") or "")[:260],
+                "error": str(result.get("error") or "")[:300],
+            }
+        )
+    job_ok = all(item.get("ok") for item in results)
+    state_update = {
+        "ok": job_ok,
+        "job_ok": job_ok,
+        "running": False,
+        "enabled": True,
+        "last_checked_at": now_iso(),
+        "last_run_at": now_iso(),
+        "last_skip_reason": "",
+        "last_error": "" if job_ok else "some_images_failed",
+        "last_processed": len(results),
+        "last_success": sum(1 for item in results if item.get("ok")),
+        "last_failed": sum(1 for item in results if not item.get("ok")),
+        "allowed_chats": allowed_chats,
+        "results": results[-20:],
+    }
+    write_image_auto_state(state_update)
+    return {**state_update, "ok": True}
+
+
+def set_photo_auto_for_chat(payload: dict) -> dict:
+    chat = str(payload.get("chat") or payload.get("chat_username") or "").strip()
+    if not chat:
+        return {"ok": False, "error": "必须选择群组"}
+    enabled = bool(payload.get("enabled"))
+    config = read_config()
+    skills = config.get("skills") if isinstance(config.get("skills"), dict) else {}
+    image = dict(
+        effective_skill_settings("image-understanding", config)
+        or DEFAULT_CONFIG["skills"]["image_understanding"]
+    )
+    current_image = skills.get("image_understanding") if isinstance(skills.get("image_understanding"), dict) else {}
+    image.update(current_image)
+    chats = [
+        str(item or "").strip()
+        for item in (image.get("auto_analyze_chats") if isinstance(image.get("auto_analyze_chats"), list) else [])
+        if str(item or "").strip()
+    ]
+    if enabled and chat not in chats:
+        chats.append(chat)
+    if not enabled:
+        chats = [item for item in chats if item != chat]
+    image["auto_analyze_chats"] = unique_texts(chats)
+    image["auto_analyze_image_messages"] = bool(image.get("auto_analyze_image_messages") or enabled)
+    image["auto_enabled"] = bool(image.get("auto_enabled", True))
+    skills["image_understanding"] = image
+    config["skills"] = sanitize_skills_config(skills, config.get("skills", DEFAULT_CONFIG["skills"]))
+    write_json(CONFIG_FILE, normalize_config(config))
+    update_skill_registry_config("image-understanding", config["skills"]["image_understanding"])
+    return {
+        "ok": True,
+        "chat_username": chat,
+        "enabled": enabled,
+        "settings": public_config(read_config()).get("skills", {}).get("image_understanding", {}),
+    }
+
+
+def image_auto_loop() -> None:
+    while True:
+        sleep_seconds = 10.0
+        try:
+            config = read_config()
+            settings = effective_skill_settings("image-understanding", config)
+            sleep_seconds = float(clamp_int(settings.get("auto_analyze_interval_seconds"), 30, 10, 86400))
+            state = image_auto_state()
+            last_epoch = float(state.get("last_loop_epoch") or 0)
+            if last_epoch and last_epoch + sleep_seconds > time.time():
+                time.sleep(min(10.0, sleep_seconds))
+                continue
+            write_image_auto_state({"last_loop_epoch": time.time(), "last_checked_at": now_iso()})
+            image_auto_once(config)
+        except Exception as exc:
+            write_image_auto_state(
+                {
+                    "ok": False,
+                    "running": False,
+                    "last_checked_at": now_iso(),
+                    "last_error": str(exc),
+                }
+            )
+            print(f"image auto ingest error: {exc}", flush=True)
+        time.sleep(min(10.0, sleep_seconds))
+
+
 RETENTION_LIMITS = {
     "ingest_runs": 1000,
     "ai_index_runs": 1000,
@@ -1344,6 +2502,8 @@ def request_vision_llm(profile: dict, prompt: str, image_path: Path, system_prom
         ],
         "temperature": clamp_float(profile.get("temperature"), 0.2, 0.0, 2.0),
         "max_tokens": clamp_int(profile.get("max_tokens"), 700, 64, 8192),
+        "presence_penalty": 0.2,
+        "frequency_penalty": 0.6,
     }
     status, data, elapsed = llm_request(profile, payload)
     if not (200 <= status < 300) or not isinstance(data, dict):
@@ -1610,10 +2770,29 @@ def reply_sender_delays(config: dict | None = None) -> dict:
     return {"switch_delay_seconds": switch_delay, "send_delay_seconds": send_delay}
 
 
+def configured_wechat_source_db_dir() -> str:
+    env_path = str(os.environ.get("WECHAT_SOURCE_DB_DIR") or "").strip()
+    if env_path:
+        return env_path
+    base = ROOT / "config/xwechat_files"
+    candidates = sorted(base.glob("*/db_storage"), key=lambda p: p.stat().st_mtime if p.exists() else 0, reverse=True) if base.exists() else []
+    if candidates:
+        return str(candidates[0])
+    return "/app/config/xwechat_files/PLEASE_SET_WECHAT_ACCOUNT_DIR/db_storage"
+
+
 def refresh_probe_session_db(force: bool = False) -> dict:
     if not force and DECRYPTED_SESSION_DB.exists():
         return {"ok": True, "method": "existing", "path": str(DECRYPTED_SESSION_DB)}
-    command = "python memory/decrypt_sync.py --source-db-dir /app/config/xwechat_files/wxid_llnfi4jtg5hi12_235e/db_storage --decrypted-dir /app/runtime/wechat-decrypt/decrypted --keys-file /app/runtime/wechat-decrypt/keys/all_keys.json --state-file /app/runtime/wechat-decrypt/sync_state.json --force >/tmp/reply-refresh-session.log 2>&1; cat /tmp/reply-refresh-session.log"
+    source_db_dir = configured_wechat_source_db_dir()
+    command = (
+        "python memory/decrypt_sync.py "
+        f"--source-db-dir {sh_quote(source_db_dir)} "
+        "--decrypted-dir /app/runtime/wechat-decrypt/decrypted "
+        "--keys-file /app/runtime/wechat-decrypt/keys/all_keys.json "
+        "--state-file /app/runtime/wechat-decrypt/sync_state.json "
+        "--force >/tmp/reply-refresh-session.log 2>&1; cat /tmp/reply-refresh-session.log"
+    )
     result = run_memory_sync_command(command, timeout=30)
     result.pop("command", None)
     return {"ok": bool(result.get("ok") and DECRYPTED_SESSION_DB.exists()), "method": "memory-sync", "details": result}
@@ -2182,6 +3361,12 @@ def auto_outbox_for_message(message_uid: str) -> dict | None:
     return output
 
 
+def is_completed_auto_outbox(outbox: dict | None) -> bool:
+    if not outbox:
+        return False
+    return str(outbox.get("status") or "") in {"sent", "failed", "skipped", "rejected"}
+
+
 def auto_outbox_for_related_message(message_uid: str, *, trigger: str = "") -> dict | None:
     init_semantic_memory()
     message_uid = str(message_uid or "").strip()
@@ -2436,6 +3621,14 @@ def mask_skill_public_config(skill_id: str, config: dict) -> dict:
     return public
 
 
+def normalize_builtin_skill_config(skill_id: str, config: dict) -> dict:
+    config_key = safe_id(skill_id).replace("-", "_")
+    if config_key not in DEFAULT_CONFIG["skills"]:
+        return dict(config or {})
+    sanitized = sanitize_skills_config({config_key: config or {}}, DEFAULT_CONFIG["skills"])
+    return dict(sanitized.get(config_key) or config or {})
+
+
 def skill_public_row(row: sqlite3.Row | dict, include_body: bool = False, public: bool = True) -> dict:
     item = dict(row)
     item["enabled"] = bool(item.get("enabled"))
@@ -2463,6 +3656,8 @@ def upsert_skill_registry(manifest: dict, path: Path, *, enabled: bool | None = 
         merged_config = dict(manifest.get("config") or {})
         if preserve_existing_config:
             merged_config.update(existing_config)
+        if source == "builtin":
+            merged_config = normalize_builtin_skill_config(skill_id, merged_config)
         enabled_value = int(bool(enabled if enabled is not None else (existing["enabled"] if existing else False)))
         row = {
             "skill_id": skill_id,
@@ -2735,6 +3930,8 @@ def update_skill_config(skill_id: str, payload: dict) -> dict:
     config = skill.get("config") if isinstance(skill.get("config"), dict) else {}
     if isinstance(payload.get("config"), dict):
         config.update(payload["config"])
+    if skill.get("source") == "builtin":
+        config = normalize_builtin_skill_config(skill_id, config)
     permissions = payload.get("permissions") if isinstance(payload.get("permissions"), list) else skill.get("permissions", [])
     permissions = sorted({str(item) for item in permissions if str(item) in SKILL_PERMISSION_CHOICES})
     triggers = payload.get("triggers") if isinstance(payload.get("triggers"), list) else skill.get("triggers", [])
@@ -2756,6 +3953,24 @@ def update_skill_config(skill_id: str, payload: dict) -> dict:
         row = conn.execute("SELECT * FROM agent_skills WHERE skill_id=?", (safe_id(skill_id),)).fetchone()
     sync_builtin_skill_config_to_runtime(skill_id, config)
     return {"ok": True, "skill": skill_public_row(row, include_body=True, public=True)}
+
+
+def update_skill_registry_config(skill_id: str, config: dict) -> None:
+    init_semantic_memory()
+    now = now_iso()
+    with db_connect(AI_DB) as conn:
+        row = conn.execute("SELECT source, config_json FROM agent_skills WHERE skill_id=?", (safe_id(skill_id),)).fetchone()
+        if not row:
+            return
+        current = parse_json_value(row["config_json"], {})
+        current.update(config or {})
+        if row["source"] == "builtin":
+            current = normalize_builtin_skill_config(skill_id, current)
+        conn.execute(
+            "UPDATE agent_skills SET config_json=?, updated_at=? WHERE skill_id=?",
+            (json.dumps(current, ensure_ascii=False), now, safe_id(skill_id)),
+        )
+    sync_builtin_skill_config_to_runtime(skill_id, current)
 
 
 def find_skill_root(path: Path) -> Path | None:
@@ -2875,6 +4090,10 @@ def effective_skill_settings(skill_id: str, config: dict) -> dict:
         settings.update(skill["config"])
     if isinstance(config.get("skills"), dict) and isinstance(config["skills"].get(config_key), dict):
         settings.update(config["skills"][config_key])
+    if config_key in DEFAULT_CONFIG["skills"]:
+        sanitized = sanitize_skills_config({config_key: settings}, DEFAULT_CONFIG["skills"])
+        if isinstance(sanitized.get(config_key), dict):
+            settings.update(sanitized[config_key])
     if safe_id(skill_id) == "official-account-reader":
         for key in list(settings.keys()):
             if key.startswith("tavily_") or key in {"max_article_chars", "min_real_content_chars"}:
@@ -3499,12 +4718,34 @@ def image_skill_profile(config: dict, settings: dict) -> dict:
     if settings.get("use_active_profile"):
         profile = {**active_profile(config)}
     else:
+        linked_profile = {}
+        profile_id = str(settings.get("profile_id") or "").strip()
+        if profile_id:
+            linked_profile = next((p for p in config.get("llm_profiles") or [] if str(p.get("id") or "") == profile_id), {}) or {}
+        base_url = str(settings.get("base_url") or "").strip()
+        api_key = str(settings.get("api_key") or "").strip()
+        if linked_profile:
+            base_url = str(linked_profile.get("base_url") or base_url).strip()
+            api_key = str(linked_profile.get("api_key") or api_key).strip()
+        parsed_base = urlparse(base_url)
+        is_local_base = parsed_base.hostname in {"127.0.0.1", "localhost", "host.docker.internal"} or (
+            parsed_base.hostname or ""
+        ).startswith(("192.168.", "10.", "172."))
+        if api_key.lower() in {"local", "none", "null"} and not is_local_base:
+            api_key = ""
+        if not api_key:
+            for candidate in config.get("llm_profiles") or []:
+                if str(candidate.get("base_url") or "").rstrip("/") == base_url.rstrip("/"):
+                    candidate_key = str(candidate.get("api_key") or "").strip()
+                    if candidate_key and candidate_key.lower() not in {"local", "none", "null"}:
+                        api_key = candidate_key
+                        break
         profile = {
             "id": "image-understanding",
             "name": "图片理解模型",
-            "base_url": str(settings.get("base_url") or "").strip(),
-            "model": str(settings.get("model") or "").strip(),
-            "api_key": str(settings.get("api_key") or "").strip(),
+            "base_url": base_url,
+            "model": str(settings.get("model") or linked_profile.get("model") or "").strip(),
+            "api_key": api_key,
             "temperature": clamp_float(settings.get("temperature"), 0.2, 0.0, 2.0),
             "max_tokens": clamp_int(settings.get("max_tokens"), 700, 64, 8192),
             "timeout_seconds": clamp_int(settings.get("timeout_seconds"), 45, 3, 180),
@@ -3554,7 +4795,9 @@ def media_for_message_uid(message_uid: str) -> dict:
     if not row:
         return {"ok": False, "error": "消息不存在"}
     item = dict(row)
-    if str(item.get("type_label") or "") not in IMAGE_UNDERSTANDING_MEDIA_TYPES:
+    media_type = str(item.get("media_type") or "").strip().lower()
+    type_label = str(item.get("type_label") or "").strip().lower()
+    if media_type not in IMAGE_UNDERSTANDING_MEDIA_TYPES and type_label not in IMAGE_UNDERSTANDING_MEDIA_TYPES:
         return {"ok": False, "error": "这条消息不是图片/表情，极速图片识别已关闭视频解析", "message": item}
     if str(item.get("status") or "") != "ready":
         return {"ok": False, "error": item.get("error") or f"媒体未就绪: {item.get('status') or 'unknown'}", "message": item}
@@ -3711,7 +4954,7 @@ def image_message_by_reference(message: dict) -> dict:
                 row = image_message_row_from_db(
                     conn,
                     """
-                    m.chat_username=? AND m.type_label IN ('image','sticker') AND mm.status='ready'
+                    m.chat_username=? AND mm.media_type IN ('image','sticker') AND mm.status='ready'
                     AND COALESCE(m.create_time, 0) BETWEEN ? AND ?
                     AND (m.message_content LIKE ? OR m.compress_content LIKE ?)
                     """,
@@ -3725,7 +4968,7 @@ def image_message_by_reference(message: dict) -> dict:
                 row = image_message_row_from_db(
                     conn,
                     """
-                    m.chat_username=? AND m.type_label IN ('image','sticker') AND mm.status='ready'
+                    m.chat_username=? AND mm.media_type IN ('image','sticker') AND mm.status='ready'
                     AND COALESCE(m.create_time, 0) BETWEEN ? AND ?
                     """,
                     (ref_time, chat, ref_time - 60, ref_time + 60),
@@ -3743,7 +4986,7 @@ def image_message_by_reference(message: dict) -> dict:
                            mm.media_path, mm.thumb_path, mm.mime_type, mm.status, mm.width, mm.height
                     FROM messages m
                     JOIN message_media mm ON mm.message_uid=m.message_uid
-                    WHERE m.chat_username=? AND m.type_label IN ('image','sticker') AND mm.status='ready'
+                    WHERE m.chat_username=? AND mm.media_type IN ('image','sticker') AND mm.status='ready'
                       AND (m.message_content LIKE ? OR m.compress_content LIKE ?)
                     ORDER BY ABS(COALESCE(m.create_time, 0) - ?) ASC, m.local_id DESC
                     LIMIT 1
@@ -3763,7 +5006,7 @@ def image_message_by_reference(message: dict) -> dict:
 def latest_image_message(chat_username: str = "", before_time: int | None = None, limit: int = 20) -> dict:
     if not MEMORY_DB.exists():
         return {}
-    clauses = ["m.type_label IN ('image','sticker')", "mm.status='ready'"]
+    clauses = ["mm.media_type IN ('image','sticker')", "mm.status='ready'"]
     params: list = []
     if chat_username:
         clauses.append("m.chat_username=?")
@@ -3801,7 +5044,7 @@ def nearby_image_message_for_request(message: dict, *, before_seconds: int = 8, 
     sender = message_sender_key(message)
     clauses = [
         "m.chat_username=?",
-        "m.type_label IN ('image','sticker')",
+        "mm.media_type IN ('image','sticker')",
         "mm.status='ready'",
         "COALESCE(m.create_time, 0) BETWEEN ? AND ?",
     ]
@@ -3920,6 +5163,90 @@ def image_cache_key(message_uid: str, media_sha256: str, model: str, prompt: str
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
+def sentence_signature(text: str) -> str:
+    return re.sub(r"[\W_]+", "", text.lower())[:80]
+
+
+def normalize_image_summary(raw: str, *, finish_reason: str = "") -> str:
+    text = clean_contact_text(raw)
+    text = re.sub(r"(?m)^\s*[-*•]\s*", "", text)
+    text = re.sub(r"(?m)^\s*\d+[.、]\s*", "", text)
+    text = re.sub(r"(画面内容|画面|可见文字/OCR|关键文字/OCR|可能的梗或语境|适合群聊的短回复|适合回复)\s*[:：]\s*", "", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    labels = []
+    for match in re.findall(r"[\[【]([^]】]{2,16})[]】]", text):
+        label = clean_contact_text(match).strip("#＃ ")
+        if label and label not in labels:
+            labels.append(label)
+    text = re.sub(r"[\[【][^]】]{2,16}[]】]", "", text).strip()
+    candidates = []
+    for part in re.split(r"(?<=[。！？!?；;])\s*|\n+", text):
+        part = clean_contact_text(part).strip(" ，,。；;")
+        if not part:
+            continue
+        if len(part) < 4 and not labels:
+            continue
+        candidates.append(part)
+    if not candidates and text:
+        candidates = [text[:180].strip()]
+    output = []
+    seen = set()
+    for sentence in candidates:
+        signature = sentence_signature(sentence)
+        if not signature or signature in seen:
+            continue
+        if any(signature and signature in old for old in seen):
+            continue
+        seen.add(signature)
+        output.append(sentence)
+        if len(output) >= 3:
+            break
+    body = "。".join(sentence.rstrip("。！？!?；;") for sentence in output if sentence).strip()
+    if body and body[-1] not in "。！？!?":
+        body += "。"
+    if finish_reason == "length" and body:
+        body = re.sub(r"[，,、；;][^，,、；;。！？!?]{0,30}$", "。", body).strip()
+    if not labels:
+        labels = image_understanding_tags(body)[:6]
+    labels = clean_image_labels(labels)[:6]
+    label_text = " ".join(f"[{label}]" for label in labels if label)
+    if not body:
+        body = "这张图暂时只能确认是群里发来的图片，细节不够清楚。"
+    return f"{body}{(' ' + label_text) if label_text else ''}".strip()[:900]
+
+
+def clean_image_labels(labels: list[str]) -> list[str]:
+    blocked = {"标签", "内容", "图片", "画面", "可以", "可能", "看起来", "这张图", "图里"}
+    output = []
+    for label in labels:
+        text = clean_contact_text(label).strip("#＃[]【】（）() ，,。；;")
+        if not text or text in blocked:
+            continue
+        if len(text) > 8:
+            continue
+        if re.search(r"[。！？!?；;，,]", text):
+            continue
+        if any(word in text for word in ("这是", "有一", "写着", "显示", "看起来", "正在", "它正", "上面", "下面")):
+            continue
+        if text not in output:
+            output.append(text)
+    return output[:8]
+
+
+def image_summary_is_stale_or_mechanical(summary: str) -> bool:
+    text = clean_contact_text(summary)
+    if not text:
+        return False
+    if any(marker in text for marker in ("- 画面内容", "可见文字/OCR", "可能的梗或语境", "适合群聊的短回复")):
+        return True
+    if len(text) > 280:
+        parts = [sentence_signature(part) for part in re.split(r"[。！？!?；;]", text) if len(clean_contact_text(part)) >= 8]
+        if len(parts) >= 5 and len(set(parts)) <= max(2, len(parts) // 2):
+            return True
+    repeated_phrases = re.findall(r"(.{8,32}?)(?:。|，|,|；|;).*\1", text)
+    return bool(repeated_phrases)
+
+
 def cached_image_understanding(cache_key: str, cache_hours: int) -> dict:
     if not cache_key or not cache_hours:
         return {}
@@ -3940,6 +5267,8 @@ def cached_image_understanding(cache_key: str, cache_hours: int) -> dict:
         return {}
     item = dict(row)
     item["details"] = parse_json_value(item.pop("details_json", None), {})
+    if image_summary_is_stale_or_mechanical(item.get("summary") or ""):
+        return {}
     return item
 
 
@@ -3988,8 +5317,90 @@ def image_understanding_prompt(base_prompt: str, message: dict, user_text: str =
         f"- 群：{message.get('chat_display_name') or message.get('chat_username') or '未知群'}",
         f"- 发图人：{sender_name or sender_key or '未知成员'}",
         f"- 消息文字/引用：{clean_contact_text(user_text or text or '[图片]')[:800]}",
+        "",
+        "输出要求：",
+        "- 先读图中文字，再总结图片真实信息；不要只描述“电脑屏幕/聊天/消息/截图”这类外壳。",
+        "- 如果是聊天记录，直接总结谁在聊什么、核心观点、问题或结论。",
+        "- 如果是网页/公告/订单/表格/报错/数据看板，直接总结标题、关键字段、数字、状态、异常和结论。",
+        "- 用 1 到 4 段自然中文描述，像在给群记忆做图片备注。",
+        "- 只有文字确实无法辨认时，才说明“某一块文字看不清”；能看清多少就总结多少。",
+        "- 结尾给短标签，例如：[截图] [表情包] [工作]。",
     ]
     return "\n".join(part for part in pieces if part is not None).strip()
+
+
+def image_understanding_tags(summary: str) -> list[str]:
+    text = clean_contact_text(summary)
+    tags: list[str] = []
+    for match in re.findall(r"[#＃]?[\[【]([^]】]{2,16})[]】]", text):
+        tags.append(clean_contact_text(match))
+    keywords = [
+        "截图",
+        "聊天记录",
+        "表情包",
+        "斗图",
+        "人物",
+        "风景",
+        "文字",
+        "二维码",
+        "菜单",
+        "订单",
+        "公告",
+        "新闻",
+        "体育",
+        "影视",
+        "游戏",
+        "梗图",
+        "亲密场景",
+        "搞笑",
+        "工作",
+        "报错",
+    ]
+    for keyword in keywords:
+        if keyword in text:
+            tags.append(keyword)
+    for part in re.split(r"[，,。；;、\s：:\-]+", text):
+        part = clean_contact_text(part).strip("[]【】（）()")
+        if 2 <= len(part) <= 8 and not re.search(r"画面|内容|可见|可能|适合|群聊|回复|无法|具体", part):
+            tags.append(part)
+    seen = set()
+    output = []
+    for tag in tags:
+        tag = clean_contact_text(tag).strip("[]【】#＃ ")
+        if not tag or tag in seen:
+            continue
+        seen.add(tag)
+        output.append(tag)
+    return clean_image_labels(output)[:12]
+
+
+def compact_photo_details(details: dict) -> dict:
+    if not isinstance(details, dict):
+        return {}
+    media = details.get("media") if isinstance(details.get("media"), dict) else {}
+    llm = details.get("llm") if isinstance(details.get("llm"), dict) else {}
+    compact = {
+        "tags": details.get("tags") or [],
+        "resolve_method": details.get("resolve_method") or "",
+        "reference": details.get("reference") or {},
+        "media_sha256": details.get("media_sha256") or "",
+        "model": llm.get("model") or "",
+        "elapsed_ms": llm.get("elapsed_ms") or 0,
+        "usage": llm.get("usage") or {},
+        "finish_reason": llm.get("finish_reason") or "",
+        "media": {
+            "message_uid": media.get("message_uid") or "",
+            "type_label": media.get("type_label") or "",
+            "media_type": media.get("media_type") or "",
+            "media_path": media.get("media_path") or "",
+            "mime_type": media.get("mime_type") or "",
+            "width": media.get("width") or 0,
+            "height": media.get("height") or 0,
+            "status": media.get("status") or "",
+            "error": media.get("error") or "",
+        },
+    }
+    return {key: value for key, value in compact.items() if value not in ("", {}, [], 0)}
 
 
 def resolve_image_message_for_understanding(payload: dict, message: dict) -> dict:
@@ -4081,7 +5492,7 @@ def run_image_understanding(payload: dict, *, send: bool = False) -> dict:
         profile,
         prompt,
         media_path,
-        "你是极速微信群图片识别助手。只基于图片内容回答，中文简洁，不编造。",
+        "你是微信群照片库的图片备注助手。只基于图片内容写短备注，中文自然，不编造，不复读。",
     )
     if not result.get("ok"):
         output = {
@@ -4095,13 +5506,14 @@ def run_image_understanding(payload: dict, *, send: bool = False) -> dict:
         }
         record_skill_run("image-understanding", "failed", payload, output, output.get("error"), int((time.time() - started) * 1000), [str(media_path)])
         return output
-    summary = clean_contact_text(result.get("message") or "")
+    summary = normalize_image_summary(result.get("message") or "", finish_reason=str(result.get("finish_reason") or ""))
     details = {
         "llm": compact_llm_result(result),
         "media": media.get("message") or {},
         "media_sha256": media_sha,
         "resolve_method": media.get("resolve_method") or "",
         "reference": media.get("reference") or {},
+        "tags": image_understanding_tags(summary),
     }
     store_image_understanding(
         cache_key,
@@ -4487,6 +5899,58 @@ MEME_TASK_BLOCK_WORDS = (
     "报告",
     "文档",
 )
+
+
+IMAGE_SEND_REQUEST_MARKERS = (
+    "找一张",
+    "找张",
+    "找个图",
+    "找个图片",
+    "发一张",
+    "发张",
+    "发个图",
+    "发个图片",
+    "来一张",
+    "来张",
+    "来个图",
+    "来个图片",
+    "给我找",
+    "给我发",
+    "帮我找",
+    "帮我发",
+    "整张",
+    "整一个图",
+    "弄张",
+)
+
+IMAGE_SEND_TYPE_WORDS = ("图", "图片", "照片", "壁纸", "表情包", "表情")
+
+
+def is_image_send_request(text: str, config: dict | None = None, chat_username: str = "") -> bool:
+    raw = clean_contact_text(text)
+    if not raw:
+        return False
+    if is_image_understanding_request(raw, "text", config):
+        return False
+    if not any(marker in raw for marker in IMAGE_SEND_REQUEST_MARKERS):
+        return False
+    return any(word in raw for word in IMAGE_SEND_TYPE_WORDS)
+
+
+def image_send_keyword_from_text(text: str, config: dict | None = None, chat_username: str = "", base_time: int | None = None) -> str:
+    query = search_query_from_text(text, config, chat_username, base_time)
+    if not query:
+        query = clean_contact_text(text)
+    query = re.sub(r"https?://\S+", " ", query)
+    query = re.sub(
+        r"(给我|帮我|麻烦|请|可以|能不能|能否|找一张|找张|找个|找|发一张|发张|发个|发|来一张|来张|来个|来|整一个|整张|整|弄张|弄|搜一下|搜索|搜|一张|几张|张|一个|个|图片|照片|壁纸|表情包|表情|图|吧|一下|看看|看一下|需要)",
+        " ",
+        query,
+    )
+    query = clean_contact_text(re.sub(r"\s+", " ", query))
+    if not query:
+        query = str(effective_skill_settings("meme-sender", config or read_config()).get("default_keyword") or "猫咪").strip()
+    return query[:24] or "猫咪"
 
 
 def meme_context_text(text: str, recent: list[dict] | None = None) -> str:
@@ -4909,7 +6373,8 @@ def maybe_execute_auto_skill(message: dict, config: dict, scoring: dict) -> dict
                 _, request_text = message_index_text(request_message)
                 prompt_text = request_text or text
                 skill_message = {**message, "text": prompt_text}
-        if auto_outbox_for_related_message(image_message_uid, trigger="skill:image-understanding"):
+        related_image_outbox = auto_outbox_for_related_message(image_message_uid, trigger="skill:image-understanding")
+        if is_completed_auto_outbox(related_image_outbox):
             set_auto_reply_live("skipped", message, scoring=scoring, details={"skill": "image-understanding", "reason": "image_already_processed", "image_message_uid": image_message_uid})
             auto_reply_skip(message, "image_already_processed", scoring)
             return {"handled": True, "ok": True, "skipped": True, "reason": "image_already_processed"}
@@ -5055,6 +6520,62 @@ def maybe_execute_auto_skill(message: dict, config: dict, scoring: dict) -> dict
             )
             return {"handled": True, "ok": bool(send_result.get("ok")), "sent": bool(send_result.get("ok")), "outbox": updated, "skill": result, "error": send_result.get("error")}
 
+    if is_image_send_request(text, config, str(message.get("chat_username") or "")):
+        keyword = image_send_keyword_from_text(
+            text,
+            config,
+            str(message.get("chat_username") or ""),
+            int(message.get("create_time") or 0) or None,
+        )
+        set_auto_reply_live("skill", message, scoring=scoring, details={"skill": "meme-sender", "mode": "image_request", "keyword": keyword})
+        outbox = create_reply_outbox(
+            {
+                "chat": message.get("chat_username"),
+                "chat_display_name": message.get("chat_display_name"),
+                "message_uid": message.get("message_uid"),
+                "source_text": text,
+                "reply_text": f"[图片] {keyword}".strip(),
+                "scoring": scoring,
+                "trigger": "skill:meme-sender:image-request",
+            },
+            "auto_send",
+            status="approved",
+        )
+        result = run_meme_sender(
+            {
+                "message": message,
+                "text": text,
+                "keyword": keyword,
+                "chat_username": message.get("chat_username"),
+                "chat_display_name": message.get("chat_display_name"),
+                "message_uid": message.get("message_uid"),
+            },
+            send=True,
+        )
+        confirmation = {}
+        confirmed = False
+        if result.get("sent"):
+            confirmation = confirm_sent_image(str(message.get("chat_username") or ""), int(message.get("create_time") or 0), timeout_seconds=10.0)
+            confirmed = bool(confirmation.get("ok"))
+        details = {"skill": result, "keyword": keyword, "image_request": True, "confirmation": confirmation}
+        updated = update_reply_outbox(
+            outbox["outbox_id"],
+            "sent" if result.get("sent") else "failed",
+            None if result.get("sent") else str(result.get("error") or "图片发送失败"),
+            details,
+            sent_confirmed=confirmed,
+        )
+        update_auto_skill_counters(message, scoring, outbox["outbox_id"], bool(result.get("sent")), str(result.get("error") or ""))
+        set_auto_reply_live(
+            "sent" if result.get("sent") else "failed",
+            message,
+            scoring=scoring,
+            reply_text=f"[图片] {keyword}".strip(),
+            error="" if result.get("sent") else str(result.get("error") or "图片发送失败"),
+            details={"skill": "meme-sender", "mode": "image_request", "confirmed": confirmed, "image_path": result.get("image_path")},
+        )
+        return {"handled": True, "ok": bool(result.get("sent")), "sent": bool(result.get("sent")), "outbox": updated, "skill": result, "error": result.get("error")}
+
     meme_decision = should_trigger_meme(
         text,
         config,
@@ -5135,6 +6656,84 @@ def update_auto_skill_counters(message: dict, scoring: dict, outbox_id: str, ok:
             "failed_count": int(state.get("failed_count") or 0) + (0 if ok else 1),
         }
     )
+
+
+def resume_auto_outbox_send(message: dict, outbox: dict, config: dict, scoring: dict | None = None) -> dict:
+    reply_text = str(outbox.get("reply_text") or "").strip()
+    if not reply_text:
+        updated = update_reply_outbox(
+            str(outbox.get("outbox_id") or ""),
+            "failed",
+            "待发送回复内容为空",
+            {"resume": True, "outbox": outbox},
+        )
+        return {"ok": False, "sent": False, "outbox": updated, "error": "待发送回复内容为空"}
+    details = outbox.get("details") if isinstance(outbox.get("details"), dict) else {}
+    mention_payload = details.get("mention") if isinstance(details.get("mention"), dict) else {}
+    set_auto_reply_live(
+        "sending",
+        message,
+        scoring=scoring or {},
+        reply_text=reply_text,
+        details={"resume_outbox_id": outbox.get("outbox_id"), "status": outbox.get("status")},
+    )
+    send_started = time.time()
+    with WECHAT_SEND_LOCK:
+        send_result = paste_reply_to_wechat(
+            reply_text,
+            send=True,
+            chat_display_name=outbox.get("chat_display_name") or "",
+            chat_username=outbox.get("chat_username") or "",
+            delays=reply_sender_delays(config),
+            mention=mention_payload,
+        )
+    send_elapsed_ms = int((time.time() - send_started) * 1000)
+    confirmation = {}
+    confirmed = False
+    if send_result.get("ok"):
+        set_auto_reply_live(
+            "confirming",
+            message,
+            scoring=scoring or {},
+            reply_text=reply_text,
+            details={"resume_outbox_id": outbox.get("outbox_id"), "send_elapsed_ms": send_elapsed_ms},
+        )
+        confirmation = confirm_sent_message(
+            reply_text,
+            str(outbox.get("chat_username") or ""),
+            int(message.get("create_time") or 0),
+            timeout_seconds=8.0,
+        )
+        confirmed = bool(confirmation.get("ok"))
+    merged_details = {
+        **details,
+        "resume": True,
+        "send": send_result.get("details") if isinstance(send_result.get("details"), dict) else send_result,
+        "timing": {"send_elapsed_ms": send_elapsed_ms},
+        "confirmation": confirmation,
+    }
+    updated = update_reply_outbox(
+        str(outbox.get("outbox_id") or ""),
+        "sent" if send_result.get("ok") else "failed",
+        None if send_result.get("ok") else str(send_result.get("error") or "自动发送恢复失败"),
+        merged_details,
+        sent_confirmed=confirmed,
+    )
+    update_auto_skill_counters(message, scoring or {}, str(outbox.get("outbox_id") or ""), bool(send_result.get("ok")), str(send_result.get("error") or ""))
+    set_auto_reply_live(
+        "sent" if send_result.get("ok") else "failed",
+        message,
+        scoring=scoring or {},
+        reply_text=reply_text,
+        error="" if send_result.get("ok") else str(send_result.get("error") or "自动发送恢复失败"),
+        details={"resume_outbox_id": outbox.get("outbox_id"), "confirmed": confirmed, "send_elapsed_ms": send_elapsed_ms},
+    )
+    add_auto_reply_event(
+        "sent" if send_result.get("ok") else "failed",
+        f"{outbox.get('chat_display_name') or outbox.get('chat_username')} · {reply_text[:80]}",
+        {"outbox_id": outbox.get("outbox_id"), "resumed": True, "confirmed": confirmed, "error": send_result.get("error")},
+    )
+    return {"ok": bool(send_result.get("ok")), "sent": bool(send_result.get("ok")), "outbox": updated, "error": send_result.get("error")}
 
 
 def default_auto_reply_state() -> dict:
@@ -5227,6 +6826,7 @@ AUTO_REPLY_PHASE_TEXT = {
 }
 
 AUTO_REPLY_LAST_ACTIVE = False
+AUTO_REPLY_MENTION_ONLY_LOOKBACK_SECONDS = 60 * 60
 
 
 def set_auto_reply_live(
@@ -5268,12 +6868,11 @@ def auto_reply_activation_state(config: dict) -> dict:
         "sender_enabled": bool(sender.get("enabled", False)),
         "maintenance_paused": paused,
         "sender_mode": mode,
+        "reply_scope": "normal" if bool(agent.get("auto_reply_enabled", False)) else "mentions_only",
     }
     reason = ""
     if not checks["agent_enabled"]:
         reason = "agent_disabled"
-    elif not checks["agent_auto_reply_enabled"]:
-        reason = "agent_auto_reply_disabled"
     elif not checks["sender_enabled"]:
         reason = "sender_disabled"
     elif paused:
@@ -5458,6 +7057,8 @@ def auto_reply_candidate_messages(config: dict, state: dict, limit: int) -> list
         return []
     watermarks = state.get("watermarks") if isinstance(state.get("watermarks"), dict) else {}
     allowed = allowed_auto_reply_chats(config)
+    mention_only = not bool(config.get("agent", {}).get("auto_reply_enabled", False))
+    mention_only_since = int(time.time()) - AUTO_REPLY_MENTION_ONLY_LOOKBACK_SECONDS
     per_chat_rows: list[list[dict]] = []
     watermarks_changed = False
     try:
@@ -5480,7 +7081,7 @@ def auto_reply_candidate_messages(config: dict, state: dict, limit: int) -> list
                 eligible_chats.append(chat_row)
             chat_count = max(1, len(eligible_chats))
             fair_quota = max(1, (max(limit, 1) + chat_count - 1) // chat_count)
-            per_chat_fetch = max(3, min(30, fair_quota * 4, max(limit, 1) * 2))
+            per_chat_fetch = 120 if mention_only else max(3, min(30, fair_quota * 4, max(limit, 1) * 2))
             for chat_row in eligible_chats:
                 chat = str(chat_row["username"] or "")
                 watermark = watermarks.get(chat) if isinstance(watermarks.get(chat), dict) else {}
@@ -5522,8 +7123,6 @@ def auto_reply_candidate_messages(config: dict, state: dict, limit: int) -> list
     except sqlite3.Error as exc:
         write_auto_reply_state({"ok": False, "last_error": str(exc), "last_checked_at": now_iso()})
         return []
-    if watermarks_changed:
-        write_auto_reply_state({"watermarks": watermarks})
     per_chat_queues: list[list[dict]] = []
     for rows in per_chat_rows:
         urgent: list[dict] = []
@@ -5533,12 +7132,21 @@ def auto_reply_candidate_messages(config: dict, state: dict, limit: int) -> list
             if normalized.get("is_self_message"):
                 continue
             if is_bot_mention_row(row, config):
-                urgent.append(row)
+                if not mention_only or int(row.get("create_time") or 0) >= mention_only_since:
+                    urgent.append(row)
             else:
-                normal.append(row)
+                if not mention_only:
+                    normal.append(row)
         queue = urgent + normal
         if queue:
             per_chat_queues.append(queue)
+        elif mention_only and rows:
+            chat = str(rows[-1].get("chat_username") or "")
+            if chat:
+                watermarks[chat] = chat_watermark(rows[-1])
+                watermarks_changed = True
+    if watermarks_changed:
+        write_auto_reply_state({"watermarks": watermarks})
     return round_robin_limited(per_chat_queues, limit)
 
 
@@ -7003,14 +8611,18 @@ def auto_reply_execute_message(row: dict, config: dict) -> dict:
         set_auto_reply_live("skipped", message, error="unsupported_message_type")
         auto_reply_skip(message, "unsupported_message_type")
         return {"ok": True, "skipped": True, "reason": "unsupported_message_type"}
-    if auto_outbox_for_message(str(message.get("message_uid") or "")):
-        set_auto_reply_live("skipped", message, error="already_processed")
-        auto_reply_skip(message, "already_processed")
-        return {"ok": True, "skipped": True, "reason": "already_processed"}
-    if str(message.get("type_label") or "") in IMAGE_UNDERSTANDING_MEDIA_TYPES and auto_outbox_for_related_message(
+    existing_outbox = auto_outbox_for_message(str(message.get("message_uid") or ""))
+    if existing_outbox:
+        if is_completed_auto_outbox(existing_outbox):
+            set_auto_reply_live("skipped", message, error="already_processed")
+            auto_reply_skip(message, "already_processed")
+            return {"ok": True, "skipped": True, "reason": "already_processed"}
+        return resume_auto_outbox_send(message, existing_outbox, config)
+    related_image_outbox = auto_outbox_for_related_message(
         str(message.get("message_uid") or ""),
         trigger="skill:image-understanding",
-    ):
+    )
+    if str(message.get("type_label") or "") in IMAGE_UNDERSTANDING_MEDIA_TYPES and is_completed_auto_outbox(related_image_outbox):
         set_auto_reply_live("skipped", message, error="image_already_processed")
         auto_reply_skip(message, "image_already_processed")
         return {"ok": True, "skipped": True, "reason": "image_already_processed"}
@@ -7517,6 +9129,39 @@ def list_models(profile: dict) -> dict:
         if isinstance(item, dict) and item.get("id"):
             models.append(item["id"])
     return {"ok": True, "status": status, "elapsed_ms": elapsed, "models": models, "fetched_at": now_iso()}
+
+
+def image_skill_profile_from_payload(payload: dict, config: dict | None = None) -> dict:
+    config = config or read_config()
+    current = effective_skill_settings("image-understanding", config)
+    raw = payload.get("config") if isinstance(payload.get("config"), dict) else payload
+    settings = sanitize_skills_config(
+        {"image_understanding": raw},
+        {"image_understanding": current},
+    )["image_understanding"]
+    if raw.get("api_key_configured") and not str(raw.get("api_key") or "").strip():
+        settings["api_key"] = str(current.get("api_key") or "").strip()
+    return image_skill_profile(config, settings)
+
+
+def list_image_skill_models(payload: dict) -> dict:
+    profile = image_skill_profile_from_payload(payload)
+    if not profile.get("base_url"):
+        return {"ok": False, "error": "图片理解模型未配置 Base URL", "models": []}
+    return list_models(profile)
+
+
+def test_image_skill_model(payload: dict) -> dict:
+    profile = image_skill_profile_from_payload(payload)
+    if not profile.get("base_url") or not profile.get("model"):
+        return {"ok": False, "error": "图片理解模型未配置 base_url/model"}
+    result = request_llm(
+        profile,
+        "只回答：图片理解模型连接正常",
+        "你是微信 Agent 图片理解模型的连通性测试助手。",
+    )
+    result["vision_note"] = "此按钮测试接口、Key 和模型名是否可用；真正图片能力请用下方上传图片测试。"
+    return result
 
 
 def run_health_check(profile: dict, force: bool = False) -> dict:
@@ -10479,7 +12124,7 @@ def evaluate_talk(payload: dict) -> dict:
 
     if context.get("is_self_message"):
         suppressions.append({"name": "机器人自己发的消息", "effect": "ignore"})
-    if not context.get("group_auto_reply_enabled", config.get("agent", {}).get("auto_reply_enabled")):
+    if not context.get("group_auto_reply_enabled", config.get("agent", {}).get("auto_reply_enabled")) and not mention_info.get("mentions_bot"):
         suppressions.append({"name": "群未开启自动回复", "effect": "ignore"})
     if context.get("safety_risk"):
         suppressions.append({"name": "安全风险", "effect": "silent"})
@@ -10524,7 +12169,9 @@ def evaluate_talk(payload: dict) -> dict:
         add("上一条机器人回复无人接", -8, "negative")
 
     threshold = int(mode.get("threshold", 50))
-    decision = "reply" if score >= threshold and not suppressions else "silent"
+    if mention_info.get("mentions_bot"):
+        threshold = min(threshold, score)
+    decision = "reply" if (mention_info.get("mentions_bot") or score >= threshold) and not suppressions else "silent"
     if suppressions:
         decision = suppressions[0]["effect"]
     return {
@@ -11144,11 +12791,8 @@ def auto_reply_loop() -> None:
                 }
             )
             if active and not AUTO_REPLY_LAST_ACTIVE:
-                reset = reset_auto_reply_watermarks_to_latest(config)
-                add_auto_reply_event("enabled", "自动接话已启用，从当前最新消息开始监听", reset)
+                add_auto_reply_event("enabled", "自动接话监听已恢复", {"ok": True, "resumed": True})
                 AUTO_REPLY_LAST_ACTIVE = True
-                time.sleep(min(5.0, sleep_seconds))
-                continue
             if not active:
                 AUTO_REPLY_LAST_ACTIVE = False
                 state = auto_reply_state()
@@ -11316,6 +12960,18 @@ class Handler(BaseHTTPRequestHandler):
                 json_response(self, semantic_runs(clamp_int(query.get("limit", ["20"])[0], 20, 1, 100)))
             elif parsed.path == "/api/memory/review":
                 json_response(self, memory_review_list(str(query.get("chat", [""])[0] or "").strip()))
+            elif parsed.path == "/api/memory/databases":
+                json_response(self, memory_database_overview(str(query.get("chat", [""])[0] or "").strip()))
+            elif parsed.path == "/api/photos":
+                json_response(
+                    self,
+                    photo_gallery(
+                        str(query.get("chat", [""])[0] or "").strip(),
+                        str(query.get("status", ["all"])[0] or "all"),
+                        clamp_int(query.get("limit", ["80"])[0], 80, 1, 300),
+                        clamp_int(query.get("offset", ["0"])[0], 0, 0, 1000000),
+                    ),
+                )
             elif parsed.path == "/api/chats/summary":
                 json_response(self, chat_summary())
             elif parsed.path == "/api/chats":
@@ -11400,6 +13056,12 @@ class Handler(BaseHTTPRequestHandler):
                 profile_id = payload.get("profile_id") or config.get("active_llm_profile_id")
                 profile = next((p for p in config.get("llm_profiles") or [] if p.get("id") == profile_id), active_profile(config))
                 json_response(self, run_health_check(profile, force=True))
+            elif parsed.path == "/api/skills/image-understanding/models":
+                result = list_image_skill_models(payload)
+                json_response(self, result, 200 if result.get("ok") else 400)
+            elif parsed.path == "/api/skills/image-understanding/test-model":
+                result = test_image_skill_model(payload)
+                json_response(self, result, 200 if result.get("ok") else 502)
             elif parsed.path == "/api/maintenance/cleanup":
                 if not require_dangerous_confirmation(self, payload, "清理运行日志"):
                     return
@@ -11485,6 +13147,35 @@ class Handler(BaseHTTPRequestHandler):
             elif parsed.path == "/api/memory/review":
                 result = memory_review_mutate(payload)
                 json_response(self, result, 200 if result.get("ok") else 400)
+            elif parsed.path == "/api/memory/export":
+                result = memory_backup_export(payload)
+                json_response(self, result, 200 if result.get("ok") else 400)
+            elif parsed.path == "/api/memory/import":
+                if not require_dangerous_confirmation(self, payload, "导入记忆备份"):
+                    return
+                result = memory_backup_import(payload)
+                json_response(self, result, 200 if result.get("ok") else 400)
+            elif parsed.path == "/api/photos/retry":
+                result = photo_retry(payload)
+                json_response(self, result, 200 if result.get("ok") else 400)
+            elif parsed.path == "/api/photos/auto-config":
+                result = set_photo_auto_for_chat(payload)
+                json_response(self, result, 200 if result.get("ok") else 400)
+            elif parsed.path == "/api/photos/auto-run":
+                result = image_auto_once(read_config())
+                json_response(self, result, 200 if result.get("ok") else 400)
+            elif parsed.path == "/api/photos/export":
+                export_payload = dict(payload)
+                export_payload["items"] = ["media", "photos"]
+                result = memory_backup_export(export_payload)
+                json_response(self, result, 200 if result.get("ok") else 400)
+            elif parsed.path == "/api/photos/import":
+                if not require_dangerous_confirmation(self, payload, "导入照片记忆备份"):
+                    return
+                import_payload = dict(payload)
+                import_payload["items"] = ["media", "photos"]
+                result = memory_backup_import(import_payload)
+                json_response(self, result, 200 if result.get("ok") else 400)
             else:
                 json_response(self, {"ok": False, "error": "not found"}, 404)
         except Exception as exc:
@@ -11503,6 +13194,7 @@ def main(argv: list[str] | None = None) -> int:
     initialize_auto_reply_state()
     threading.Thread(target=health_loop, daemon=True, name="llm-health-check").start()
     threading.Thread(target=semantic_extract_loop, daemon=True, name="semantic-memory-extract").start()
+    threading.Thread(target=image_auto_loop, daemon=True, name="image-auto-ingest").start()
     threading.Thread(target=auto_reply_loop, daemon=True, name="wechat-auto-reply").start()
     server = ThreadingHTTPServer((args.host, args.port), Handler)
     print(f"Serving WeChat Agent console at http://{args.host}:{args.port}", flush=True)

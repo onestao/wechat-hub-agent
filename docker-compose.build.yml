@@ -1,0 +1,15 @@
+services:
+  wechat-memory-sync:
+    build:
+      context: .
+    image: local/wechat-memory-suite:latest
+
+  wechat-ai-memory:
+    build:
+      context: .
+    image: local/wechat-memory-suite:latest
+
+  wechat-agent-console:
+    build:
+      context: .
+    image: local/wechat-memory-suite:latest

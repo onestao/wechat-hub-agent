@@ -26,6 +26,8 @@
           <button type="button" data-view="talk">接话 <span>4</span></button>
           <button type="button" data-view="skills">技能 <span id="navSkillCount">--</span></button>
           <button type="button" data-view="memory">群记忆 <span id="navMemoryCount">--</span></button>
+          <button type="button" data-view="database">数据库 <span id="navDatabaseCount">--</span></button>
+          <button type="button" data-view="photos">照片库 <span id="navPhotoCount">--</span></button>
           <button type="button" data-view="test">测试 <span></span></button>
         </nav>
 
@@ -40,14 +42,13 @@
 
       <section class="main">
         <header class="topbar">
-          <div>
-            <h2 id="pageTitle">群记忆总览</h2>
-            <p id="pageSubtitle">查看服务运行、聊天同步、长期记忆和知识图谱。</p>
+          <div class="top-title">
+            <h2 id="pageTitle"></h2>
+            <p id="pageSubtitle"></p>
           </div>
           <div class="top-actions">
             <label class="scope-select"><span>记忆群组</span><select id="memoryChat"></select></label>
             <button id="refreshBtn" class="btn" type="button">刷新</button>
-            <button id="extractMemoryBtn" class="btn primary" type="button">抽取记忆</button>
           </div>
         </header>
 
@@ -97,6 +98,7 @@
                 <button id="zoomOutBtn" type="button">-</button>
                 <button id="zoomResetBtn" type="button">复位</button>
                 <button id="zoomInBtn" type="button">+</button>
+                <button id="graphFullscreenBtn" type="button">全屏</button>
               </div>
             </article>
 
@@ -605,6 +607,92 @@
                 <article class="card panel span-2"><div class="panel-head"><h3>关系边管理</h3></div><div id="edgePreview" class="edge-list"></div></article>
               </section>
             </section>
+          </section>
+        </section>
+
+        <section class="page" data-page="database">
+          <section class="database-console">
+            <article class="card panel span-2 database-command">
+              <div class="panel-head">
+                <div>
+                  <h3>记忆库数据库</h3>
+                  <p>所有统计、导出和导入都按当前群组隔离；导入时会校验备份来源群，群不匹配会拒绝。</p>
+                </div>
+                <div class="button-row">
+                  <label class="scope-select compact"><span>当前群组</span><select id="databaseChat"></select></label>
+                  <button id="refreshDatabaseBtn" class="btn" type="button">刷新</button>
+                  <button id="exportDatabaseSelectedBtn" class="btn primary" type="button">导出所选</button>
+                  <button id="exportDatabaseFullBtn" class="btn" type="button">导出全量</button>
+                </div>
+              </div>
+              <div class="database-hero">
+                <div><span>当前群组</span><strong id="databaseScopeName">--</strong></div>
+                <div><span>数据库总容量</span><strong id="databaseTotalSize">--</strong></div>
+                <div><span>导入状态</span><strong id="databaseImportState">等待操作</strong></div>
+              </div>
+            </article>
+            <article class="card panel span-2">
+              <div class="panel-head compact-head"><h3>数据库类型与容量</h3><span class="muted">原始库 + AI 记忆库</span></div>
+              <div id="databaseDbGrid" class="database-db-grid"></div>
+            </article>
+            <article class="card panel">
+              <div class="panel-head compact-head"><h3>导出模块</h3><span class="muted">可单项 / 多项 / 全量</span></div>
+              <div id="databaseModuleList" class="database-module-list"></div>
+            </article>
+            <article class="card panel">
+              <div class="panel-head compact-head"><h3>导入备份</h3><span class="pill">按群校验</span></div>
+              <label class="textarea-label"><span>粘贴备份 JSON</span><textarea id="databaseImportInput" rows="12" placeholder="粘贴从同一群组导出的备份 JSON"></textarea></label>
+              <button id="importDatabaseBtn" class="btn danger full" type="button">导入到当前群组</button>
+            </article>
+            <article class="card panel span-2">
+              <div class="panel-head compact-head"><h3>最近导出的备份内容</h3><span class="muted">已同时下载为 JSON 文件</span></div>
+              <textarea id="databaseExportOutput" class="backup-output" rows="10" readonly placeholder="导出后这里会显示备份 JSON"></textarea>
+            </article>
+          </section>
+        </section>
+
+        <section class="page" data-page="photos">
+          <section class="photos-console">
+            <article class="card panel span-2 photo-command">
+              <div class="panel-head">
+                <div>
+                  <h3>照片数据库画廊</h3>
+                  <p>按群展示图片、表情图、解析摘要和标签；失败图片可重新解析，成功后自动写入图片记忆库。</p>
+                </div>
+                <div class="button-row">
+                  <label class="scope-select compact"><span>当前群组</span><select id="photosChat"></select></label>
+                  <button id="refreshPhotosBtn" class="btn" type="button">刷新</button>
+                  <button id="analyzePendingPhotosBtn" class="btn primary" type="button">解析未入库</button>
+                  <button id="retryFailedPhotosBtn" class="btn" type="button">重试失败</button>
+                  <label class="switch-label photo-auto-toggle"><input id="photoAutoIngestEnabled" type="checkbox" /><span>当前群自动入库</span></label>
+                </div>
+              </div>
+              <div class="photo-toolbar">
+                <div><span>当前群组</span><strong id="photoScopeName">--</strong><small id="photoActionState">等待操作</small></div>
+                <div id="photoStatusFilters" class="photo-status-filters"></div>
+              </div>
+            </article>
+            <article class="card panel photo-gallery-panel">
+              <div class="panel-head compact-head">
+                <h3>图片画廊</h3>
+                <div class="button-row">
+                  <button id="exportPhotosBtn" class="mini-btn" type="button">导出照片记忆</button>
+                </div>
+              </div>
+              <div id="photoGallery" class="photo-gallery"></div>
+            </article>
+            <aside class="card panel photo-detail-panel">
+              <div class="panel-head compact-head"><h3>图片解析详情</h3><span class="pill">视觉记忆</span></div>
+              <div id="photoDetail" class="photo-detail"></div>
+            </aside>
+            <article class="card panel span-2 photo-import-panel">
+              <div class="panel-head compact-head"><h3>照片记忆导入 / 导出</h3><span id="photoImportState" class="muted">等待操作</span></div>
+              <div class="photo-backup-grid">
+                <label class="textarea-label"><span>导入照片备份 JSON</span><textarea id="photoImportInput" rows="7" placeholder="粘贴同一群组的照片记忆备份 JSON"></textarea></label>
+                <label class="textarea-label"><span>最近导出的照片备份</span><textarea id="photoExportOutput" rows="7" readonly placeholder="导出照片记忆后显示 JSON"></textarea></label>
+              </div>
+              <button id="importPhotosBtn" class="btn danger" type="button">导入照片记忆</button>
+            </article>
           </section>
         </section>
 

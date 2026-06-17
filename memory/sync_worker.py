@@ -62,13 +62,13 @@ def run_once(args) -> dict:
 def parse_args(argv: list[str] | None = None):
     parser = argparse.ArgumentParser(description="Run periodic WeChat memory sync")
     parser.add_argument("--interval", type=float, default=5.0, help="Polling interval seconds")
-    parser.add_argument("--source-db-dir", type=Path, default=Path("config/xwechat_files/wxid_llnfi4jtg5hi12_235e/db_storage"))
+    parser.add_argument("--source-db-dir", type=Path, default=Path("config/xwechat_files/PLEASE_SET_WECHAT_ACCOUNT_DIR/db_storage"))
     parser.add_argument("--decrypted-dir", type=Path, default=Path("runtime/wechat-decrypt/decrypted"))
     parser.add_argument("--keys-file", type=Path, default=Path("runtime/wechat-decrypt/keys/all_keys.json"))
     parser.add_argument("--decrypt-state-file", type=Path, default=Path("runtime/wechat-decrypt/sync_state.json"))
     parser.add_argument("--memory-db", type=Path, default=Path("runtime/memory/wechat_memory.sqlite"))
     parser.add_argument("--status-file", type=Path, default=Path("runtime/memory/sync_status.json"))
-    parser.add_argument("--wechat-base-dir", type=Path, default=Path("config/xwechat_files/wxid_llnfi4jtg5hi12_235e"))
+    parser.add_argument("--wechat-base-dir", type=Path, default=Path("config/xwechat_files/PLEASE_SET_WECHAT_ACCOUNT_DIR"))
     parser.add_argument("--runtime-dir", type=Path, default=Path("runtime"))
     parser.add_argument("--media-dir", type=Path, default=Path("runtime/media"))
     parser.add_argument("--config-file", type=Path, default=Path("runtime/wechat-decrypt/config.json"))
@@ -95,7 +95,7 @@ def resolve_args(args):
         value = getattr(args, key)
         if not value.is_absolute():
             setattr(args, key, root / value)
-    args.prefer_thumbnails = not args.prefer_full_images
+    args.prefer_thumbnails = False
     return args
 
 

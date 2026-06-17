@@ -1,7 +1,7 @@
 services:
   wechat-selkies:
-    image: ghcr.io/nickrunning/wechat-selkies:0.0.12-minimal
-    platform: linux/arm64
+    image: ${WECHAT_SELKIES_IMAGE:-ghcr.io/nickrunning/wechat-selkies:0.0.12-minimal}
+    platform: ${WECHAT_SELKIES_PLATFORM:-linux/arm64}
     container_name: wechat-selkies
     restart: unless-stopped
     cap_add:
@@ -28,9 +28,7 @@ services:
       - PASSWORD=${PASSWORD}
 
   wechat-memory-sync:
-    image: local/wechat-memory-suite:latest
-    build:
-      context: .
+    image: ${WECHAT_AGENT_IMAGE:-docker.io/xiaoguiwucan/linux-wechat-agent:latest}
     container_name: wechat-memory-sync
     restart: unless-stopped
     depends_on:
@@ -44,7 +42,7 @@ services:
       - --interval
       - "${MEMORY_SYNC_INTERVAL:-5}"
       - --source-db-dir
-      - /app/config/xwechat_files/wxid_llnfi4jtg5hi12_235e/db_storage
+      - /app/config/xwechat_files/${WECHAT_ACCOUNT_DIR_NAME:-PLEASE_SET_WECHAT_ACCOUNT_DIR}/db_storage
       - --decrypted-dir
       - /app/runtime/wechat-decrypt/decrypted
       - --keys-file
@@ -56,7 +54,7 @@ services:
       - --status-file
       - /app/runtime/memory/sync_status.json
       - --wechat-base-dir
-      - /app/config/xwechat_files/wxid_llnfi4jtg5hi12_235e
+      - /app/config/xwechat_files/${WECHAT_ACCOUNT_DIR_NAME:-PLEASE_SET_WECHAT_ACCOUNT_DIR}
       - --runtime-dir
       - /app/runtime
       - --media-dir
@@ -65,7 +63,7 @@ services:
       - /app/runtime/wechat-decrypt/config.json
 
   wechat-ai-memory:
-    image: local/wechat-memory-suite:latest
+    image: ${WECHAT_AGENT_IMAGE:-docker.io/xiaoguiwucan/linux-wechat-agent:latest}
     container_name: wechat-ai-memory
     restart: unless-stopped
     depends_on:
@@ -75,6 +73,8 @@ services:
     volumes:
       - ./runtime:/app/runtime
       - /var/run/docker.sock:/var/run/docker.sock:ro
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     command:
       - python
       - ai/app.py
@@ -92,7 +92,7 @@ services:
       - /app/runtime/ai-memory/ai_status.json
 
   wechat-agent-console:
-    image: local/wechat-memory-suite:latest
+    image: ${WECHAT_AGENT_IMAGE:-docker.io/xiaoguiwucan/linux-wechat-agent:latest}
     container_name: wechat-agent-console
     restart: unless-stopped
     depends_on:
@@ -102,6 +102,10 @@ services:
     volumes:
       - ./runtime:/app/runtime
       - /var/run/docker.sock:/var/run/docker.sock:ro
+    environment:
+      - WECHAT_SOURCE_DB_DIR=/app/config/xwechat_files/${WECHAT_ACCOUNT_DIR_NAME:-PLEASE_SET_WECHAT_ACCOUNT_DIR}/db_storage
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     command:
       - python
       - agent_console/app.py

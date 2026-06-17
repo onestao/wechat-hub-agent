@@ -191,7 +191,7 @@ def refresh_decrypted(
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Refresh decrypted DB copies from live WeChat DBs")
-    parser.add_argument("--source-db-dir", default="config/xwechat_files/wxid_llnfi4jtg5hi12_235e/db_storage")
+    parser.add_argument("--source-db-dir", default="config/xwechat_files/PLEASE_SET_WECHAT_ACCOUNT_DIR/db_storage")
     parser.add_argument("--decrypted-dir", default="runtime/wechat-decrypt/decrypted")
     parser.add_argument("--keys-file", default="runtime/wechat-decrypt/keys/all_keys.json")
     parser.add_argument("--state-file", default="runtime/wechat-decrypt/sync_state.json")

@@ -929,6 +929,7 @@ h4 { color: var(--muted); font-size: 13px; margin: 0 0 10px; }
 }
 .leader-row.podium {
   grid-template-columns: 30px 40px minmax(0, 1fr);
+  column-gap: 18px;
   min-height: 0;
   padding: clamp(4px, .62vh, 8px) 38px clamp(4px, .62vh, 8px) 6px;
   border-width: 1px;
@@ -936,6 +937,7 @@ h4 { color: var(--muted); font-size: 13px; margin: 0 0 10px; }
 .leader-row.podium-1 {
   min-height: 0;
   grid-template-columns: 34px 44px minmax(0, 1fr);
+  column-gap: 22px;
   grid-template-areas: "place avatar main";
   background:
     radial-gradient(circle at 20% 48%, rgba(255,245,179,.34), transparent 30%),
@@ -1085,6 +1087,9 @@ h4 { color: var(--muted); font-size: 13px; margin: 0 0 10px; }
   isolation: isolate;
 }
 .podium .leader-avatar-wrap {
+  z-index: 2;
+}
+.podium .leader-avatar-wrap {
   height: calc(100% - 4px);
   max-width: 40px;
   max-height: 40px;
@@ -1140,7 +1145,7 @@ h4 { color: var(--muted); font-size: 13px; margin: 0 0 10px; }
   inset: -1px;
   border-radius: 20px;
   background: conic-gradient(from 220deg, #fff8bf, #f4a91f, #fff1b2, #b87713, #fff8bf);
-  box-shadow: 0 0 0 5px rgba(255,215,111,.14), 0 0 38px rgba(255,215,111,.52), 0 0 82px rgba(255,215,111,.20);
+  box-shadow: 0 0 0 3px rgba(255,215,111,.12), 0 0 22px rgba(255,215,111,.34), 0 0 48px rgba(255,215,111,.14);
   animation: avatarFrameSpin 10s linear infinite;
 }
 .podium-1 .avatar-frame-inner {
@@ -1155,18 +1160,23 @@ h4 { color: var(--muted); font-size: 13px; margin: 0 0 10px; }
 .podium-2 .avatar-frame-outer {
   border-radius: 22px;
   background: conic-gradient(from 220deg, #f8fbff, #8794a7, #ffffff, #a5b0c0, #f8fbff);
-  box-shadow: 0 0 0 4px rgba(223,233,246,.10), 0 0 28px rgba(223,233,246,.32);
+  box-shadow: 0 0 0 3px rgba(223,233,246,.08), 0 0 18px rgba(223,233,246,.24);
 }
 .podium-3 .avatar-frame-outer {
   border-radius: 22px;
   background: conic-gradient(from 220deg, #ffd0a2, #b76129, #ffead1, #d78343, #ffd0a2);
-  box-shadow: 0 0 0 4px rgba(229,154,92,.10), 0 0 24px rgba(229,154,92,.28);
+  box-shadow: 0 0 0 3px rgba(229,154,92,.08), 0 0 16px rgba(229,154,92,.22);
 }
 .leader-main {
+  position: relative;
+  z-index: 4;
   min-width: 0;
   display: grid;
   align-content: center;
   gap: 1px;
+}
+.leader-row.podium .leader-main {
+  padding-left: 2px;
 }
 .podium-1 .leader-main { grid-area: main; align-self: center; }
 .leader-row.standard .leader-main {
@@ -3732,11 +3742,13 @@ pre { min-height: 170px; max-height: 380px; overflow: auto; white-space: pre-wra
   .leader-row.podium {
     min-height: 0;
     grid-template-columns: 22px 34px minmax(0, 1fr);
+    column-gap: 14px;
     padding: 5px 30px 5px 5px;
   }
   .leader-row.podium-1 {
     min-height: 0;
     grid-template-columns: 24px 36px minmax(0, 1fr);
+    column-gap: 16px;
     grid-template-areas: "place avatar main";
   }
   .leader-crown { left: 43px; top: 4px; scale: .48; transform-origin: left top; }
@@ -3757,6 +3769,7 @@ pre { min-height: 170px; max-height: 380px; overflow: auto; white-space: pre-wra
   .podium-1 .avatar-frame-outer { border-radius: 20px; }
   .podium-1 .avatar-frame-inner { inset: 5px; border-radius: 16px; }
   .leader-seat { min-height: 13px; padding: 0 4px; margin-bottom: 0; font-size: 7px; }
+  .leader-row.podium .leader-main { padding-left: 1px; }
   .podium-1 .leader-main { grid-area: main; align-self: center; }
   .leader-main em { font-size: 10px; }
   .podium-1 .leader-main em { font-size: 11px; }

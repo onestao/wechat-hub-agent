@@ -21,15 +21,33 @@
 | `8078` | WeChatAgent 控制台 |
 | `8090` | AI 记忆 API |
 
-## CPU 架构注意
+## CPU 架构兼容
 
-当前 `wechat-selkies` 上游镜像默认按 `linux/arm64` 使用，适合 Apple Silicon、部分 ARM NAS。
+当前发布版按多架构部署设计：
 
-如果你的 NAS 是 x86_64/amd64：
+- 项目服务镜像 `docker.io/xiaoguiwucan/linux-wechat-agent` 发布 `linux/amd64` 和 `linux/arm64`。
+- 微信 GUI 镜像 `ghcr.io/nickrunning/wechat-selkies:0.0.12-minimal` 已验证包含 `linux/amd64` 和 `linux/arm64`。
+- `.env.example` 默认 `WECHAT_SELKIES_PLATFORM=` 为空，让 Docker 自动按宿主机 CPU 架构选择镜像。
 
-1. 先尝试删除或修改 `.env` 里的 `WECHAT_SELKIES_PLATFORM`。
-2. 如果上游镜像没有 amd64 版本，需要换成可运行 Linux 微信 GUI 的兼容镜像。
-3. 项目服务镜像 `linux-wechat-agent` 本身可以正常构建/推送多架构，但微信 GUI 镜像是否可用取决于上游。
+常见机器对应关系：
+
+| 机器 | 推荐配置 |
+| --- | --- |
+| Intel/AMD x86 NAS、x86 Linux 服务器 | 保持 `WECHAT_SELKIES_PLATFORM=` 为空，自动拉 `linux/amd64` |
+| Apple Silicon、ARM NAS | 保持 `WECHAT_SELKIES_PLATFORM=` 为空，自动拉 `linux/arm64` |
+| 需要强制指定架构的特殊环境 | 手动写 `WECHAT_SELKIES_PLATFORM=linux/amd64` 或 `linux/arm64` |
+
+如果旧版 `.env` 里还写着：
+
+```env
+WECHAT_SELKIES_PLATFORM=linux/arm64
+```
+
+x86 机器上请改成：
+
+```env
+WECHAT_SELKIES_PLATFORM=
+```
 
 ## 从零部署
 

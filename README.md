@@ -39,6 +39,8 @@ flowchart LR
 
 需要一台已安装 Docker 和 Docker Compose 的机器。
 
+当前发布镜像支持 `linux/amd64` 和 `linux/arm64`。x86 NAS、Intel/AMD Linux 服务器、ARM NAS、Apple Silicon 都使用同一套 Compose；默认会自动按宿主机架构拉取镜像。
+
 ```bash
 git clone https://github.com/xiaoguiwucan/linux-wechat-agent.git
 cd linux-wechat-agent

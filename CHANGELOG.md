@@ -1,5 +1,16 @@
 # Changelog
 
+## v0.3.1 - 2026-06-18
+
+### Changed
+- Published the project service image as a multi-architecture DockerHub manifest for `linux/amd64` and `linux/arm64`.
+- Removed the default `linux/arm64` platform pin from the WeChat GUI service so x86 hosts can automatically pull `linux/amd64`.
+- Updated deployment docs to describe x86 NAS, Intel/AMD servers, ARM NAS, and Apple Silicon compatibility.
+- Updated DockerHub publishing script to use `docker buildx build --platform linux/amd64,linux/arm64 --push` by default.
+
+### Verified
+- Verified `ghcr.io/nickrunning/wechat-selkies:0.0.12-minimal` includes both `linux/amd64` and `linux/arm64` manifests.
+
 ## v0.3.0 - 2026-06-18
 
 ### Added

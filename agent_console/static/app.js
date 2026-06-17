@@ -2805,9 +2805,11 @@ function renderSkillDetail() {
   $("skillDetailState").className = `pill ${skill.enabled ? "ok" : ""}`;
   const triggers = (skill.triggers || []).map((item) => `<span class="memory-tag topic">${escapeHtml(item)}</span>`).join("");
   const perms = (skill.permissions || []).map((item) => `<span class="memory-tag ${item === "script_exec" ? "risk" : "person"}">${escapeHtml(permissionLabel(item))}</span>`).join("");
-  const configHtml = skill.skill_id === "image-understanding" ? renderImageSkillConfig(skill.config || {}) : `
-    <section class="skill-detail-section"><h4>配置 JSON</h4><textarea id="skillConfigJson" rows="7">${escapeHtml(JSON.stringify(skill.config || {}, null, 2))}</textarea></section>
-  `;
+  const configHtml = skill.skill_id === "image-understanding"
+    ? renderImageSkillConfig(skill.config || {})
+    : skill.skill_id === "meme-sender"
+      ? renderMemeSkillConfig(skill.config || {})
+      : `<section class="skill-detail-section"><h4>配置 JSON</h4><textarea id="skillConfigJson" rows="7">${escapeHtml(JSON.stringify(skill.config || {}, null, 2))}</textarea></section>`;
   root.innerHTML = `
     <section class="skill-detail-section"><h4>说明</h4><p>${escapeHtml(skill.description || "暂无描述")}</p></section>
     <section class="skill-detail-section"><h4>触发词</h4><div class="memory-tag-row">${triggers || `<span class="muted">暂无</span>`}</div></section>
@@ -2820,6 +2822,7 @@ function renderSkillDetail() {
       ${skill.source === "builtin" ? "" : `<button class="btn danger" type="button" data-skill-action="delete">删除</button>`}
     </section>
   `;
+  if (skill.skill_id === "meme-sender") bindMemeSkillConfig();
 }
 
 function renderImageSkillConfig(config) {
@@ -2870,6 +2873,97 @@ function collectImageSkillConfig(fallback = {}) {
   const key = $("imageSkillApiKey").value.trim();
   if (key) config.api_key = key;
   else if (fallback.api_key_configured) config.api_key_configured = true;
+  $("skillConfigJson").value = JSON.stringify(config, null, 2);
+  return config;
+}
+
+function renderMemeSkillConfig(config) {
+  const probability = Math.round(Number(config.probability || 0) * 100);
+  return `
+    <section class="skill-detail-section meme-skill-config">
+      <h4>斗图概率</h4>
+      <div class="form-grid skill-config-grid">
+        <label class="switch-label tight"><input id="memeSkillEnabled" type="checkbox" ${config.enabled !== false ? "checked" : ""} /><span>启用斗图技能</span></label>
+        <label class="switch-label tight"><input id="memeSkillAutoEnabled" type="checkbox" ${config.auto_enabled !== false ? "checked" : ""} /><span>允许自动斗图</span></label>
+        <label class="span-2 meme-probability-field">
+          <span>自动斗图概率</span>
+          <div class="meme-probability-control">
+            <input id="memeSkillProbabilityRange" type="range" min="0" max="100" step="1" value="${escapeAttr(probability)}" />
+            <input id="memeSkillProbability" type="number" min="0" max="100" step="1" value="${escapeAttr(probability)}" />
+            <strong id="memeSkillProbabilityText">${escapeHtml(probability)}%</strong>
+          </div>
+        </label>
+        <div class="span-2 meme-probability-actions" aria-label="快捷概率">
+          ${[0, 5, 10, 20, 35, 50].map((value) => `<button class="btn tiny" type="button" data-meme-probability="${value}">${value}%</button>`).join("")}
+        </div>
+        <label><span>默认关键词</span><input id="memeSkillDefaultKeyword" value="${escapeAttr(config.default_keyword || "笑死")}" autocomplete="off" /></label>
+        <label><span>接口地址</span><input id="memeSkillApiUrl" value="${escapeAttr(config.api_url || "https://api.suol.cc/v1/meme.php")}" autocomplete="off" /></label>
+        <label><span>接口页码</span><input id="memeSkillPage" type="number" min="1" max="99" step="1" value="${escapeAttr(config.page ?? 1)}" /></label>
+        <label><span>候选数量</span><input id="memeSkillNum" type="number" min="1" max="80" step="1" value="${escapeAttr(config.num ?? 40)}" /></label>
+      </div>
+      <p class="muted">明确要求斗图时直接发图；普通闲聊按这里的概率随机触发，并从当前消息和最近上下文里抽关键词搜对应表情。查询、总结、看图、严肃和工作事故场景会跳过斗图。</p>
+    </section>
+    <section class="skill-detail-section compact-json"><h4>配置 JSON</h4><textarea id="skillConfigJson" rows="5">${escapeHtml(JSON.stringify(config || {}, null, 2))}</textarea></section>
+  `;
+}
+
+function memeProbabilityPercent() {
+  const range = $("memeSkillProbabilityRange");
+  const input = $("memeSkillProbability");
+  const raw = input?.value || range?.value || 0;
+  return Math.max(0, Math.min(100, Number(raw || 0)));
+}
+
+function updateMemeSkillJson(fallback = {}) {
+  if (!$("memeSkillProbability")) return;
+  const config = collectMemeSkillConfig(fallback);
+  $("skillConfigJson").value = JSON.stringify(config, null, 2);
+}
+
+function bindMemeSkillConfig() {
+  const range = $("memeSkillProbabilityRange");
+  const input = $("memeSkillProbability");
+  const text = $("memeSkillProbabilityText");
+  const sync = (value) => {
+    const percent = Math.max(0, Math.min(100, Number(value || 0)));
+    if (range) range.value = String(percent);
+    if (input) input.value = String(percent);
+    if (text) text.textContent = `${percent}%`;
+    updateMemeSkillJson(selectedSkill()?.config || {});
+    markSkillConfigDirty();
+  };
+  range?.addEventListener("input", () => sync(range.value));
+  input?.addEventListener("input", () => sync(input.value));
+  document.querySelectorAll("[data-meme-probability]").forEach((button) => {
+    button.addEventListener("click", () => sync(button.dataset.memeProbability || 0));
+  });
+  ["memeSkillEnabled", "memeSkillAutoEnabled", "memeSkillDefaultKeyword", "memeSkillApiUrl", "memeSkillPage", "memeSkillNum"].forEach((id) => {
+    $(id)?.addEventListener("input", () => {
+      updateMemeSkillJson(selectedSkill()?.config || {});
+      markSkillConfigDirty();
+    });
+    $(id)?.addEventListener("change", () => {
+      updateMemeSkillJson(selectedSkill()?.config || {});
+      markSkillConfigDirty();
+    });
+  });
+}
+
+function collectMemeSkillConfig(fallback = {}) {
+  if (!$("memeSkillProbability")) {
+    return JSON.parse($("skillConfigJson")?.value || "{}");
+  }
+  const probability = memeProbabilityPercent() / 100;
+  const config = {
+    ...fallback,
+    enabled: $("memeSkillEnabled").checked,
+    auto_enabled: $("memeSkillAutoEnabled").checked,
+    probability,
+    default_keyword: $("memeSkillDefaultKeyword").value.trim() || "笑死",
+    api_url: $("memeSkillApiUrl").value.trim() || "https://api.suol.cc/v1/meme.php",
+    page: Number($("memeSkillPage").value || 1),
+    num: Number($("memeSkillNum").value || 40),
+  };
   $("skillConfigJson").value = JSON.stringify(config, null, 2);
   return config;
 }
@@ -2945,6 +3039,8 @@ async function mutateSkill(action) {
     try {
       body.config = skill.skill_id === "image-understanding"
         ? collectImageSkillConfig(skill.config || {})
+        : skill.skill_id === "meme-sender"
+          ? collectMemeSkillConfig(skill.config || {})
         : JSON.parse($("skillConfigJson").value || "{}");
     } catch (error) {
       alert(`配置 JSON 不合法：${error.message}`);

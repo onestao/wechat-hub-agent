@@ -2712,8 +2712,42 @@ textarea { resize: vertical; }
 
 .skill-config-grid .span-2 { grid-column: span 2; }
 
-.image-skill-config .muted {
+.image-skill-config .muted,
+.meme-skill-config .muted {
   margin-top: 8px;
+  font-size: 12px;
+}
+
+.meme-probability-field {
+  gap: 8px;
+}
+
+.meme-probability-control {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 88px 56px;
+  gap: 10px;
+  align-items: center;
+}
+
+.meme-probability-control input[type="range"] {
+  width: 100%;
+  accent-color: var(--accent);
+}
+
+.meme-probability-control strong {
+  color: var(--accent);
+  text-align: right;
+}
+
+.meme-probability-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.btn.tiny {
+  min-height: 30px;
+  padding: 5px 9px;
   font-size: 12px;
 }
 

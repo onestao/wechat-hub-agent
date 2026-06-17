@@ -2265,10 +2265,17 @@ BUILTIN_SKILL_DEFINITIONS = {
     },
     "meme-sender": {
         "name": "meme-sender",
-        "description": "根据群聊玩梗、离谱、笑死、吃瓜等场景搜索斗图表情，并只发送真实图片文件。",
+        "description": "根据聊天上下文和配置概率随机发送贴合语境的斗图表情图片，只发送真实图片文件。",
         "permissions": ["read_messages", "network", "send_image"],
-        "triggers": ["笑死", "离谱", "吃瓜", "无语", "破防", "斗图", "表情包"],
-        "config": {"auto_enabled": True, "probability": 0.0, "default_keyword": "笑死"},
+        "triggers": ["斗图", "表情包", "上下文随机斗图", "图片表情"],
+        "config": {
+            "auto_enabled": True,
+            "probability": 0.0,
+            "default_keyword": "笑死",
+            "api_url": "https://api.suol.cc/v1/meme.php",
+            "page": 1,
+            "num": 40,
+        },
     },
     "web-search": {
         "name": "web-search",
@@ -2318,9 +2325,10 @@ def default_builtin_skill_md(skill_id: str, definition: dict) -> str:
     if skill_id == "meme-sender":
         body = """# Meme Sender
 
-当群聊出现明显玩梗、离谱、笑死、吃瓜、无语、破防、互相调侃、冷场、求表情包时，可以触发斗图。
-斗图动作必须只发送一张相关表情图片，不要补文字，不要发送图片链接。
-严肃话题、争吵、悲伤求助、隐私、医疗法律、金钱交易、工作事故，不要斗图。
+根据当前消息和最近聊天上下文抽取语境关键词，再按技能配置的概率随机触发斗图。
+明确要求“斗图/来个表情包”时可以直接触发；普通闲聊只按概率触发。
+斗图动作必须只发送一张相关表情图片，不补文字，不发送图片链接。
+明确查询、总结、看图分析、严肃求助、隐私、安全、工作事故、争吵升级等场景不要斗图。
 """
     elif skill_id == "web-search":
         body = """# Web Search
@@ -4445,12 +4453,90 @@ def meme_keyword_for_text(text: str, config: dict) -> str:
     return str(settings.get("default_keyword") or "笑死").strip() or "笑死"
 
 
+MEME_TASK_BLOCK_WORDS = (
+    "总结",
+    "日报",
+    "查一下",
+    "查询",
+    "搜索",
+    "联网",
+    "赛程",
+    "新闻",
+    "资料",
+    "分析图片",
+    "看图",
+    "识图",
+    "截图",
+    "图里",
+    "公众号",
+    "文章",
+    "报告",
+    "文档",
+)
+
+
+def meme_context_text(text: str, recent: list[dict] | None = None) -> str:
+    snippets = [clean_contact_text(text)]
+    for row in (recent or [])[-6:]:
+        value = clean_contact_text(str(row.get("text") or row.get("display_content") or ""))
+        if value:
+            snippets.append(value)
+    return " ".join(snippets).strip()
+
+
+def meme_keyword_for_context(text: str, recent: list[dict] | None, config: dict) -> str:
+    context = meme_context_text(text, recent)
+    keyword = meme_keyword_for_text(context, config)
+    default_keyword = str(effective_skill_settings("meme-sender", config).get("default_keyword") or "笑死").strip() or "笑死"
+    if keyword != default_keyword:
+        return keyword
+    stopwords = {
+        "这个",
+        "那个",
+        "我们",
+        "你们",
+        "他们",
+        "今天",
+        "明天",
+        "昨天",
+        "一下",
+        "什么",
+        "怎么",
+        "为什么",
+        "可以",
+        "不是",
+        "没有",
+        "已经",
+        "现在",
+        "感觉",
+        "回复",
+        "机器人",
+    }
+    candidates = re.findall(r"[\u4e00-\u9fff]{2,6}|[A-Za-z0-9_+-]{3,16}", context)
+    scored: list[tuple[int, str]] = []
+    for token in candidates:
+        token = token.strip()
+        if not token or token in stopwords or token.startswith("@"):
+            continue
+        if any(block in token for block in MEME_TASK_BLOCK_WORDS):
+            continue
+        score = context.count(token) * 2 + min(len(token), 6)
+        if any(word in token for words in MEME_KEYWORDS.values() for word in words):
+            score += 10
+        scored.append((score, token))
+    if scored:
+        scored.sort(reverse=True)
+        return scored[0][1]
+    return default_keyword
+
+
 def should_trigger_meme(
     text: str,
     config: dict,
     scoring: dict | None = None,
     chat_username: str = "",
     base_time: int | None = None,
+    recent: list[dict] | None = None,
 ) -> dict:
     settings = effective_skill_settings("meme-sender", config)
     if not config.get("skills", {}).get("enabled", True) or not settings.get("enabled", True) or not settings.get("auto_enabled", True):
@@ -4460,36 +4546,39 @@ def should_trigger_meme(
         return {"trigger": False, "reason": "skill_disabled_or_no_permission"}
     text = str(text or "")
     mention_info = detect_bot_mention(text, config, chat_username)
-    if is_image_understanding_request(text, "", config):
+    explicit_request = any(word in text for word in ("斗图", "来张表情", "来个表情", "发个表情", "发张表情", "发个表情包", "来个表情包", "表情包整一个"))
+    if not explicit_request and is_image_understanding_request(text, "", config):
         return {"trigger": False, "reason": "image_understanding_intent"}
-    if is_web_search_request(text, config, chat_username, base_time):
+    if not explicit_request and is_web_search_request(text, config, chat_username, base_time):
         return {"trigger": False, "reason": "web_search_intent"}
+    if not explicit_request and (is_daily_report_request(text) or any(word in text for word in MEME_TASK_BLOCK_WORDS)):
+        return {"trigger": False, "reason": "task_intent"}
     serious_words = ("事故", "报警", "隐私", "密码", "账号", "转账", "借钱", "生病", "医院", "法律", "合同", "投诉", "值班", "故障", "严重")
     if any(word in text for word in serious_words):
         return {"trigger": False, "reason": "serious_context"}
-    keyword = meme_keyword_for_text(text, config)
-    keyword_hit = any(word in text for words in MEME_KEYWORDS.values() for word in words)
-    explicit_request = any(word in text for word in ("斗图", "来张表情", "来个表情", "发个表情", "发张表情", "发个表情包", "来个表情包", "表情包整一个"))
+    keyword = meme_keyword_for_context(text, recent, config)
     pure_laugh = bool(re.fullmatch(r"[@\w\u4e00-\u9fa5\s\u2005]*[哈啊]{3,}[哈啊\s\u2005]*", clean_contact_text(text)))
+    probability = clamp_float(settings.get("probability"), 0.0, 0.0, 1.0)
+    if probability <= 0 and not explicit_request:
+        return {"trigger": False, "reason": "probability_zero", "keyword": keyword, "probability": probability}
     playful_hit = any(
         any(token in str(hit.get("name") or "") for token in ("梗", "吐槽", "玩笑", "冷场"))
         for hit in ((scoring or {}).get("hits") or [])
         if isinstance(hit, dict)
     )
-    if mention_info.get("mentions_bot") and not explicit_request and not pure_laugh:
+    if mention_info.get("mentions_bot") and not explicit_request and not pure_laugh and probability < 1.0:
         return {"trigger": False, "reason": "mention_without_meme_request", "keyword": keyword}
-    if not (explicit_request or pure_laugh):
-        return {"trigger": False, "reason": "no_meme_signal", "keyword": keyword}
-    probability = clamp_float(settings.get("probability"), 0.0, 0.0, 1.0)
-    if explicit_request or pure_laugh or (playful_hit and keyword_hit and random.random() < probability):
+    roll = random.random()
+    if explicit_request or roll < probability:
         return {
             "trigger": True,
             "keyword": keyword,
-            "direct": bool(explicit_request or pure_laugh),
+            "direct": bool(explicit_request),
             "playful_hit": playful_hit,
             "probability": probability,
+            "roll": round(roll, 4),
         }
-    return {"trigger": False, "reason": "probability_skip", "keyword": keyword, "probability": probability}
+    return {"trigger": False, "reason": "probability_skip", "keyword": keyword, "probability": probability, "roll": round(roll, 4)}
 
 
 IMAGE_UNDERSTANDING_REQUEST_WORDS = (
@@ -4958,6 +5047,7 @@ def maybe_execute_auto_skill(message: dict, config: dict, scoring: dict) -> dict
         scoring,
         str(message.get("chat_username") or ""),
         int(message.get("create_time") or 0) or None,
+        recent_context(str(message.get("chat_username") or ""), before_time=int(message.get("create_time") or 0), limit=8),
     )
     if meme_decision.get("trigger"):
         set_auto_reply_live("skill", message, scoring=scoring, details={"skill": "meme-sender", **meme_decision})

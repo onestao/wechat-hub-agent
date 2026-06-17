@@ -685,8 +685,22 @@ def sanitize_config(payload: dict, current: dict) -> dict:
 
 def save_config(payload: dict) -> dict:
     current = read_config()
-    merged = normalize_config(merge_dicts(current, sanitize_config(payload, current)))
+    save_source = str((payload or {}).get("_save_source") or "").strip()
+    was_active = bool(auto_reply_activation_state(current).get("active"))
+    sanitized = sanitize_config(payload, current)
+    if save_source == "auto_reply":
+        sender = sanitized.get("reply_sender") if isinstance(sanitized.get("reply_sender"), dict) else {}
+        if sender.get("enabled") and sender.get("mode") == "auto_send" and not sender.get("maintenance_paused"):
+            agent = dict(sanitized.get("agent") or current.get("agent") or {})
+            agent["enabled"] = True
+            agent["auto_reply_enabled"] = True
+            sanitized["agent"] = agent
+    merged = normalize_config(merge_dicts(current, sanitized))
     write_json(CONFIG_FILE, merged)
+    is_active = bool(auto_reply_activation_state(merged).get("active"))
+    if save_source == "auto_reply" and is_active and not was_active:
+        reset = reset_auto_reply_watermarks_to_latest(merged)
+        add_auto_reply_event("enabled", "自动接话已启用，从当前最新消息开始监听", reset)
     return public_config(merged)
 
 
@@ -5212,6 +5226,8 @@ AUTO_REPLY_PHASE_TEXT = {
     "skipped": "已跳过",
 }
 
+AUTO_REPLY_LAST_ACTIVE = False
+
 
 def set_auto_reply_live(
     phase: str,
@@ -5241,21 +5257,43 @@ def set_auto_reply_live(
     write_auto_reply_state({"live": live, "last_action_at": now_iso()})
 
 
+def auto_reply_activation_state(config: dict) -> dict:
+    agent = config.get("agent", {}) if isinstance(config.get("agent"), dict) else {}
+    sender = config.get("reply_sender", {}) if isinstance(config.get("reply_sender"), dict) else {}
+    paused = bool(sender.get("maintenance_paused", False))
+    mode = str(sender.get("mode") or "draft_only")
+    checks = {
+        "agent_enabled": bool(agent.get("enabled", True)),
+        "agent_auto_reply_enabled": bool(agent.get("auto_reply_enabled", False)),
+        "sender_enabled": bool(sender.get("enabled", False)),
+        "maintenance_paused": paused,
+        "sender_mode": mode,
+    }
+    reason = ""
+    if not checks["agent_enabled"]:
+        reason = "agent_disabled"
+    elif not checks["agent_auto_reply_enabled"]:
+        reason = "agent_auto_reply_disabled"
+    elif not checks["sender_enabled"]:
+        reason = "sender_disabled"
+    elif paused:
+        reason = "maintenance_paused"
+    elif mode != "auto_send":
+        reason = f"sender_mode_{mode or 'missing'}"
+    return {"active": not reason, "reason": reason, **checks}
+
+
 def auto_reply_public_state(config: dict | None = None) -> dict:
     config = config or read_config()
     state = auto_reply_state()
     sender = config.get("reply_sender", {})
     paused = bool(sender.get("maintenance_paused", False))
-    active = bool(
-        config.get("agent", {}).get("enabled", True)
-        and config.get("agent", {}).get("auto_reply_enabled", False)
-        and sender.get("enabled", False)
-        and not paused
-        and sender.get("mode") == "auto_send"
-    )
+    activation = auto_reply_activation_state(config)
     return {
         **state,
-        "active": active,
+        "active": bool(activation.get("active")),
+        "inactive_reason": activation.get("reason") or "",
+        "activation": activation,
         "enabled": bool(sender.get("enabled", False)),
         "maintenance_paused": paused,
         "mode": sender.get("mode") or "draft_only",
@@ -5331,6 +5369,51 @@ def is_auto_reply_allowed_chat(row: dict, allowed: set[str]) -> bool:
     chat_username = str(row.get("chat_username") or "").strip()
     chat_display = str(row.get("chat_display_name") or "").strip()
     return not allowed or chat_username in allowed or chat_display in allowed
+
+
+def reset_auto_reply_watermarks_to_latest(config: dict) -> dict:
+    if not MEMORY_DB.exists():
+        return {"ok": False, "error": "memory db missing", "updated": 0}
+    allowed = allowed_auto_reply_chats(config)
+    watermarks: dict[str, dict] = {}
+    try:
+        with db_connect(MEMORY_DB, readonly=True) as conn:
+            chat_rows = conn.execute(
+                """
+                SELECT username, display_name
+                FROM chats
+                WHERE COALESCE(is_group, 0)=1
+                """
+            ).fetchall()
+            for chat_row in chat_rows:
+                chat = str(chat_row["username"] or "")
+                display = str(chat_row["display_name"] or "")
+                if not chat:
+                    continue
+                if allowed and chat not in allowed and display not in allowed:
+                    continue
+                latest = conn.execute(
+                    """
+                    SELECT message_uid, chat_username, chat_display_name, local_id, create_time
+                    FROM messages
+                    WHERE chat_username=?
+                      AND COALESCE(origin_source, 0)!=1
+                    ORDER BY create_time DESC, local_id DESC
+                    LIMIT 1
+                    """,
+                    (chat,),
+                ).fetchone()
+                watermarks[chat] = chat_watermark(dict(latest) if latest else None)
+    except sqlite3.Error as exc:
+        return {"ok": False, "error": str(exc), "updated": 0}
+    write_auto_reply_state(
+        {
+            "watermarks": watermarks,
+            "last_skip_reason": "watermarks_reset_to_latest",
+            "last_checked_at": now_iso(),
+        }
+    )
+    return {"ok": True, "updated": len(watermarks)}
 
 
 def round_robin_limited(groups: list[list[dict]], limit: int) -> list[dict]:
@@ -11042,43 +11125,43 @@ def semantic_extract_loop() -> None:
 
 def auto_reply_loop() -> None:
     initialize_auto_reply_state()
+    global AUTO_REPLY_LAST_ACTIVE
+    AUTO_REPLY_LAST_ACTIVE = False
     while True:
         sleep_seconds = 5.0
         try:
             config = read_config()
             sender = config.get("reply_sender", {})
             sleep_seconds = clamp_float(sender.get("poll_interval_seconds"), 5, 1.0, 300.0)
-            paused = bool(sender.get("maintenance_paused", False))
-            active = bool(
-                config.get("agent", {}).get("enabled", True)
-                and config.get("agent", {}).get("auto_reply_enabled", False)
-                and sender.get("enabled", False)
-                and not paused
-                and sender.get("mode") == "auto_send"
-            )
+            activation = auto_reply_activation_state(config)
+            active = bool(activation.get("active"))
             write_auto_reply_state(
                 {
                     "enabled": bool(sender.get("enabled", False)),
                     "running": active,
                     "last_checked_at": now_iso(),
+                    "last_inactive_reason": activation.get("reason") or "",
                 }
             )
+            if active and not AUTO_REPLY_LAST_ACTIVE:
+                reset = reset_auto_reply_watermarks_to_latest(config)
+                add_auto_reply_event("enabled", "自动接话已启用，从当前最新消息开始监听", reset)
+                AUTO_REPLY_LAST_ACTIVE = True
+                time.sleep(min(5.0, sleep_seconds))
+                continue
             if not active:
+                AUTO_REPLY_LAST_ACTIVE = False
                 state = auto_reply_state()
                 live = state.get("live") if isinstance(state.get("live"), dict) else {}
-                phase = "paused" if paused else "disabled"
-                if live.get("phase") != phase and live.get("phase") not in {"sent", "failed"}:
+                phase = "paused" if activation.get("reason") == "maintenance_paused" else "disabled"
+                if live.get("phase") != phase or live.get("details", {}).get("reason") != activation.get("reason"):
                     set_auto_reply_live(
                         phase,
                         details={
-                            "agent_enabled": bool(config.get("agent", {}).get("enabled", True)),
-                            "agent_auto_reply_enabled": bool(config.get("agent", {}).get("auto_reply_enabled", False)),
-                            "sender_enabled": bool(sender.get("enabled", False)),
-                            "maintenance_paused": paused,
-                            "sender_mode": sender.get("mode") or "",
+                            **activation,
                         },
                     )
-                write_auto_reply_state({"last_skip_reason": "maintenance_paused" if paused else "disabled"})
+                write_auto_reply_state({"last_skip_reason": activation.get("reason") or "disabled"})
                 time.sleep(min(5.0, sleep_seconds))
                 continue
             result = auto_reply_once(config)

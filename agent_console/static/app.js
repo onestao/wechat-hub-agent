@@ -623,14 +623,53 @@ function syncReplySenderFromForm() {
   };
 }
 
+function applyAutoReplySaveIntent() {
+  if (!state.config) return;
+  const sender = state.config.reply_sender || {};
+  if (sender.enabled && sender.mode === "auto_send" && !sender.maintenance_paused) {
+    state.config.agent = {
+      ...(state.config.agent || {}),
+      enabled: true,
+      auto_reply_enabled: true,
+    };
+    if ($("agentEnabled")) $("agentEnabled").checked = true;
+    if ($("autoReplyEnabled")) $("autoReplyEnabled").checked = true;
+  }
+}
+
+function configSaveSource(button) {
+  const id = typeof button === "string" ? button : button?.id || "";
+  if (id === "saveAutoReplyBtn") return "auto_reply";
+  if (id === "savePersonaBtn") return "persona";
+  if (id === "saveTalkBtn") return "talk";
+  if (id === "saveModelsBtn") return "models";
+  if (id === "saveMemoryBtn") return "memory";
+  return "";
+}
+
+function autoReplyReasonText(reason) {
+  const labels = {
+    agent_disabled: "Agent 分析未启用",
+    agent_auto_reply_disabled: "自动回复判定未开启",
+    sender_disabled: "自动发送器未启用",
+    maintenance_paused: "维修暂停",
+    sender_mode_draft_only: "当前是草稿模式",
+    sender_mode_manual_send: "当前是手动发送模式",
+    sender_mode_missing: "发送模式未配置",
+  };
+  return labels[reason] || reason || "";
+}
+
 function renderAutoReplyStatus() {
   const root = $("autoReplyStatus");
   if (!root) return;
   const auto = state.autoReply || {};
   const active = Boolean(auto.active);
   const paused = Boolean(auto.maintenance_paused);
+  const inactiveReason = auto.inactive_reason || auto.activation?.reason || auto.last_skip_reason || "";
+  const inactiveText = autoReplyReasonText(inactiveReason);
   const statusClass = active ? "ok" : auto.ok === false ? "bad" : paused ? "warn" : "warn";
-  const statusText = active ? "自动发送运行中" : auto.ok === false ? "自动发送异常" : paused ? "维修暂停中" : "自动发送未生效";
+  const statusText = active ? "自动发送运行中" : auto.ok === false ? "自动发送异常" : paused ? "维修暂停中" : `自动发送未生效${inactiveText ? `：${inactiveText}` : ""}`;
   const events = (auto.recent_events || []).slice(0, 4);
   const lastBits = [
     `模式 ${auto.mode || "--"}`,
@@ -641,7 +680,7 @@ function renderAutoReplyStatus() {
     auto.sender?.active_chat_display_name ? `当前窗口 ${auto.sender.active_chat_display_name}` : "",
     auto.last_chat_display_name ? `最近 ${auto.last_chat_display_name}` : "",
     auto.last_decision ? `判定 ${auto.last_decision} ${fmtNumber(auto.last_score || 0)}/${fmtNumber(auto.last_threshold || 0)}` : "",
-    auto.last_skip_reason ? `状态 ${auto.last_skip_reason}` : "",
+    inactiveText ? `状态 ${inactiveText}` : auto.last_skip_reason ? `状态 ${auto.last_skip_reason}` : "",
     auto.last_error ? `错误 ${auto.last_error}` : "",
   ].filter(Boolean);
   root.innerHTML = `
@@ -3342,10 +3381,11 @@ async function saveAll(button, label = "保存") {
   button.disabled = true;
   button.textContent = "保存中";
   try {
+    const source = configSaveSource(button);
     const payload = await fetchJson("/api/config", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(collectConfig()),
+      body: JSON.stringify(collectConfig(source)),
     });
     state.config = payload.config;
     state.talkSettingsDirty = false;
@@ -3369,13 +3409,14 @@ async function saveAll(button, label = "保存") {
   }
 }
 
-function collectConfig() {
+function collectConfig(source = "") {
   syncProfileFromForm();
   syncAgentFromForm();
   syncTalkFromForm();
   syncReplySenderFromForm();
   syncLayersFromForm();
-  return state.config;
+  if (source === "auto_reply") applyAutoReplySaveIntent();
+  return source ? { ...state.config, _save_source: source } : state.config;
 }
 
 function addProfile() {

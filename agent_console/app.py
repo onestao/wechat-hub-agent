@@ -391,14 +391,6 @@ def normalize_config(config: dict) -> dict:
     )
     sender_hourly_limit = clamp_int(sender.get("hourly_limit"), sender_defaults["hourly_limit"], 0, 1000)
     sender_streak_limit = clamp_int(sender.get("streak_limit"), sender_defaults["streak_limit"], 0, 1000)
-    # Old builds shipped conservative defaults here. The current sender relies
-    # on explicit random delays only, so migrate those legacy limits away.
-    if sender_min_interval == 60:
-        sender_min_interval = 0
-    if sender_hourly_limit == 10:
-        sender_hourly_limit = 0
-    if sender_streak_limit == 2:
-        sender_streak_limit = 0
     config["reply_sender"] = {
         "enabled": bool(sender.get("enabled", sender_defaults["enabled"])),
         "maintenance_paused": bool(sender.get("maintenance_paused", sender_defaults.get("maintenance_paused", False))),
@@ -439,7 +431,7 @@ def normalize_config(config: dict) -> dict:
         "enabled": bool(semantic.get("enabled", defaults["enabled"])),
         "interval_seconds": clamp_int(semantic.get("interval_seconds"), defaults["interval_seconds"], 5, 86400),
         "min_new_messages": clamp_int(semantic.get("min_new_messages"), defaults["min_new_messages"], 1, 500),
-        "limit": clamp_int(semantic.get("limit"), defaults["limit"], 1, 120),
+        "limit": clamp_int(semantic.get("limit"), defaults["limit"], 1, 500),
         "batch_size": clamp_int(semantic.get("batch_size"), defaults["batch_size"], 1, 10),
         "chat_username": str(semantic.get("chat_username") or "").strip(),
     }
@@ -727,8 +719,6 @@ def sanitize_skills_config(raw: dict, current: dict | None = None) -> dict:
     if not image_key and image_raw.get("api_key_configured"):
         image_key = str(image_current.get("api_key") or "").strip()
     meme_probability = clamp_float(meme_raw.get("probability"), meme_current.get("probability", 0.0), 0.0, 1.0)
-    if abs(meme_probability - 0.35) < 0.0001:
-        meme_probability = 0.0
     return {
         "enabled": bool(raw.get("enabled", current.get("enabled", defaults["enabled"]))),
         "blue_mention_enabled": bool(

@@ -1820,8 +1820,10 @@ function graphLeaderboardHtml(nodes) {
       const podiumClass = index < 3 ? `podium podium-${index + 1}` : "standard";
       const crown = index < 3 ? `<span class="leader-crown" aria-hidden="true"><i></i><i></i><i></i></span>` : "";
       const seat = index === 0 ? "冠军席" : index === 1 ? "银翼席" : index === 2 ? "铜辉席" : "活跃席";
+      const countLabel = index < 3 ? `${fmtNumber(count)} 条发言` : `${fmtNumber(count)}条`;
+      const rowTitle = `${displayName} · ${fmtNumber(count)} 条发言 · ${rank}`;
       return `
-        <button type="button" class="leader-row ${podiumClass} rank-${rankClass}" data-place="${index + 1}" data-leader-node="${escapeAttr(node.id)}">
+        <button type="button" class="leader-row ${podiumClass} rank-${rankClass}" data-place="${index + 1}" data-leader-node="${escapeAttr(node.id)}" title="${escapeAttr(rowTitle)}">
           <span class="leader-row-glow" aria-hidden="true"></span>
           ${crown}
           <span class="leader-place"><em>${index + 1}</em><small>NO.</small></span>
@@ -1833,7 +1835,7 @@ function graphLeaderboardHtml(nodes) {
           <span class="leader-main">
             <span class="leader-seat">${escapeHtml(seat)}</span>
             <em>${escapeHtml(displayName)}</em>
-            <small>${fmtNumber(count)} 条发言</small>
+            <small>${escapeHtml(countLabel)}</small>
           </span>
           <b class="leader-rank-badge">${escapeHtml(rank)}</b>
         </button>

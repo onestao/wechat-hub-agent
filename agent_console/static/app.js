@@ -1770,6 +1770,7 @@ function graphLeaderboardHtml(nodes) {
       <span>群聊发言榜</span>
       <strong>Top 10</strong>
     </div>
+    <div class="leader-list">
     ${people.map((node, index) => {
       const count = Number(node.meta?.message_count || node.count || 0);
       const rank = personRank(node);
@@ -1799,6 +1800,7 @@ function graphLeaderboardHtml(nodes) {
         </button>
       `;
     }).join("")}
+    </div>
   `;
 }
 

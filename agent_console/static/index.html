@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>微信 Agent 控制台</title>
-    <link rel="stylesheet" href="/styles.css" />
+    <link rel="stylesheet" href="/styles.css?v=20260618-rank-tiers" />
   </head>
   <body>
     <main class="screen">
@@ -69,7 +69,7 @@
           <article class="card stat"><label>消息索引</label><strong id="memoryBadge">--</strong><small id="syncHint">5 秒增量同步</small></article>
           <article class="card stat"><label>模型</label><strong id="modelHealth">--</strong><small id="modelHint">等待检测</small></article>
           <article class="card stat"><label>服务</label><strong id="runMode">--</strong><small id="talkHint">等待检测</small></article>
-          <article class="card stat"><label>记忆</label><strong id="memoryObjectCount">--</strong><small id="memoryHint">群摘要/人物/事实/关系</small></article>
+          <article id="loginGuardCard" class="card stat"><label>登录守护</label><strong id="loginGuardPhase">--</strong><small id="loginGuardHint">等待检测</small></article>
         </section>
 
         <section class="page active" data-page="overview">
@@ -188,6 +188,13 @@
                   </div>
                   <span id="flowState" class="pill">--</span>
                 </div>
+                <div id="loginGuardStatus" class="login-guard-status">
+                  <div>
+                    <strong id="loginGuardPanelPhase">登录守护等待检测</strong>
+                    <span id="loginGuardPanelHint">用于微信掉线后自动点登录并通知手机确认。</span>
+                  </div>
+                  <span id="loginGuardPanelNotify" class="pill">--</span>
+                </div>
                 <div class="flow">
                   <div class="flow-step"><span class="flow-dot"></span><div><strong>微信数据</strong><small>原始数据只读挂载</small></div></div>
                   <div class="flow-step"><span class="flow-dot"></span><div><strong>聊天同步</strong><small id="syncSummary">--</small></div></div>
@@ -204,6 +211,58 @@
                   <span id="cleanupLogsState">保留最近运行记录，不影响消息和记忆。</span>
                 </div>
               </aside>
+
+              <article class="card panel login-guard-panel">
+                <div class="panel-head">
+                  <div>
+                    <h3>微信登录守护</h3>
+                    <p>掉线时自动点击“我知道了”和“登录”，然后通过 Clawbot 提醒你在手机微信确认。</p>
+                  </div>
+                  <div class="button-row">
+                    <button id="loginGuardRunBtn" class="btn" type="button">检查一次</button>
+                    <button id="loginGuardTestNotifyBtn" class="btn" type="button">发送测试通知</button>
+                    <button id="saveLoginGuardBtn" class="btn primary" type="button">保存守护</button>
+                  </div>
+                </div>
+                <div class="login-guard-grid">
+                  <label class="switch-label"><input id="loginGuardEnabled" type="checkbox" /><span>启用登录守护</span></label>
+                  <label class="switch-label"><input id="loginGuardAutoClick" type="checkbox" /><span>掉线自动点登录</span></label>
+                  <label class="switch-label"><input id="loginGuardNotifyEnabled" type="checkbox" /><span>启用 Clawbot 通知</span></label>
+                  <label class="switch-label"><input id="loginGuardRecoveryNotify" type="checkbox" /><span>恢复后通知一次</span></label>
+                  <label><span>检测间隔 秒</span><input id="loginGuardCheckInterval" type="number" min="15" max="3600" step="5" /></label>
+                  <label><span>同步停滞判定 分钟</span><input id="loginGuardStaleMinutes" type="number" min="1" max="1440" step="1" /></label>
+                  <label><span>未处理重复提醒 分钟</span><input id="loginGuardRepeatMinutes" type="number" min="1" max="1440" step="1" /></label>
+                  <label><span>通知通道</span><select id="loginGuardChannel"><option value="clawbot_http">Clawbot HTTP</option><option value="generic_webhook">通用 Webhook</option></select></label>
+                  <label class="span-2"><span>Clawbot URL</span><input id="loginGuardWebhookUrl" autocomplete="off" placeholder="http://NAS:26322/bots/{bot_id}/messages" /></label>
+                  <label><span>目标 / bot_id 备注</span><input id="loginGuardNotifyTarget" autocomplete="off" placeholder="可留空" /></label>
+                  <label><span>API Token</span><input id="loginGuardNotifyToken" type="password" autocomplete="off" placeholder="留空则保持已保存 token" /></label>
+                  <label class="span-2 textarea-label"><span>通知文案</span><textarea id="loginGuardTemplate" rows="3"></textarea></label>
+                </div>
+              </article>
+
+              <article class="card panel clawbot-panel">
+                <div class="panel-head">
+                  <div>
+                    <h3>Clawbot 通知登录</h3>
+                    <p>在 8078 内启动 Clawbot、扫码登录，并自动回填到登录守护通知配置。</p>
+                  </div>
+                  <div class="button-row">
+                    <button id="clawbotStartBtn" class="btn" type="button">启动服务</button>
+                    <button id="clawbotLoginBtn" class="btn primary" type="button">开始扫码</button>
+                    <button id="clawbotApplyBtn" class="btn" type="button">应用到守护</button>
+                    <button id="clawbotRefreshBtn" class="btn" type="button">刷新</button>
+                  </div>
+                </div>
+                <div class="clawbot-status">
+                  <div><span>容器</span><strong id="clawbotContainerState">--</strong></div>
+                  <div><span>登录账号</span><strong id="clawbotBotCount">--</strong></div>
+                  <div><span>端口</span><strong id="clawbotPort">--</strong></div>
+                  <div><span>通知地址</span><strong id="clawbotUrlHint">--</strong></div>
+                </div>
+                <div id="clawbotBots" class="clawbot-bots"></div>
+                <pre id="clawbotQr" class="clawbot-qr">点击“开始扫码”后，这里会显示微信二维码。</pre>
+                <div id="clawbotHint" class="clawbot-hint">扫码授权后，请用该微信给“微信ClawBot”发一条消息激活 API。</div>
+              </article>
 
               <article class="card panel logs-panel">
                 <div class="panel-head">
@@ -458,15 +517,20 @@
             <section class="memory-tab-page active" data-memory-page="people">
               <section class="memory-people-layout">
                 <article class="card panel memory-profile-wall">
-                  <div class="panel-head">
-                    <div>
-                      <h3>人物画像</h3>
-                      <p>每个群成员独立成卡，点击后查看性格、偏好、故事线和证据。</p>
-                    </div>
-                    <input id="memoryPeopleSearch" class="search-input compact" placeholder="搜索成员、标签、画像" autocomplete="off" />
-                  </div>
-                  <div id="memoryPeopleGrid" class="memory-profile-grid"></div>
-                </article>
+	                  <div class="panel-head">
+	                    <div>
+	                      <h3>人物画像</h3>
+	                      <p>每个群成员独立成卡，点击后查看性格、偏好、故事线和证据。</p>
+	                    </div>
+	                    <div class="memory-profile-actions">
+	                      <span id="profileRebuildState" class="pill">--</span>
+	                      <button id="rebuildProfilesBtn" class="btn primary" type="button">手动更新画像</button>
+	                      <input id="memoryPeopleSearch" class="search-input compact" placeholder="搜索成员、标签、画像" autocomplete="off" />
+	                    </div>
+	                  </div>
+	                  <div id="profileRebuildPanel" class="profile-rebuild-panel"></div>
+	                  <div id="memoryPeopleGrid" class="memory-profile-grid"></div>
+	                </article>
                 <aside class="card panel memory-profile-detail">
                   <div class="panel-head">
                     <div>
@@ -601,6 +665,26 @@
                   </div>
                   <div id="semanticRunList" class="run-list"></div>
                 </article>
+                <article class="card panel span-2">
+                  <div class="panel-head">
+                    <div>
+                      <h3>画像重建</h3>
+                      <p>从全历史消息、群昵称映射和互动证据重建人物画像与关系，默认每 12 小时刷新。</p>
+                    </div>
+                    <span id="profileRebuildSettingsState" class="pill">--</span>
+                  </div>
+                  <div class="extract-grid">
+                    <label class="switch-label"><input id="profileRebuildEnabled" type="checkbox" /><span>启用画像重建</span></label>
+                    <label><span>重建间隔 秒</span><input id="profileRebuildInterval" type="number" min="3600" step="3600" /></label>
+                    <label><span>每群最多成员</span><input id="profileRebuildMaxPeople" type="number" min="5" max="500" step="5" /></label>
+                    <label><span>最低发言数</span><input id="profileRebuildMinMessages" type="number" min="1" max="50" step="1" /></label>
+                    <label class="switch-label"><input id="profileRebuildUseLlm" type="checkbox" /><span>使用大模型画像</span></label>
+                    <label><span>LLM 最低发言数</span><input id="profileRebuildLlmMinMessages" type="number" min="1" max="100" step="1" /></label>
+                    <label><span>限定会话</span><select id="profileRebuildChat"></select></label>
+                    <button id="rebuildProfilesSettingsBtn" class="btn primary" type="button">手动更新画像</button>
+                  </div>
+                  <div id="profileRebuildSettingsPanel" class="profile-rebuild-panel"></div>
+                </article>
                 <article class="card panel span-2"><div class="panel-head"><h3>群摘要管理</h3></div><div id="summaryPreview" class="memory-list"></div></article>
                 <article class="card panel"><div class="panel-head"><h3>人物画像管理</h3></div><div id="peoplePreview" class="memory-list"></div></article>
                 <article class="card panel"><div class="panel-head"><h3>长期事实管理</h3></div><div id="factPreview" class="memory-list"></div></article>
@@ -627,12 +711,13 @@
               </div>
               <div class="database-hero">
                 <div><span>当前群组</span><strong id="databaseScopeName">--</strong></div>
-                <div><span>数据库总容量</span><strong id="databaseTotalSize">--</strong></div>
+                <div><span>核心数据库容量</span><strong id="databaseTotalSize">--</strong></div>
+                <div><span>全部运行数据容量</span><strong id="databaseRuntimeSize">--</strong></div>
                 <div><span>导入状态</span><strong id="databaseImportState">等待操作</strong></div>
               </div>
             </article>
             <article class="card panel span-2">
-              <div class="panel-head compact-head"><h3>数据库类型与容量</h3><span class="muted">原始库 + AI 记忆库</span></div>
+              <div class="panel-head compact-head"><h3>数据库类型与容量</h3><span class="muted">文件大小实时计算，当前群容量为估算</span></div>
               <div id="databaseDbGrid" class="database-db-grid"></div>
             </article>
             <article class="card panel">
@@ -712,6 +797,6 @@
         </section>
       </section>
     </main>
-    <script src="/app.js"></script>
+    <script src="/app.js?v=20260618-rank-tiers"></script>
   </body>
 </html>

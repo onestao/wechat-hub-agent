@@ -15,7 +15,7 @@ services:
     volumes:
       - ./config:/config
       - ./tools/wechat-decrypt:/opt/wechat-decrypt:ro
-      - ./agent_console/wechat_controller.py:/opt/wechat-controller/wechat_controller.py:ro
+      - ./agent_console:/opt/wechat-controller:ro
       - ./runtime/wechat-decrypt:/runtime/wechat-decrypt
     environment:
       - PUID=${PUID:-1000}

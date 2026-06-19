@@ -12,7 +12,10 @@ const state = {
   lastMessages: [],
   suite: null,
   semanticRuns: null,
+  profileRebuild: null,
   autoReply: null,
+  loginGuard: null,
+  clawbot: null,
   skills: { skills: [], runs: [], stats: {} },
   database: null,
   photos: { items: [], stats: {}, auto: {}, status: "all", selectedUid: "" },
@@ -22,6 +25,8 @@ const state = {
   preview: null,
   lastOutbox: null,
   talkSettingsDirty: false,
+  loginGuardDirty: false,
+  profileRebuildPolling: false,
   memoryUi: {
     tab: "people",
     selectedPersonId: null,
@@ -47,6 +52,9 @@ const state = {
     lastX: 0,
     lastY: 0,
   },
+  overviewSemanticSignature: "",
+  overviewFullRefreshInFlight: false,
+  lastOverviewFullRefreshAt: 0,
 };
 
 const $ = (id) => document.getElementById(id);
@@ -204,6 +212,42 @@ function activeMemoryChat() {
   return state.chats.find((chat) => chat.username === state.memoryChat) || null;
 }
 
+function overviewSemanticSignature(payload = {}) {
+  const memory = payload.memory || state.memory || {};
+  const scope = payload.semantic_memory?.scope || state.semantic?.scope || {};
+  return [
+    state.memoryChat || "all",
+    Number(memory.messages || 0),
+    Number(memory.ai_indexed_messages || 0),
+    Number(memory.latest_message_time || 0),
+    Number(scope.message_count || 0),
+    Number(scope.end_time || 0),
+  ].join(":");
+}
+
+function rememberOverviewSemanticSignature(payload = {}) {
+  state.overviewSemanticSignature = overviewSemanticSignature(payload);
+}
+
+function needsOverviewFullRefresh(payload = {}) {
+  if (state.view !== "overview") return false;
+  if (state.overviewFullRefreshInFlight) return false;
+  if (Date.now() - Number(state.lastOverviewFullRefreshAt || 0) < 3500) return false;
+  const nextSignature = overviewSemanticSignature(payload);
+  return Boolean(state.semantic?.graph) && nextSignature !== state.overviewSemanticSignature;
+}
+
+async function refreshOverviewSemanticIfNeeded(payload = {}) {
+  if (!needsOverviewFullRefresh(payload)) return;
+  state.overviewFullRefreshInFlight = true;
+  state.lastOverviewFullRefreshAt = Date.now();
+  try {
+    await refreshFullStatus({ skipAuxViews: true });
+  } finally {
+    state.overviewFullRefreshInFlight = false;
+  }
+}
+
 function resetMemorySelection() {
   state.graph.selectedId = null;
   state.graph.didFit = false;
@@ -236,14 +280,17 @@ function updateTop() {
   $("memoryBadge").textContent = `${fmtNumber(memory.ai_indexed_messages)} / ${fmtNumber(memory.messages)}`;
   $("syncHint").textContent = `${fmtNumber(memory.chats)} 会话`;
   updateServiceStat();
-  $("memoryObjectCount").textContent = fmtNumber(state.memoryChat ? scopedObjects : memoryObjects);
-  $("memoryHint").textContent = state.memoryChat
-    ? `${fmtNumber(totals.summaries)} 摘要 · ${fmtNumber(totals.people)} 人物 · ${fmtNumber(totals.facts)} 事实`
-    : `${fmtNumber(memory.group_summaries)} 摘要 · ${fmtNumber(memory.people_profiles)} 人物 · ${fmtNumber(memory.facts)} 事实`;
+  if ($("memoryObjectCount")) $("memoryObjectCount").textContent = fmtNumber(state.memoryChat ? scopedObjects : memoryObjects);
+  if ($("memoryHint")) {
+    $("memoryHint").textContent = state.memoryChat
+      ? `${fmtNumber(totals.summaries)} 摘要 · ${fmtNumber(totals.people)} 人物 · ${fmtNumber(totals.facts)} 事实`
+      : `${fmtNumber(memory.group_summaries)} 摘要 · ${fmtNumber(memory.people_profiles)} 人物 · ${fmtNumber(memory.facts)} 事实`;
+  }
   $("navChatCount").textContent = fmtNumber(memory.chats);
   $("navMemoryCount").textContent = fmtNumber(memoryObjects);
   $("navModelCount").textContent = fmtNumber((config.llm_profiles || []).length);
   if ($("navSkillCount")) $("navSkillCount").textContent = fmtNumber(state.skills?.stats?.enabled ?? state.skills?.skills?.length ?? 0);
+  renderLoginGuardStatus();
 
   if (health.ok) {
     $("modelHealth").textContent = "连通";
@@ -364,13 +411,19 @@ function mergeRuntimeStatus(payload) {
     state.config.talk_modes = payload.config.talk_modes || state.config.talk_modes;
     state.config.talk_scoring = payload.config.talk_scoring || state.config.talk_scoring;
     state.config.reply_sender = payload.config.reply_sender || state.config.reply_sender;
+    if (!state.loginGuardDirty) state.config.login_guard = payload.config.login_guard || state.config.login_guard;
   }
   state.memory = payload.memory;
   if (payload.semantic_memory) state.semantic = payload.semantic_memory;
   state.semanticRuns = payload.semantic_runs || state.semanticRuns;
+  state.profileRebuild = payload.profile_rebuild || payload.semantic_memory?.profile_rebuild || state.profileRebuild;
   state.autoReply = payload.auto_reply || state.autoReply;
+  state.loginGuard = payload.login_guard || state.loginGuard;
   renderAutoReplyStatus();
+  renderLoginGuardStatus();
   renderMemoryChatSelects();
+  renderProfileRebuildState();
+  ensureProfileRebuildPolling();
 }
 
 async function setMemoryChat(username, options = {}) {
@@ -621,6 +674,209 @@ function fillReplySenderForm() {
   renderReplyAllowedChats();
 }
 
+function loginGuardPhaseInfo(phase, guard = {}) {
+  if (guard?.enabled === false) return { text: "已关闭", cls: "warn", hint: "登录守护未启用" };
+  const map = {
+    online: { text: "在线", cls: "ok", hint: "同步和微信窗口正常" },
+    unknown: { text: "待检测", cls: "warn", hint: "等待登录守护线程上报" },
+    disabled: { text: "已关闭", cls: "warn", hint: "登录守护未启用" },
+    suspected_logout: { text: "疑似掉线", cls: "bad", hint: "正在准备自动登录处理" },
+    clicked_login: { text: "已点登录", cls: "warn", hint: "等待手机端确认" },
+    waiting_mobile_confirm: { text: "等手机确认", cls: "warn", hint: "请在手机微信确认登录" },
+    notify_failed: { text: "通知失败", cls: "bad", hint: "检查 Clawbot URL 或 token" },
+    error: { text: "异常", cls: "bad", hint: "登录守护执行失败" },
+  };
+  return map[phase] || { text: phase || "待检测", cls: "warn", hint: "等待登录守护线程上报" };
+}
+
+function renderLoginGuardStatus() {
+  const guard = state.loginGuard || {};
+  const info = loginGuardPhaseInfo(guard.phase, guard);
+  if ($("loginGuardPhase")) {
+    $("loginGuardPhase").textContent = info.text;
+    $("loginGuardPhase").className = info.cls;
+  }
+  if ($("loginGuardHint")) {
+    const parts = [];
+    if (guard.last_checked_at) parts.push(`检测 ${guard.last_checked_at}`);
+    if (guard.notify_count) parts.push(`提醒 ${fmtNumber(guard.notify_count)} 次`);
+    if (guard.last_error) parts.push(String(guard.last_error).slice(0, 30));
+    $("loginGuardHint").textContent = parts.join(" · ") || info.hint;
+  }
+  const card = $("loginGuardCard");
+  if (card) {
+    card.classList.toggle("ok", info.cls === "ok");
+    card.classList.toggle("warn", info.cls === "warn");
+    card.classList.toggle("bad", info.cls === "bad");
+  }
+  if ($("loginGuardPanelPhase")) $("loginGuardPanelPhase").textContent = info.text;
+  if ($("loginGuardPanelHint")) {
+    const probe = guard.details?.probe || {};
+    const signal = probe.reason ? `信号 ${probe.reason}` : info.hint;
+    $("loginGuardPanelHint").textContent = guard.last_error || signal;
+  }
+  if ($("loginGuardPanelNotify")) {
+    $("loginGuardPanelNotify").className = `pill ${guard.notify_configured ? "ok" : "warn"}`;
+    $("loginGuardPanelNotify").textContent = guard.notify_configured ? `提醒 ${fmtNumber(guard.notify_count || 0)} 次` : "未配通知";
+  }
+  const panel = $("loginGuardStatus");
+  if (panel) {
+    panel.classList.toggle("ok", info.cls === "ok");
+    panel.classList.toggle("warn", info.cls === "warn");
+    panel.classList.toggle("bad", info.cls === "bad");
+  }
+}
+
+function fillLoginGuardForm() {
+  const guard = state.config?.login_guard || {};
+  if (!$("loginGuardEnabled") || state.loginGuardDirty) return;
+  $("loginGuardEnabled").checked = guard.enabled !== false;
+  $("loginGuardAutoClick").checked = guard.auto_click_relogin !== false;
+  $("loginGuardNotifyEnabled").checked = guard.notify_enabled !== false;
+  $("loginGuardRecoveryNotify").checked = guard.recovery_notify_enabled !== false;
+  $("loginGuardCheckInterval").value = guard.check_interval_seconds ?? 60;
+  $("loginGuardStaleMinutes").value = guard.stale_sync_minutes ?? 5;
+  $("loginGuardRepeatMinutes").value = guard.notify_repeat_minutes ?? 10;
+  $("loginGuardChannel").value = guard.notify_channel || "clawbot_http";
+  $("loginGuardWebhookUrl").value = guard.notify_webhook_url || "";
+  $("loginGuardNotifyTarget").value = guard.notify_target || "";
+  $("loginGuardNotifyToken").value = "";
+  $("loginGuardNotifyToken").placeholder = guard.notify_token_configured
+    ? `已保存 token · ${guard.notify_token_tail || ""}`
+    : "留空则保持已保存 token";
+  $("loginGuardTemplate").value = guard.notify_template || "";
+}
+
+function syncLoginGuardFromForm() {
+  if (!$("loginGuardEnabled") || !state.config) return;
+  const previous = state.config.login_guard || {};
+  state.config.login_guard = {
+    ...previous,
+    enabled: $("loginGuardEnabled").checked,
+    auto_click_relogin: $("loginGuardAutoClick").checked,
+    notify_enabled: $("loginGuardNotifyEnabled").checked,
+    recovery_notify_enabled: $("loginGuardRecoveryNotify").checked,
+    check_interval_seconds: Number($("loginGuardCheckInterval").value || 60),
+    stale_sync_minutes: Number($("loginGuardStaleMinutes").value || 5),
+    notify_repeat_minutes: Number($("loginGuardRepeatMinutes").value || 10),
+    notify_channel: $("loginGuardChannel").value || "clawbot_http",
+    notify_webhook_url: $("loginGuardWebhookUrl").value.trim(),
+    notify_target: $("loginGuardNotifyTarget").value.trim(),
+    notify_template: $("loginGuardTemplate").value.trim(),
+  };
+  const token = $("loginGuardNotifyToken").value.trim();
+  if (token) state.config.login_guard.notify_token = token;
+}
+
+function markLoginGuardDirty() {
+  state.loginGuardDirty = true;
+  syncLoginGuardFromForm();
+}
+
+function loginGuardCheckSummary(payload) {
+  const guard = payload?.state || payload?.login_guard || state.loginGuard || {};
+  const info = loginGuardPhaseInfo(guard.phase, guard);
+  if (payload?.skipped) {
+    if (payload.reason === "disabled") return "检查完成：登录守护已关闭，没有执行检测。";
+    if (payload.reason === "no_sync_signal") return "检查完成：暂时没有同步信号，还不能判断微信是否掉线。";
+    return `检查完成：已跳过${payload.reason ? `（${payload.reason}）` : ""}。`;
+  }
+  if (payload?.online) return "检查完成：微信在线，不发送 Clawbot 通知。";
+  const notify = payload?.notify || {};
+  if (notify.ok) return "检查完成：疑似掉线，已尝试点击登录并发送 Clawbot 通知。";
+  if (notify.error) return `检查完成：${info.text}，但通知失败：${notify.error}`;
+  if (payload?.action?.ok) return "检查完成：疑似掉线，已点击登录，等待手机确认。";
+  return `检查完成：${info.text}。`;
+}
+
+function loginGuardNotifySummary(payload) {
+  const notify = payload?.notify || {};
+  if (notify.ok) return "测试通知已发送：请看绑定 Clawbot 的手机微信。";
+  return `测试通知失败：${notify.error || payload?.message || "请检查 Clawbot URL 和 token"}`;
+}
+
+function renderClawbotStatus() {
+  const data = state.clawbot || {};
+  if ($("clawbotContainerState")) {
+    $("clawbotContainerState").textContent = data.running ? "运行中" : data.exists ? "已停止" : "未安装";
+    $("clawbotContainerState").className = data.running ? "ok" : "warn";
+  }
+  if ($("clawbotBotCount")) $("clawbotBotCount").textContent = fmtNumber(data.bot_count || 0);
+  if ($("clawbotPort")) $("clawbotPort").textContent = data.port ? `:${data.port}` : "--";
+  if ($("clawbotUrlHint")) $("clawbotUrlHint").textContent = data.message_url_hint || "--";
+  const botsRoot = $("clawbotBots");
+  if (botsRoot) {
+    const bots = data.bots || [];
+    botsRoot.innerHTML = bots.length
+      ? bots.map((bot) => `
+          <button class="clawbot-bot active" type="button" data-clawbot-bot="${escapeAttr(bot.bot_id || "")}">
+            <strong>${escapeHtml(bot.bot_id || "未命名 bot")}</strong>
+            <span>${bot.api_token_configured ? `token 已保存 · ${escapeHtml(bot.token_tail || "")}` : "token 缺失"}</span>
+          </button>
+        `).join("")
+      : `<div class="empty-state compact">还没有登录账号，点击“开始扫码”。</div>`;
+  }
+  const qr = $("clawbotQr");
+  if (qr) {
+    const logText = data.login_log?.text || "";
+    qr.textContent = logText.trim() || "点击“开始扫码”后，这里会显示微信二维码。";
+    qr.classList.toggle("active", Boolean(logText.trim()));
+  }
+  if ($("clawbotHint")) {
+    $("clawbotHint").textContent = data.bot_count
+      ? "已检测到登录账号。可以点击“应用到守护”，自动配置 Clawbot 通知。"
+      : data.auth_error
+        ? `授权文件读取异常：${data.auth_error}`
+        : "扫码授权后，请用该微信给“微信ClawBot”发一条消息激活 API。";
+  }
+}
+
+async function refreshClawbotStatus() {
+  const payload = await fetchJson("/api/clawbot/status");
+  state.clawbot = payload.clawbot || state.clawbot;
+  renderClawbotStatus();
+}
+
+async function clawbotAction(action, button) {
+  const original = button?.textContent || "";
+  if (button) {
+    button.disabled = true;
+    button.textContent = action === "login" ? "启动扫码中" : action === "apply" ? "应用中" : "处理中";
+  }
+  try {
+    const endpoint = action === "start" ? "/api/clawbot/start" : action === "login" ? "/api/clawbot/login" : "/api/clawbot/apply";
+    const selectedBot = document.querySelector("[data-clawbot-bot].active")?.dataset?.clawbotBot || "";
+    const payload = await fetchJson(endpoint, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ bot_id: selectedBot }),
+    });
+    if (payload.clawbot) state.clawbot = payload.clawbot;
+    if (payload.config) {
+      state.config = payload.config;
+      state.loginGuardDirty = false;
+      fillLoginGuardForm();
+    }
+    await refreshClawbotStatus();
+    if (action === "login") {
+      let remaining = 18;
+      const timer = setInterval(() => {
+        refreshClawbotStatus().catch(() => {});
+        remaining -= 1;
+        if (remaining <= 0) clearInterval(timer);
+      }, 2500);
+    }
+  } catch (error) {
+    if ($("clawbotHint")) $("clawbotHint").textContent = `操作失败：${error.message}`;
+    alert(error.message);
+  } finally {
+    if (button) {
+      button.disabled = false;
+      button.textContent = original;
+    }
+  }
+}
+
 function renderReplyAllowedChats() {
   const select = $("replyAllowedChats");
   if (!select || !state.config) return;
@@ -682,6 +938,7 @@ function configSaveSource(button) {
   if (id === "saveTalkBtn") return "talk";
   if (id === "saveModelsBtn") return "models";
   if (id === "saveMemoryBtn") return "memory";
+  if (id === "saveLoginGuardBtn") return "login_guard";
   return "";
 }
 
@@ -832,6 +1089,8 @@ function renderLayers() {
   fillSemanticExtractForm();
   renderSemanticRuns();
   renderSemanticDetails();
+  fillProfileRebuildForm();
+  renderProfileRebuildState();
 }
 
 function syncLayersFromForm() {
@@ -841,6 +1100,7 @@ function syncLayersFromForm() {
   }
   if (state.config.memory_layers?.fact_review) state.config.memory_layers.fact_review.enabled = true;
   syncSemanticExtractFromForm();
+  syncProfileRebuildFromForm();
 }
 
 function fillSemanticExtractForm() {
@@ -854,6 +1114,18 @@ function fillSemanticExtractForm() {
   renderChatSelect("semanticChat", settings.chat_username || "", true);
 }
 
+function fillProfileRebuildForm() {
+  const settings = state.config?.profile_rebuild || {};
+  if (!$("profileRebuildEnabled")) return;
+  $("profileRebuildEnabled").checked = settings.enabled !== false;
+  $("profileRebuildInterval").value = settings.interval_seconds ?? 43200;
+  $("profileRebuildMaxPeople").value = settings.max_people_per_chat ?? 120;
+  $("profileRebuildMinMessages").value = settings.min_messages_per_person ?? 2;
+  if ($("profileRebuildUseLlm")) $("profileRebuildUseLlm").checked = settings.use_llm !== false;
+  if ($("profileRebuildLlmMinMessages")) $("profileRebuildLlmMinMessages").value = settings.llm_min_messages ?? 3;
+  renderChatSelect("profileRebuildChat", settings.chat_username || "", true);
+}
+
 function syncSemanticExtractFromForm() {
   if (!$("semanticEnabled") || !state.config) return;
   state.config.semantic_extract = {
@@ -864,6 +1136,33 @@ function syncSemanticExtractFromForm() {
     limit: Number($("semanticLimit").value || 60),
     batch_size: Number($("semanticBatch").value || 5),
     chat_username: $("semanticChat").value || "",
+  };
+}
+
+function syncProfileRebuildFromForm() {
+  if (!state.config) return;
+  if ($("profileRebuildEnabled")) {
+    state.config.profile_rebuild = {
+      ...(state.config.profile_rebuild || {}),
+      enabled: $("profileRebuildEnabled").checked,
+      interval_seconds: Number($("profileRebuildInterval").value || 43200),
+      chat_username: $("profileRebuildChat").value || "",
+      max_people_per_chat: Number($("profileRebuildMaxPeople").value || 120),
+      min_messages_per_person: Number($("profileRebuildMinMessages").value || 2),
+      use_llm: $("profileRebuildUseLlm") ? $("profileRebuildUseLlm").checked : true,
+      llm_min_messages: Number($("profileRebuildLlmMinMessages")?.value || 3),
+    };
+    return;
+  }
+  state.config.profile_rebuild = {
+    ...(state.config.profile_rebuild || {}),
+    enabled: state.config.profile_rebuild?.enabled !== false,
+    interval_seconds: Number(state.config.profile_rebuild?.interval_seconds || 43200),
+    chat_username: state.config.profile_rebuild?.chat_username || "",
+    max_people_per_chat: Number(state.config.profile_rebuild?.max_people_per_chat || 120),
+    min_messages_per_person: Number(state.config.profile_rebuild?.min_messages_per_person || 2),
+    use_llm: state.config.profile_rebuild?.use_llm !== false,
+    llm_min_messages: Number(state.config.profile_rebuild?.llm_min_messages || 3),
   };
 }
 
@@ -990,6 +1289,124 @@ function renderMemoryConsole() {
   renderMemoryStories(summaries, facts, people);
   renderMemoryTags(summaries, facts, people, edges);
   renderMemoryRelations(people, facts, edges, summaries);
+  renderProfileRebuildState();
+}
+
+function renderProfileRebuildState() {
+  const payload = state.profileRebuild || state.semantic?.profile_rebuild || {};
+  const rebuildState = payload.state || {};
+  const counts = rebuildState.last_counts || {};
+  const progress = rebuildState.progress || {};
+  const percent = clamp(Number(progress.percent ?? (rebuildState.running ? 3 : 100)), 0, 100);
+  const phaseLabels = {
+    queued: "排队准备画像",
+    starting: "启动画像扫描",
+    scanning: "扫描历史消息",
+    building: "正在捏人设标签",
+    llm_building: "AI 正在生成贴脸画像",
+    writing: "写入画像证据",
+    done_chat: "当前群已完成",
+    skipped: "当前群暂无可重建成员",
+    done: "画像已更新",
+    error: "画像重建异常",
+  };
+  const phaseText = phaseLabels[progress.phase] || (rebuildState.running ? "正在重建画像" : "画像待命");
+  const currentChat = progress.current_chat_display_name || progress.current_chat || "";
+  const currentPerson = progress.current_person_display_name || progress.current_person_key || "";
+  const progressMeta = rebuildState.running
+    ? [
+        currentChat ? `当前：${currentChat}` : "",
+        currentPerson ? `成员：${currentPerson}` : "",
+        progress.total_chats ? `群 ${fmtNumber(progress.current_chat_index || 0)} / ${fmtNumber(progress.total_chats)}` : "",
+        progress.people_total ? `成员 ${fmtNumber(progress.people_done || 0)} / ${fmtNumber(progress.people_total)}` : "",
+        `证据 ${fmtNumber(progress.claims || 0)}`,
+        `关系 ${fmtNumber(progress.relations || 0)}`,
+      ].filter(Boolean).join(" · ")
+    : (rebuildState.last_finished_at ? `上次完成：${rebuildState.last_finished_at}` : "点击手动更新画像可立即重建");
+  for (const id of ["profileRebuildState", "profileRebuildSettingsState"]) {
+    const statePill = $(id);
+    if (statePill) {
+      statePill.className = `pill ${rebuildState.running ? "warn" : rebuildState.ok === false ? "bad" : "ok"}`;
+      statePill.textContent = rebuildState.running ? "画像重建中" : rebuildState.ok === false ? "画像异常" : "画像正常";
+    }
+  }
+  const runs = payload.runs || [];
+  const latest = runs[0] || {};
+  const skipText = formatProfileRebuildSkipReason(rebuildState.last_skip_reason);
+  const status = [
+    rebuildState.running ? phaseText : "每 12 小时自动重建，也可手动更新",
+    rebuildState.last_finished_at ? `上次 ${rebuildState.last_finished_at}` : "",
+    skipText ? `状态 ${skipText}` : "",
+    rebuildState.last_error ? `错误 ${rebuildState.last_error}` : "",
+  ].filter(Boolean).join(" · ");
+  const html = `
+    <div class="profile-rebuild-copy">
+      <strong>${escapeHtml(status || "等待画像重建")}</strong>
+      <span>来源：当前群/全部群的历史消息、群昵称映射、互动关系和证据原文。</span>
+    </div>
+    <div class="profile-rebuild-progress" aria-label="画像重建进度">
+      <i style="width:${percent}%"></i>
+    </div>
+    <div class="profile-rebuild-progress-meta">
+      <span>${escapeHtml(phaseText)}</span>
+      <b>${escapeHtml(progressMeta)}</b>
+      <em>${Math.round(percent)}%</em>
+    </div>
+    <div class="profile-rebuild-kpis">
+      <span>人物 <b>${fmtNumber(counts.people ?? latest.people_count ?? 0)}</b></span>
+      <span>画像证据 <b>${fmtNumber(counts.claims ?? latest.claims_count ?? state.semantic?.totals?.profile_claims ?? 0)}</b></span>
+      <span>关系 <b>${fmtNumber(counts.relations ?? latest.relations_count ?? state.semantic?.totals?.person_relations ?? 0)}</b></span>
+      <span>消息 <b>${fmtNumber(counts.messages ?? latest.message_count ?? 0)}</b></span>
+    </div>
+  `;
+  ["profileRebuildPanel", "profileRebuildSettingsPanel"].forEach((id) => {
+    const root = $(id);
+    if (root) root.innerHTML = html;
+  });
+}
+
+function formatProfileRebuildSkipReason(reason) {
+  const text = String(reason || "").trim();
+  if (!text) return "";
+  const match = text.match(/^next_rebuild_in_(\d+)s$/);
+  if (match) return `下次自动更新约 ${fmtDuration(Number(match[1]) * 1000)} 后`;
+  if (text === "disabled") return "已关闭自动重建";
+  return text;
+}
+
+function profileRebuildRunning() {
+  const payload = state.profileRebuild || state.semantic?.profile_rebuild || {};
+  return Boolean(payload.state?.running);
+}
+
+async function refreshProfileRebuildState() {
+  const payload = await fetchJson("/api/memory/profile-rebuild-state?limit=8");
+  state.profileRebuild = payload;
+  renderProfileRebuildState();
+  return payload;
+}
+
+function ensureProfileRebuildPolling() {
+  if (state.profileRebuildPolling || !profileRebuildRunning()) return;
+  state.profileRebuildPolling = true;
+  (async () => {
+    try {
+      for (let index = 0; index < 720; index += 1) {
+        const payload = await refreshProfileRebuildState();
+        if (!payload.state?.running) {
+          await refreshFullStatus();
+          if (state.view === "memory") renderMemoryConsole();
+          break;
+        }
+        await new Promise((resolve) => setTimeout(resolve, 1500));
+      }
+    } catch (error) {
+      console.warn("profile rebuild polling failed", error);
+    } finally {
+      state.profileRebuildPolling = false;
+      if (profileRebuildRunning()) setTimeout(ensureProfileRebuildPolling, 3000);
+    }
+  })();
 }
 
 function activeMemoryItems(items) {
@@ -1045,21 +1462,23 @@ function renderMemoryPeople(people, facts, edges) {
       card.className = `memory-person-card ${id === state.memoryUi.selectedPersonId ? "active" : ""}`;
       card.dataset.personId = id;
       const initials = personInitial(person);
-      const tags = personTags(person, facts, edges).slice(0, 5);
-      const avatar = person.avatar_url || "";
-      card.innerHTML = `
-        <div class="memory-person-top">
-          <div class="memory-avatar ${memoryAvatarTone(index)}">${avatar ? `<img src="${escapeAttr(avatar)}" alt="">` : escapeHtml(initials)}</div>
-          <div>
-            <strong>${escapeHtml(person.display_name || person.person_key || "未知成员")}</strong>
-            <span>${escapeHtml(person.person_key || "群成员")}</span>
-          </div>
-          <em>${formatConfidence(person.confidence)}</em>
-        </div>
-        <p>${escapeHtml(personSummary(person))}</p>
-        ${renderMemoryTagsInline(tags, "person")}
-        <div class="memory-person-foot"><span>${fmtNumber(person.message_count || person.derived?.message_count || 0)} 条发言</span><span>${fmtTime(person.latest_time)}</span></div>
-      `;
+	      const tags = personTags(person, facts, edges).slice(0, 5);
+	      const avatar = person.avatar_url || "";
+	      const claimCount = Array.isArray(person.claims) ? person.claims.length : Number(person.profile_claim_refs?.length || 0);
+	      const relationCount = Array.isArray(person.relations) ? person.relations.length : 0;
+	      card.innerHTML = `
+	        <div class="memory-person-top">
+	          <div class="memory-avatar ${memoryAvatarTone(index)}">${avatar ? `<img src="${escapeAttr(avatar)}" alt="">` : escapeHtml(initials)}</div>
+	          <div>
+	            <strong>${escapeHtml(person.display_name || person.person_key || "未知成员")}</strong>
+	            <span>${escapeHtml(person.person_key || "群成员")}</span>
+	          </div>
+	          <em>${formatConfidence(person.confidence)}</em>
+	        </div>
+	        <p>${escapeHtml(personSummary(person))}</p>
+	        ${renderMemoryTagsInline(tags, "person")}
+	        <div class="memory-person-foot"><span>${fmtNumber(person.message_count || person.derived?.message_count || 0)} 发言 · ${fmtNumber(claimCount)} 证据</span><span>${fmtNumber(relationCount)} 关系</span></div>
+	      `;
       card.addEventListener("click", () => {
         state.memoryUi.selectedPersonId = id;
         renderMemoryPeople(people, facts, edges);
@@ -1079,6 +1498,8 @@ function memoryPersonSearchText(person) {
     formatObjectValue(person.traits),
     ...(person.storyline || []),
     ...(person.recent_snippets || []),
+    ...(person.claims || []).map((claim) => `${claim.claim_type || ""} ${claim.label || ""} ${claim.value || ""}`),
+    ...(person.relations || []).map((relation) => `${relation.source_display_name || ""} ${relation.relation || ""} ${relation.target_display_name || relation.target_key || ""}`),
   ].filter(Boolean).join(" ");
 }
 
@@ -1092,6 +1513,11 @@ function memoryAvatarTone(index) {
 }
 
 function personSummary(person) {
+  const priority = ["llm_profile", "llm_style", "llm_catchphrase", "catchphrase", "signature", "quote", "style", "topic", "activity"];
+  const primaryClaim = priority
+    .map((type) => (person.claims || []).find((claim) => claim.claim_type === type))
+    .find(Boolean);
+  if (primaryClaim) return `${primaryClaim.label || "画像"}：${primaryClaim.value || primaryClaim.label}`;
   const story = (person.storyline || []).find(Boolean);
   if (story) return story;
   const traits = formatObjectValue(person.traits || {});
@@ -1105,14 +1531,58 @@ function personTags(person, facts, edges) {
   return personRichTags(person, facts, edges).map((item) => item.label);
 }
 
+const genericProfileTags = new Set([
+  "PT雷达兵",
+  "一句话验货员",
+  "实测催更官",
+  "低频冒泡雷达",
+  "机器人饲养员",
+  "群聊点火器",
+  "技术党",
+  "气氛组",
+  "吃瓜群众",
+  "群聊发动机",
+  "核心活跃",
+  "高频参与",
+  "稳定出现",
+  "推断画像",
+  "长期画像",
+  "event",
+]);
+
 function personRichTags(person, facts = [], edges = []) {
   const tags = [];
   const add = (label, tone = "topic", weight = 1) => {
-    const text = String(label || "").trim();
+    const text = String(label || "").replace(/^(AI标签|标签|关注点|互动建议|AI证据)[:：]\s*/, "").trim();
     if (!text) return;
+    if (genericProfileTags.has(text)) return;
+    if (text.length > 24) return;
     tags.push({ label: text, tone, weight });
   };
-  for (const key of Object.keys(person.preferences || {})) tags.push(key);
+  const tagClaims = [];
+  const otherClaims = [];
+  for (const claim of person.claims || []) {
+    if (claim.claim_type === "llm_tag") tagClaims.push(claim);
+    else otherClaims.push(claim);
+  }
+  tagClaims.slice(0, 8).forEach((claim) => add(claim.value || claim.label, "rose", 5));
+  otherClaims.forEach((claim) => {
+    const tone = claim.claim_type === "llm_interest"
+      ? "fact"
+      : claim.claim_type === "llm_style"
+        ? "violet"
+        : claim.claim_type === "llm_catchphrase" || claim.claim_type === "catchphrase" || claim.claim_type === "signature"
+          ? "amber"
+          : claim.claim_type === "topic"
+            ? "fact"
+            : claim.claim_type === "style"
+              ? "trait"
+              : claim.claim_type === "activity"
+                ? "confidence"
+                : "";
+    if (!tone) return;
+    add(claim.value || claim.label, tone, Math.min(4, 2 + Math.round(Number(claim.confidence || 0) * 2)));
+  });
   for (const key of Object.keys(person.preferences || {})) add(key, "preference", 3);
   const traits = person.traits || {};
   if (Array.isArray(traits["性格倾向"])) traits["性格倾向"].slice(0, 4).forEach((item) => add(item, "trait", 3));
@@ -1165,12 +1635,14 @@ function renderMemoryPersonDetail(person, facts, edges) {
     const name = person.display_name || person.person_key || "";
     return name && text.includes(name);
   }).slice(0, 6);
-  const relatedEdges = edges.filter((edge) => {
-    const text = `${edge.source_node} ${edge.relation} ${edge.target_node}`;
-    const name = person.display_name || person.person_key || "";
-    return name && text.includes(name);
-  }).slice(0, 6);
-  const richTags = personRichTags(person, facts, edges);
+	  const relatedEdges = edges.filter((edge) => {
+	    const text = `${edge.source_node} ${edge.relation} ${edge.target_node}`;
+	    const name = person.display_name || person.person_key || "";
+	    return name && text.includes(name);
+	  }).slice(0, 6);
+	  const claims = person.claims || [];
+	  const relations = person.relations || [];
+	  const richTags = personRichTags(person, facts, edges);
   const editableControls = person.inferred
     ? `<div class="memory-inferred-note">这是根据聊天片段生成的推断画像；自动抽取生成正式人物画像后，可以在这里编辑保存。</div>`
     : `
@@ -1188,22 +1660,52 @@ function renderMemoryPersonDetail(person, facts, edges) {
         <p>${escapeHtml(person.person_key || "群成员")} · ${fmtNumber(person.message_count || person.derived?.message_count || 0)} 条相关发言</p>
       </div>
     </section>
-    ${memoryDetailSection("画像标签", renderMemoryTagObjects(richTags))}
-    ${memoryDetailSection("核心画像", `<p>${escapeHtml(personSummary(person))}</p>`)}
-    ${memoryDetailSection("属性", memoryKvGrid([
-      ["最近活跃", fmtTime(person.latest_time) || "未知"],
-      ["画像来源", person.inferred ? "聊天片段推断" : "LLM 长期画像"],
-      ["更新时间", person.updated_at || "--"],
-      ["状态", person.status || "active"],
-    ]))}
+	    ${memoryDetailSection("画像标签", renderMemoryTagObjects(richTags))}
+	    ${memoryDetailSection("证据驱动画像", renderProfileClaims(claims))}
+	    ${memoryDetailSection("核心画像", `<p>${escapeHtml(personSummary(person))}</p>`)}
+	    ${memoryDetailSection("属性", memoryKvGrid([
+	      ["最近活跃", fmtTime(person.latest_time) || "未知"],
+	      ["画像来源", claims.length ? "全历史证据重建" : person.inferred ? "聊天片段推断" : "LLM 长期画像"],
+	      ["证据结论", `${fmtNumber(claims.length)} 条`],
+	      ["人物关系", `${fmtNumber(relations.length)} 条`],
+	      ["更新时间", person.updated_at || "--"],
+	      ["状态", person.status || "active"],
+	    ]))}
     ${memoryDetailSection("性格归纳", renderMemoryObject(person.traits, "trait"))}
     ${memoryDetailSection("偏好", renderMemoryObject(person.preferences, "preference"))}
     ${memoryDetailSection("故事线", renderMemoryTimeline(person.storyline || []))}
     ${memoryDetailSection("最近证据片段", renderMemoryQuotes(person.recent_snippets || person.evidence || []))}
     ${memoryDetailSection("关联事实", relatedFacts.length ? relatedFacts.map((fact) => `<div class="memory-mini-fact"><strong>${escapeHtml(fact.subject)}</strong><span>${escapeHtml(`${fact.predicate} ${fact.object}`)}</span></div>`).join("") : `<p class="muted">暂无直接关联事实。</p>`)}
-    ${memoryDetailSection("关系", relatedEdges.length ? relatedEdges.map((edge) => `<div class="memory-mini-fact"><strong>${escapeHtml(nodeLabel(edge.source_node))}</strong><span>${escapeHtml(`${edge.relation} -> ${nodeLabel(edge.target_node)}`)}</span></div>`).join("") : `<p class="muted">暂无直接关系边。</p>`)}
-    ${editableControls}
-  `;
+	    ${memoryDetailSection("人物关系", renderPersonRelations(relations) || (relatedEdges.length ? relatedEdges.map((edge) => `<div class="memory-mini-fact"><strong>${escapeHtml(nodeLabel(edge.source_node))}</strong><span>${escapeHtml(`${edge.relation} -> ${nodeLabel(edge.target_node)}`)}</span></div>`).join("") : `<p class="muted">暂无直接关系边。</p>`))}
+	    ${editableControls}
+	  `;
+	}
+
+function renderProfileClaims(claims) {
+  if (!Array.isArray(claims) || !claims.length) return `<p class="muted">暂无全历史证据画像，等待 12 小时重建或点击“重建画像”。</p>`;
+  return `<div class="profile-claim-list">${claims.slice(0, 12).map((claim) => {
+    const quotes = (claim.source_quotes || []).filter((item) => item && (item.text || item.sender));
+    return `
+      <article class="profile-claim ${escapeAttr(claim.claim_type || "claim")}">
+        <div class="profile-claim-head">
+          <strong>${escapeHtml(claim.label || claim.claim_type || "画像结论")}</strong>
+          <span>${escapeHtml(claim.claim_type || "claim")} · ${formatConfidence(claim.confidence)} · 支持 ${fmtNumber(claim.support_count || 0)}</span>
+        </div>
+        <p>${escapeHtml(claim.value || claim.label || "")}</p>
+        ${quotes.length ? `<div class="profile-claim-quotes">${quotes.slice(0, 3).map((quote) => `<blockquote><b>${escapeHtml(quote.sender || claim.display_name || "群友")}</b><span>${escapeHtml(quote.text || "")}</span></blockquote>`).join("")}</div>` : ""}
+      </article>
+    `;
+  }).join("")}</div>`;
+}
+
+function renderPersonRelations(relations) {
+  if (!Array.isArray(relations) || !relations.length) return "";
+  return `<div class="person-relation-list">${relations.slice(0, 12).map((relation) => `
+    <article class="person-relation-card ${escapeAttr(relation.target_kind || "person")}">
+      <strong>${escapeHtml(relation.source_display_name || relation.source_person_key || "成员")} ${escapeHtml(relation.relation || "关联")} ${escapeHtml(relation.target_display_name || relation.target_key || "对象")}</strong>
+      <span>${escapeHtml(relation.target_kind || "person")} · ${formatConfidence(relation.confidence)} · 支持 ${fmtNumber(relation.support_count || 0)}</span>
+    </article>
+  `).join("")}</div>`;
 }
 
 function renderMemoryFacts(facts) {
@@ -1425,14 +1927,22 @@ function renderMemoryTags(summaries, facts, people, edges) {
 function renderMemoryRelations(people, facts, edges, summaries) {
   const focusRoot = $("memoryFocusList");
   if (!focusRoot) return;
+  const relationGraph = state.semantic?.relationship_graph || {};
+  const focusNodes = relationGraph.focus_nodes || [];
   const focuses = [
-    ...people.slice(0, 12).map((person, index) => ({
-      id: `person:${memoryItemId(person, String(index))}`,
+    ...focusNodes.map((node, index) => {
+      const person = people.find((item) => (item.person_key || item.username) === node.person_key) || node;
+      return {
+      id: `person:${node.person_key || memoryItemId(person, String(index))}`,
       label: person.display_name || person.person_key || "群成员",
-      sub: `${fmtNumber(person.message_count || person.derived?.message_count || 0)} 条发言`,
+      sub: `${fmtNumber(node.message_count || person.message_count || person.derived?.message_count || 0)} 发言 · ${fmtNumber(node.claim_count || person.claims?.length || 0)} 证据`,
       type: "person",
       source: person,
-    })),
+      avatar_url: node.avatar_url || person.avatar_url || "",
+      claim_count: node.claim_count || 0,
+      relation_count: node.relation_count || 0,
+    };
+    }),
     ...summaries.slice(0, 3).map((summary) => ({
       id: `summary:${summary.chat_username || summary.chat_display_name}`,
       label: summary.chat_display_name || "群摘要",
@@ -1448,11 +1958,11 @@ function renderMemoryRelations(people, facts, edges, summaries) {
   if (!focuses.length) {
     renderEmpty(focusRoot, "暂无可聚焦对象");
   } else {
-    focuses.forEach((focus, index) => {
-      const item = document.createElement("button");
-      item.type = "button";
-      item.className = `memory-focus-item ${focus.id === state.memoryUi.selectedFocusId ? "active" : ""}`;
-      item.innerHTML = `<div class="memory-avatar ${memoryAvatarTone(index)}">${escapeHtml(String(focus.label).slice(0, 1))}</div><div><strong>${escapeHtml(focus.label)}</strong><span>${escapeHtml(focus.sub)}</span></div>`;
+	    focuses.forEach((focus, index) => {
+	      const item = document.createElement("button");
+	      item.type = "button";
+	      item.className = `memory-focus-item ${focus.id === state.memoryUi.selectedFocusId ? "active" : ""}`;
+	      item.innerHTML = `<div class="memory-avatar ${memoryAvatarTone(index)}">${focus.avatar_url ? `<img src="${escapeAttr(focus.avatar_url)}" alt="">` : escapeHtml(String(focus.label).slice(0, 1))}</div><div><strong>${escapeHtml(focus.label)}</strong><span>${escapeHtml(focus.sub)}</span></div>`;
       item.addEventListener("click", () => {
         state.memoryUi.selectedFocusId = focus.id;
         renderMemoryRelations(people, facts, edges, summaries);
@@ -1474,64 +1984,115 @@ function renderMemoryRelationCanvas(focus, people, facts, edges, summaries) {
     return;
   }
   const label = focus.label;
-  const relatedFacts = facts.filter((fact) => `${fact.subject} ${fact.object} ${fact.predicate}`.includes(label)).slice(0, 5);
-  const relatedEdges = edges.filter((edge) => `${edge.source_node} ${edge.target_node} ${edge.relation}`.includes(label)).slice(0, 8);
-  const relatedPeople = people.filter((person) => {
-    const name = person.display_name || person.person_key || "";
-    return name && name !== label && relatedEdges.some((edge) => `${edge.source_node} ${edge.target_node}`.includes(name));
-  }).slice(0, 5);
-  const fallbackPeople = people.filter((person) => (person.display_name || person.person_key) !== label).slice(0, Math.max(0, 5 - relatedPeople.length));
-  const peopleGroup = uniqueRelationItems([...relatedPeople, ...fallbackPeople].map((person) => ({
-    title: person.display_name || person.person_key || "成员",
-    sub: `${fmtNumber(person.message_count || person.derived?.message_count || 0)} 条发言`,
-    tone: "person",
-  }))).slice(0, 5);
+  const source = focus.source || {};
+  const focusPersonKey = source.person_key || source.username || String(focus.id || "").replace(/^person:/, "");
+  const claims = source.claims || [];
+  const relations = source.relations || [];
+  const topClaims = claims.slice(0, 6);
+  const evidenceQuotes = [];
+  for (const claim of claims) {
+    for (const quote of claim.source_quotes || []) {
+      if (quote?.text) evidenceQuotes.push({ ...quote, claim: claim.label || claim.claim_type || "画像证据" });
+      if (evidenceQuotes.length >= 6) break;
+    }
+    if (evidenceQuotes.length >= 6) break;
+  }
+  const relatedFacts = facts.filter((fact) => {
+    const text = `${fact.subject} ${fact.object} ${fact.predicate}`;
+    return [label, focusPersonKey].some((key) => key && text.includes(key));
+  }).slice(0, 8);
+  const peopleGroup = uniqueRelationItems(relations
+    .filter((relation) => relation.target_kind === "person" || relation.source_person_key !== focusPersonKey)
+    .map((relation) => {
+      const otherKey = relation.source_person_key === focusPersonKey ? relation.target_key : relation.source_person_key;
+      const otherName = relation.source_person_key === focusPersonKey ? relation.target_display_name : relation.source_display_name;
+      const person = people.find((item) => (item.person_key || item.username) === otherKey);
+      return {
+        title: otherName || person?.display_name || otherKey || "成员",
+        sub: `${relation.relation || "关联"} · 支持 ${fmtNumber(relation.support_count || 0)}`,
+        quote: relation.source_quotes?.[0]?.text || "",
+        tone: "person",
+      };
+    })).slice(0, 8);
+  const topicGroup = uniqueRelationItems(relations
+    .filter((relation) => relation.target_kind === "topic")
+    .map((relation) => ({
+      title: relation.target_display_name || relation.target_key || "话题",
+      sub: `${relation.relation || "常聊话题"} · 支持 ${fmtNumber(relation.support_count || 0)}`,
+      quote: relation.source_quotes?.[0]?.text || "",
+      tone: "topic",
+    }))).slice(0, 8);
+  const claimGroup = claims.slice(0, 10).map((claim) => ({
+    title: claim.label || claim.claim_type || "画像",
+    sub: `${claim.value || claim.label || ""} · ${formatConfidence(claim.confidence)} · ${fmtNumber(claim.support_count || 0)} 证据`,
+    quote: claim.source_quotes?.[0]?.text || "",
+    tone: claim.claim_type === "topic" ? "topic" : "edge",
+  }));
   const factGroup = relatedFacts.map((fact) => ({
     title: fact.subject || "事实",
     sub: `${fact.predicate || fact.category || "事实"} · ${formatConfidence(fact.confidence)}`,
     tone: factTone(fact.category),
   }));
-  const relationGroup = relatedEdges.map((edge) => ({
-    title: edge.relation || "关系",
-    sub: `${nodeLabel(edge.source_node)} -> ${nodeLabel(edge.target_node)}`,
-    tone: "edge",
-  }));
-  const topics = summaries.flatMap((summary) => summary.topics || []).slice(0, 5);
-  const topicGroup = topics.map((topic) => ({ title: topic, sub: "群主题", tone: "topic" }));
   const groups = [
-    { title: "相关成员", tone: "person", items: peopleGroup },
-    { title: "关系边", tone: "edge", items: relationGroup },
-    { title: "事实证据", tone: "fact", items: factGroup },
-    { title: "群主题", tone: "topic", items: topicGroup },
+    { title: "互动成员", tone: "person", items: peopleGroup },
+    { title: "证据画像", tone: "edge", items: claimGroup },
+    { title: "常聊话题", tone: "topic", items: topicGroup },
+    { title: "关联事实", tone: "fact", items: factGroup },
   ];
   const nodeCount = groups.reduce((sum, group) => sum + group.items.length, 0);
   canvas.innerHTML = `
-    <div class="relation-board">
-      <section class="relation-core">
-        <span>${escapeHtml(focus.type === "person" ? "人物" : "摘要")}</span>
-        <strong>${escapeHtml(label)}</strong>
-        <small>${escapeHtml(focus.sub || "聚焦对象")}</small>
+    <div class="relation-report">
+      <section class="relation-report-hero">
+        <div class="memory-avatar ${memoryAvatarTone(0)}">${focus.avatar_url ? `<img src="${escapeAttr(focus.avatar_url)}" alt="">` : escapeHtml(String(label || "?").slice(0, 1))}</div>
+        <div>
+          <span>${escapeHtml(focus.type === "person" ? "人物关系报告" : "群摘要关系报告")}</span>
+          <strong>${escapeHtml(label)}</strong>
+          <small>${escapeHtml(focus.sub || "聚焦对象")} · 可读关系 ${fmtNumber(nodeCount)}</small>
+        </div>
+      </section>
+      <section class="relation-profile-strip">
+        ${topClaims.length ? topClaims.map((claim) => `
+          <article class="relation-profile-chip ${escapeAttr(claim.claim_type || "claim")}">
+            <span>${escapeHtml(claim.label || claim.claim_type || "画像")}</span>
+            <strong>${escapeHtml(claim.value || claim.label || "")}</strong>
+            <small>${formatConfidence(claim.confidence)} · ${fmtNumber(claim.support_count || 0)} 证据</small>
+          </article>
+        `).join("") : `<p class="muted">暂无画像结论，点击人物页“重建画像”后会按全历史消息生成。</p>`}
       </section>
       ${groups.map((group) => `
-        <section class="relation-column ${escapeAttr(group.tone)}">
+        <section class="relation-report-section ${escapeAttr(group.tone)}">
           <h4>${escapeHtml(group.title)} <span>${fmtNumber(group.items.length)}</span></h4>
           <div>
             ${group.items.length ? group.items.map((item) => `
-              <article class="relation-item ${escapeAttr(item.tone)}">
-                <strong>${escapeHtml(item.title)}</strong>
-                <span>${escapeHtml(item.sub || "")}</span>
+              <article class="relation-report-item ${escapeAttr(item.tone)}">
+                <div>
+                  <strong>${escapeHtml(item.title)}</strong>
+                  <span>${escapeHtml(item.sub || "")}</span>
+                </div>
+                ${item.quote ? `<blockquote>${escapeHtml(item.quote)}</blockquote>` : ""}
               </article>
             `).join("") : `<p class="muted">暂无直接关联</p>`}
           </div>
         </section>
       `).join("")}
+      <section class="relation-report-section evidence">
+        <h4>代表证据 <span>${fmtNumber(evidenceQuotes.length)}</span></h4>
+        <div>
+          ${evidenceQuotes.length ? evidenceQuotes.map((quote) => `
+            <article class="relation-report-item evidence">
+              <div><strong>${escapeHtml(quote.claim || "证据")}</strong><span>${escapeHtml(`${quote.sender || label} · ${quote.time ? fmtTime(quote.time) : ""}`)}</span></div>
+              <blockquote>${escapeHtml(quote.text || "")}</blockquote>
+            </article>
+          `).join("") : `<p class="muted">暂无可展示原文证据。</p>`}
+        </div>
+      </section>
     </div>
   `;
   detail.innerHTML = `
-    ${memoryDetailSection("核心对象", `<p>${escapeHtml(focus.label)} 当前关联 ${fmtNumber(nodeCount)} 个可读节点。新版关系视图按“成员、关系、事实、主题”分区展示，不再用难读的散点图。</p>`)}
+    ${memoryDetailSection("核心对象", `<p>${escapeHtml(focus.label)} 当前关联 ${fmtNumber(nodeCount)} 个可读节点。这里按“互动成员、证据画像、常聊话题、关联事实”分区展示，每条关系都带支持次数。</p>`)}
     ${memoryDetailSection("关联事实", relatedFacts.length ? relatedFacts.map((fact) => `<div class="memory-mini-fact"><strong>${escapeHtml(fact.subject)}</strong><span>${escapeHtml(`${fact.predicate} ${fact.object}`)}</span></div>`).join("") : `<p class="muted">暂无直接事实。</p>`)}
-    ${memoryDetailSection("关系边", relatedEdges.length ? relatedEdges.map((edge) => `<div class="memory-mini-fact"><strong>${escapeHtml(nodeLabel(edge.source_node))}</strong><span>${escapeHtml(`${edge.relation} -> ${nodeLabel(edge.target_node)}`)}</span></div>`).join("") : `<p class="muted">暂无直接关系边。</p>`)}
-    ${memoryDetailSection("主题", renderMemoryTagSpans(topics, "topic"))}
+    ${memoryDetailSection("人物关系", renderPersonRelations(relations) || `<p class="muted">暂无直接关系边。</p>`)}
+    ${memoryDetailSection("画像证据", renderProfileClaims(claims))}
   `;
 }
 
@@ -1678,14 +2239,15 @@ function renderDatabaseConsole() {
   const data = state.database || {};
   renderMemoryChatSelects();
   setText("databaseScopeName", data.chat_display_name || activeMemoryChat()?.display_name || state.memoryChat || "--");
-  setText("databaseTotalSize", data.total_size || formatSize(data.total_bytes));
+  setText("databaseTotalSize", data.core_database_size || data.total_size || formatSize(data.core_database_bytes ?? data.total_bytes));
+  setText("databaseRuntimeSize", data.runtime_total_size || formatSize(data.runtime_total_bytes));
   const dbGrid = $("databaseDbGrid");
   if (dbGrid) {
     dbGrid.innerHTML = (data.databases || []).map((db) => `
       <div class="db-card">
         <div><strong>${db.type === "memory" ? "原始微信记忆库" : "AI 派生记忆库"}</strong><span>${escapeHtml(db.path || "")}</span></div>
         <b>${escapeHtml(db.size || formatSize(db.bytes))}</b>
-        <small>当前群估算 ${escapeHtml(db.scoped_estimated_size || formatSize(db.scoped_estimated_bytes))}</small>
+        <small>文件大小实时计算 · 当前群估算 ${escapeHtml(db.scoped_estimated_size || formatSize(db.scoped_estimated_bytes))}</small>
       </div>
     `).join("") || `<div class="empty">等待数据库信息</div>`;
   }
@@ -1699,7 +2261,7 @@ function renderDatabaseConsole() {
           <small>${escapeHtml(item.table)} · ${item.database === "memory" ? "原始库" : "AI库"}</small>
         </span>
         <em>${fmtNumber(item.scoped_rows)} / ${fmtNumber(item.total_rows)}</em>
-        <b>${formatSize(item.estimated_bytes)}</b>
+        <b title="当前群估算容量"><small>估算</small>${formatSize(item.estimated_bytes)}</b>
       </label>
     `).join("") || `<div class="empty">暂无模块</div>`;
   }
@@ -2390,25 +2952,30 @@ function graphNodeHtml(node) {
   `;
 }
 
+const PERSON_RANK_TIERS = [
+  { rank: "水王+", min: 20000, label: "终极水王" },
+  { rank: "水王", min: 10000, label: "群聊水王" },
+  { rank: "超神", min: 5000, label: "超神主宰" },
+  { rank: "SSS", min: 2000, label: "星河主力" },
+  { rank: "SS", min: 500, label: "超级核心" },
+  { rank: "S", min: 300, label: "核心贡献者" },
+  { rank: "A", min: 100, label: "高活跃成员" },
+  { rank: "B", min: 60, label: "稳定参与" },
+  { rank: "C", min: 30, label: "低频参与" },
+  { rank: "D", min: 0, label: "偶尔冒泡" },
+];
+
 function personRank(node) {
   const count = Number(node.meta?.message_count || node.count || 0);
-  if (count >= 20000) return "水王";
-  if (count >= 10000) return "超神";
-  if (count >= 5000) return "SSS";
-  if (count >= 2000) return "SS";
-  if (count >= 500) return "S";
-  if (count >= 100) return "A";
-  if (count >= 60) return "B";
-  if (count >= 30) return "C";
-  return "D";
+  return (PERSON_RANK_TIERS.find((tier) => count >= tier.min) || PERSON_RANK_TIERS[PERSON_RANK_TIERS.length - 1]).rank;
 }
 
 function personRankLabel(rank) {
-  return { 水王: "群聊水王", 超神: "超神主宰", SSS: "星河主力", SS: "超级核心", S: "核心贡献者", A: "高活跃成员", B: "稳定参与", C: "低频参与", D: "偶尔冒泡" }[rank] || "群成员";
+  return PERSON_RANK_TIERS.find((tier) => tier.rank === rank)?.label || "群成员";
 }
 
 function rankClassName(rank) {
-  return { 水王: "water", 超神: "god", SSS: "sss", SS: "ss", S: "s", A: "a", B: "b", C: "c", D: "d" }[rank] || "d";
+  return { "水王+": "water", 水王: "water", 超神: "god", SSS: "sss", SS: "ss", S: "s", A: "a", B: "b", C: "c", D: "d" }[rank] || "d";
 }
 
 function graphNodeBody(node) {
@@ -2492,7 +3059,7 @@ function graphNodeSize(node) {
   if (node.kind === "summary") return { w: 298, h: 298 };
   if (node.kind === "person") {
     const rank = personRank(node);
-    if (rank === "水王") return { w: 292, h: 152 };
+    if (rank === "水王+" || rank === "水王") return { w: 292, h: 152 };
     if (rank === "超神") return { w: 280, h: 146 };
     if (rank === "SSS") return { w: 266, h: 140 };
     if (rank === "SS") return { w: 254, h: 134 };
@@ -2890,13 +3457,17 @@ async function load() {
   state.memory = payload.memory;
   state.semantic = payload.semantic_memory;
   state.semanticRuns = payload.semantic_runs;
+  state.profileRebuild = payload.profile_rebuild || payload.semantic_memory?.profile_rebuild || state.profileRebuild;
+  rememberOverviewSemanticSignature(payload);
   state.autoReply = payload.auto_reply;
+  state.loginGuard = payload.login_guard;
   state.activeProfileId = payload.config.active_llm_profile_id;
   renderProfiles();
   fillProfileForm(activeProfile());
   fillAgent();
   renderTalkModes();
   fillReplySenderForm();
+  fillLoginGuardForm();
   renderLayers();
   renderLastTest(payload.last_test || {});
   updateTop();
@@ -2905,6 +3476,7 @@ async function load() {
   renderSemanticRuns();
   renderAutoReplyStatus();
   renderAutoReplyLive();
+  renderLoginGuardStatus();
   renderMemoryChatSelects();
   await loadSkills();
 }
@@ -2912,6 +3484,7 @@ async function load() {
 async function refreshStatus() {
   const payload = await fetchJson(statusLiteUrl());
   mergeRuntimeStatus(payload);
+  await refreshOverviewSemanticIfNeeded(payload);
   updateTop();
   renderProfiles();
   renderSemanticRuns();
@@ -2922,16 +3495,19 @@ async function refreshStatus() {
   if (state.view === "photos") await loadPhotos();
 }
 
-async function refreshFullStatus() {
+async function refreshFullStatus(options = {}) {
   const payload = await fetchJson(statusUrl());
   mergeRuntimeStatus(payload);
+  rememberOverviewSemanticSignature(payload);
   updateTop();
   renderProfiles();
   renderSemanticDetails();
   renderSemanticRuns();
-  if (state.view === "services") await loadSuiteStatus();
-  if (state.view === "chat") await loadChats(true);
-  if (state.view === "skills") await loadSkills();
+  if (!options.skipAuxViews) {
+    if (state.view === "services") await loadSuiteStatus();
+    if (state.view === "chat") await loadChats(true);
+    if (state.view === "skills") await loadSkills();
+  }
 }
 
 async function refreshAutoReplyLive() {
@@ -3775,13 +4351,18 @@ async function recognizeImageMessage(messageUid) {
 }
 
 async function loadSuiteStatus() {
-  const payload = await fetchJson("/api/suite-status");
+  const [payload, clawbotPayload] = await Promise.all([
+    fetchJson("/api/suite-status"),
+    fetchJson("/api/clawbot/status").catch(() => null),
+  ]);
   state.suite = payload;
+  if (clawbotPayload?.clawbot) state.clawbot = clawbotPayload.clawbot;
   $("suiteGeneratedAt").textContent = payload.generated_at || "--";
   $("navServiceCount").textContent = fmtNumber((payload.services || []).length);
   renderServices(payload.services || []);
   renderOverviewServices();
   updateServiceStat();
+  renderClawbotStatus();
 }
 
 function renderServices(services) {
@@ -3887,6 +4468,71 @@ async function cleanupLogs() {
   }
 }
 
+async function runLoginGuardOnce() {
+  const button = $("loginGuardRunBtn");
+  if (!button) return;
+  syncLoginGuardFromForm();
+  const original = button.textContent;
+  button.disabled = true;
+  button.textContent = "检查中";
+  try {
+    await fetchJson("/api/config", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(collectConfig("login_guard")),
+    });
+    state.loginGuardDirty = false;
+    const payload = await fetchJson("/api/login-guard/run-once", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ force_notify: false, force_action: false }),
+    });
+    state.loginGuard = payload.state || payload.login_guard || state.loginGuard;
+    renderLoginGuardStatus();
+    setText("loginGuardPanelHint", loginGuardCheckSummary(payload));
+    fillLoginGuardForm();
+  } catch (error) {
+    if ($("loginGuardPanelHint")) $("loginGuardPanelHint").textContent = `检查失败：${error.message}`;
+    alert(error.message);
+  } finally {
+    button.disabled = false;
+    button.textContent = original;
+  }
+}
+
+async function sendLoginGuardTestNotify() {
+  const button = $("loginGuardTestNotifyBtn");
+  if (!button) return;
+  syncLoginGuardFromForm();
+  const original = button.textContent;
+  button.disabled = true;
+  button.textContent = "发送中";
+  setText("loginGuardPanelHint", "正在发送 Clawbot 测试通知...");
+  try {
+    await fetchJson("/api/config", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(collectConfig("login_guard")),
+    });
+    state.loginGuardDirty = false;
+    const payload = await fetchJson("/api/login-guard/test-notify", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({}),
+    });
+    state.loginGuard = payload.state || state.loginGuard;
+    renderLoginGuardStatus();
+    setText("loginGuardPanelHint", loginGuardNotifySummary(payload));
+    fillLoginGuardForm();
+  } catch (error) {
+    setText("loginGuardPanelHint", `测试通知失败：${error.message}`);
+    alert(error.message);
+  } finally {
+    button.disabled = false;
+    button.textContent = original;
+  }
+}
+
 function renderContainers(containers) {
   const root = $("containerGrid");
   if (!root) return;
@@ -3927,6 +4573,9 @@ async function saveAll(button, label = "保存") {
     fillAgent();
     renderTalkModes();
     fillReplySenderForm();
+    state.loginGuardDirty = false;
+    fillLoginGuardForm();
+    renderLoginGuardStatus();
     updateTop();
     button.textContent = "已保存";
   } catch (error) {
@@ -3945,6 +4594,7 @@ function collectConfig(source = "") {
   syncAgentFromForm();
   syncTalkFromForm();
   syncReplySenderFromForm();
+  syncLoginGuardFromForm();
   syncLayersFromForm();
   if (source === "auto_reply") applyAutoReplySaveIntent();
   return source ? { ...state.config, _save_source: source } : state.config;
@@ -4091,6 +4741,66 @@ async function mutateMemory(button) {
     button.disabled = false;
     button.textContent = original;
   }
+}
+
+async function rebuildProfilesNow(button) {
+  syncProfileRebuildFromForm();
+  const original = button?.textContent || "";
+  if (button) {
+    button.disabled = true;
+    button.textContent = "更新中";
+  }
+  const statePill = $("profileRebuildState");
+  if (statePill) {
+    statePill.className = "pill warn";
+    statePill.textContent = "画像重建中";
+  }
+  try {
+    const profileSettings = state.config?.profile_rebuild || {};
+    const chat = button?.id === "rebuildProfilesSettingsBtn"
+      ? (profileSettings.chat_username || state.memoryChat || "")
+      : (state.memoryChat || profileSettings.chat_username || "");
+    const payload = await fetchJson("/api/memory/rebuild-profiles", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        chat,
+        async: true,
+        force: true,
+        max_people_per_chat: profileSettings.max_people_per_chat || 120,
+        min_messages_per_person: profileSettings.min_messages_per_person || 2,
+        use_llm: true,
+        llm_min_messages: profileSettings.llm_min_messages || 3,
+      }),
+    });
+    state.profileRebuild = payload.profile_rebuild || state.profileRebuild;
+    renderProfileRebuildState();
+    ensureProfileRebuildPolling();
+    await pollProfileRebuildUntilDone();
+    state.memoryUi.selectedPersonId = null;
+    await refreshFullStatus();
+    renderMemoryConsole();
+  } catch (error) {
+    alert(`画像重建失败：${error.message}`);
+    if (statePill) {
+      statePill.className = "pill bad";
+      statePill.textContent = "画像异常";
+    }
+  } finally {
+    if (button) {
+      button.disabled = false;
+      button.textContent = original;
+    }
+  }
+}
+
+async function pollProfileRebuildUntilDone() {
+  for (let index = 0; index < 240; index += 1) {
+    const payload = await refreshProfileRebuildState();
+    if (!payload.state?.running) return payload;
+    await new Promise((resolve) => setTimeout(resolve, 1000));
+  }
+  throw new Error("画像重建仍在运行，请稍后刷新查看结果");
 }
 
 function collectDebugPayload() {
@@ -4369,8 +5079,51 @@ function bindEvents() {
   $("savePersonaBtn").addEventListener("click", () => saveAll($("savePersonaBtn"), "保存人格"));
   $("saveTalkBtn").addEventListener("click", () => saveAll($("saveTalkBtn"), "保存接话设置"));
   $("saveAutoReplyBtn")?.addEventListener("click", () => saveAll($("saveAutoReplyBtn"), "保存自动发送"));
-  $("saveMemoryBtn").addEventListener("click", () => saveAll($("saveMemoryBtn"), "保存记忆设置"));
-  $("cleanupLogsBtn")?.addEventListener("click", cleanupLogs);
+  $("saveLoginGuardBtn")?.addEventListener("click", () => saveAll($("saveLoginGuardBtn"), "保存守护"));
+  $("loginGuardRunBtn")?.addEventListener("click", runLoginGuardOnce);
+  $("loginGuardTestNotifyBtn")?.addEventListener("click", sendLoginGuardTestNotify);
+  $("clawbotStartBtn")?.addEventListener("click", (event) => clawbotAction("start", event.currentTarget));
+  $("clawbotLoginBtn")?.addEventListener("click", (event) => clawbotAction("login", event.currentTarget));
+  $("clawbotApplyBtn")?.addEventListener("click", (event) => clawbotAction("apply", event.currentTarget));
+  $("clawbotRefreshBtn")?.addEventListener("click", () => refreshClawbotStatus().catch((error) => alert(error.message)));
+  $("clawbotBots")?.addEventListener("click", (event) => {
+    const button = event.target.closest("[data-clawbot-bot]");
+    if (!button) return;
+    document.querySelectorAll("[data-clawbot-bot]").forEach((item) => item.classList.toggle("active", item === button));
+  });
+  [
+    "loginGuardEnabled",
+    "loginGuardAutoClick",
+    "loginGuardNotifyEnabled",
+    "loginGuardRecoveryNotify",
+    "loginGuardCheckInterval",
+    "loginGuardStaleMinutes",
+    "loginGuardRepeatMinutes",
+    "loginGuardChannel",
+    "loginGuardWebhookUrl",
+    "loginGuardNotifyTarget",
+    "loginGuardNotifyToken",
+    "loginGuardTemplate",
+  ].forEach((id) => {
+    $(id)?.addEventListener("input", markLoginGuardDirty);
+    $(id)?.addEventListener("change", markLoginGuardDirty);
+	  });
+  [
+    "profileRebuildEnabled",
+    "profileRebuildInterval",
+    "profileRebuildMaxPeople",
+    "profileRebuildMinMessages",
+    "profileRebuildUseLlm",
+    "profileRebuildLlmMinMessages",
+    "profileRebuildChat",
+  ].forEach((id) => {
+    $(id)?.addEventListener("input", syncProfileRebuildFromForm);
+    $(id)?.addEventListener("change", syncProfileRebuildFromForm);
+  });
+	  $("saveMemoryBtn").addEventListener("click", () => saveAll($("saveMemoryBtn"), "保存记忆设置"));
+	  $("rebuildProfilesBtn")?.addEventListener("click", (event) => rebuildProfilesNow(event.currentTarget));
+	  $("rebuildProfilesSettingsBtn")?.addEventListener("click", (event) => rebuildProfilesNow(event.currentTarget));
+	  $("cleanupLogsBtn")?.addEventListener("click", cleanupLogs);
   $("modelsBtn").addEventListener("click", fetchModels);
   $("checkBtn").addEventListener("click", checkLLM);
   $("testBtn").addEventListener("click", testLLM);

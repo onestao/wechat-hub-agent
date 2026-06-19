@@ -26,6 +26,7 @@ const state = {
   lastOutbox: null,
   talkSettingsDirty: false,
   loginGuardDirty: false,
+  excludedMembers: { chat: "", members: [], loading: false, query: "" },
   profileRebuildPolling: false,
   memoryUi: {
     tab: "people",
@@ -662,6 +663,17 @@ function markTalkSettingsDirty() {
 function fillReplySenderForm() {
   const sender = state.config?.reply_sender || {};
   if (!$("replySenderEnabled")) return;
+  const active = document.activeElement;
+  if (
+    active &&
+    active !== document.body &&
+    (
+      active.closest?.(".auto-reply-grid") ||
+      active.closest?.(".reply-exclusion-panel")
+    )
+  ) {
+    return;
+  }
   $("replySenderEnabled").checked = Boolean(sender.enabled);
   if ($("replySenderPaused")) $("replySenderPaused").checked = Boolean(sender.maintenance_paused);
   $("replySenderMode").value = sender.mode || "draft_only";
@@ -672,6 +684,10 @@ function fillReplySenderForm() {
   $("sendDelayMin").value = sender.send_delay_min_seconds ?? 1.2;
   $("sendDelayMax").value = sender.send_delay_max_seconds ?? 4.8;
   renderReplyAllowedChats();
+  renderReplyExcludedChatOptions();
+  loadExcludedMembersForSelectedChat().catch((error) => {
+    if ($("replyExcludedMembers")) $("replyExcludedMembers").innerHTML = `<div class="empty-state compact">成员加载失败：${escapeHtml(error.message)}</div>`;
+  });
 }
 
 function loginGuardPhaseInfo(phase, guard = {}) {
@@ -891,6 +907,203 @@ function renderReplyAllowedChats() {
   }
 }
 
+function groupChatsForReplyConfig() {
+  return (state.chats || []).filter((chat) => String(chat.username || "").includes("@chatroom") || chat.is_group);
+}
+
+function memberDisplayName(member) {
+  return member.group_nickname || member.nickname || member.remark || member.alias || member.member_username || "群成员";
+}
+
+function memberKey(member) {
+  return member.member_username || member.alias || member.group_nickname || member.nickname || "";
+}
+
+function memberSearchText(member) {
+  return [
+    member.group_nickname,
+    member.nickname,
+    member.remark,
+    member.alias,
+    member.member_username,
+  ].filter(Boolean).join(" ").toLowerCase();
+}
+
+function memberByKey(key) {
+  const target = String(key || "");
+  return (state.excludedMembers.members || []).find((member) => memberKey(member) === target) || null;
+}
+
+function excludedMembersByChat() {
+  if (!state.config) return {};
+  const sender = state.config.reply_sender || {};
+  if (!sender.excluded_members_by_chat || typeof sender.excluded_members_by_chat !== "object") {
+    sender.excluded_members_by_chat = {};
+  }
+  state.config.reply_sender = sender;
+  return sender.excluded_members_by_chat;
+}
+
+function renderReplyExcludedChatOptions() {
+  const select = $("replyExcludedChat");
+  if (!select || !state.config) return;
+  const chats = groupChatsForReplyConfig();
+  const allowed = new Set(state.config.reply_sender?.allowed_chats || []);
+  const visible = chats.filter((chat) => !allowed.size || allowed.has(chat.username) || allowed.has(chat.display_name));
+  const options = (visible.length ? visible : chats);
+  const previous = select.value || state.excludedMembers.chat || options[0]?.username || "";
+  select.innerHTML = options.length
+    ? options.map((chat) => `<option value="${escapeAttr(chat.username)}">${escapeHtml(chat.display_name || chat.username)}</option>`).join("")
+    : `<option value="" disabled>等待同步群聊列表</option>`;
+  select.value = options.some((chat) => chat.username === previous) ? previous : options[0]?.username || "";
+  state.excludedMembers.chat = select.value || "";
+  state.excludedMembers.query = $("replyExcludedSearch")?.value?.trim() || "";
+  renderExcludedSummary();
+}
+
+async function loadExcludedMembersForSelectedChat() {
+  const select = $("replyExcludedChat");
+  const root = $("replyExcludedMembers");
+  if (!select || !root || !state.config) return;
+  const chat = select.value || "";
+  state.excludedMembers.chat = chat;
+  if (!chat) {
+    state.excludedMembers.members = [];
+    root.innerHTML = `<div class="empty-state compact">等待同步群聊列表</div>`;
+    renderExcludedSummary();
+    return;
+  }
+  state.excludedMembers.loading = true;
+  root.innerHTML = `<div class="empty-state compact">正在加载群成员...</div>`;
+  try {
+    const payload = await fetchJson(`/api/chat-members?chat=${encodeURIComponent(chat)}&limit=1000`);
+    state.excludedMembers.members = payload.members || [];
+    renderReplyExcludedMembers();
+  } finally {
+    state.excludedMembers.loading = false;
+  }
+}
+
+function renderReplyExcludedMembers() {
+  const root = $("replyExcludedMembers");
+  if (!root) return;
+  const chat = state.excludedMembers.chat || $("replyExcludedChat")?.value || "";
+  const selected = new Set((excludedMembersByChat()[chat] || []).map(String));
+  const query = ($("replyExcludedSearch")?.value || state.excludedMembers.query || "").trim().toLowerCase();
+  state.excludedMembers.query = query;
+  const allMembers = state.excludedMembers.members || [];
+  const members = query ? allMembers.filter((member) => memberSearchText(member).includes(query)) : allMembers;
+  if (!chat) {
+    root.innerHTML = `<div class="empty-state compact">请选择群聊</div>`;
+    renderExcludedSummary();
+    renderSelectedExcludedMembers();
+    return;
+  }
+  if (!allMembers.length) {
+    root.innerHTML = `<div class="empty-state compact">暂未同步到成员映射。等聊天同步后再刷新。</div>`;
+    renderExcludedSummary();
+    renderSelectedExcludedMembers();
+    return;
+  }
+  if (!members.length) {
+    root.innerHTML = `<div class="empty-state compact">没搜到匹配成员，换个昵称或 username 试试。</div>`;
+    renderExcludedSummary();
+    renderSelectedExcludedMembers();
+    return;
+  }
+  root.innerHTML = members.map((member) => {
+    const key = memberKey(member);
+    const label = memberDisplayName(member);
+    const sub = [member.alias, member.member_username].filter(Boolean).join(" · ");
+    return `
+      <label class="member-check">
+        <input type="checkbox" data-excluded-member="${escapeAttr(key)}" ${selected.has(key) ? "checked" : ""}>
+        <span>
+          <strong>${escapeHtml(label)}</strong>
+          <small>${escapeHtml(sub || key)}</small>
+        </span>
+      </label>
+    `;
+  }).join("");
+  root.querySelectorAll("[data-excluded-member]").forEach((input) => {
+    input.addEventListener("change", syncExcludedMembersFromUi);
+  });
+  renderExcludedSummary();
+  renderSelectedExcludedMembers();
+}
+
+function syncExcludedMembersFromUi() {
+  const chat = state.excludedMembers.chat || $("replyExcludedChat")?.value || "";
+  if (!chat || !state.config) return;
+  const excluded = excludedMembersByChat();
+  const current = new Set((excluded[chat] || []).map(String));
+  document.querySelectorAll("[data-excluded-member]").forEach((input) => {
+    const key = input.getAttribute("data-excluded-member");
+    if (!key) return;
+    if (input.checked) current.add(key);
+    else current.delete(key);
+  });
+  const selected = Array.from(current).filter(Boolean);
+  if (selected.length) excluded[chat] = selected;
+  else delete excluded[chat];
+  renderExcludedSummary();
+  renderSelectedExcludedMembers();
+  const button = $("saveAutoReplyBtn");
+  if (button && !button.disabled) button.textContent = "保存并立即生效";
+}
+
+function removeExcludedMember(key) {
+  const chat = state.excludedMembers.chat || $("replyExcludedChat")?.value || "";
+  if (!chat || !state.config) return;
+  const excluded = excludedMembersByChat();
+  const next = (excluded[chat] || []).map(String).filter((item) => item !== String(key));
+  if (next.length) excluded[chat] = next;
+  else delete excluded[chat];
+  renderReplyExcludedMembers();
+  const button = $("saveAutoReplyBtn");
+  if (button && !button.disabled) button.textContent = "保存并立即生效";
+}
+
+function renderSelectedExcludedMembers() {
+  const root = $("replyExcludedSelected");
+  if (!root || !state.config) return;
+  const chat = state.excludedMembers.chat || $("replyExcludedChat")?.value || "";
+  const selected = (excludedMembersByChat()[chat] || []).map(String).filter(Boolean);
+  if (!chat || !selected.length) {
+    root.innerHTML = `<span class="empty-pill">当前群暂无已排除成员</span>`;
+    return;
+  }
+  root.innerHTML = selected.map((key) => {
+    const member = memberByKey(key);
+    const label = member ? memberDisplayName(member) : key;
+    const sub = member ? [member.alias, member.member_username].filter(Boolean).join(" · ") : key;
+    return `
+      <button class="excluded-member-pill" type="button" data-remove-excluded="${escapeAttr(key)}" title="从排除列表移除">
+        <span>${escapeHtml(label)}</span>
+        <small>${escapeHtml(sub || key)}</small>
+        <b>×</b>
+      </button>
+    `;
+  }).join("");
+  root.querySelectorAll("[data-remove-excluded]").forEach((button) => {
+    button.addEventListener("click", () => removeExcludedMember(button.getAttribute("data-remove-excluded")));
+  });
+}
+
+function renderExcludedSummary() {
+  const root = $("replyExcludedSummary");
+  if (!root || !state.config) return;
+  const excluded = excludedMembersByChat();
+  const chats = groupChatsForReplyConfig();
+  const parts = Object.entries(excluded)
+    .filter(([, members]) => Array.isArray(members) && members.length)
+    .map(([chat, members]) => {
+      const label = chats.find((item) => item.username === chat)?.display_name || chat;
+      return `${label} ${members.length} 人`;
+    });
+  root.textContent = parts.length ? `全部已排除：${parts.join(" · ")}` : "未设置排除成员";
+}
+
 function syncReplySenderFromForm() {
   if (!$("replySenderEnabled") || !state.config) return;
   const selected = Array.from($("replyAllowedChats").selectedOptions || [])
@@ -902,6 +1115,7 @@ function syncReplySenderFromForm() {
     maintenance_paused: Boolean($("replySenderPaused")?.checked),
     mode: $("replySenderMode").value || "draft_only",
     allowed_chats: selected,
+    excluded_members_by_chat: excludedMembersByChat(),
     send_to_active_chat_only: false,
     require_manual_approval: $("replySenderMode").value !== "auto_send",
     poll_interval_seconds: Number($("replyPollInterval").value || 5),
@@ -3530,6 +3744,12 @@ async function loadChats(refreshMessages = false) {
   renderChatStats();
   renderChatList();
   renderReplyAllowedChats();
+  renderReplyExcludedChatOptions();
+  if ($("replyExcludedChat") && !$("replyExcludedChat").disabled) {
+    loadExcludedMembersForSelectedChat().catch((error) => {
+      if ($("replyExcludedMembers")) $("replyExcludedMembers").innerHTML = `<div class="empty-state compact">成员加载失败：${escapeHtml(error.message)}</div>`;
+    });
+  }
   renderMemoryChatSelects();
   if (!state.selectedChat && state.chats.length) await selectChat(state.chats[0].username);
   else if (refreshMessages && state.selectedChat) await loadCurrentMessages();
@@ -5079,6 +5299,18 @@ function bindEvents() {
   $("savePersonaBtn").addEventListener("click", () => saveAll($("savePersonaBtn"), "保存人格"));
   $("saveTalkBtn").addEventListener("click", () => saveAll($("saveTalkBtn"), "保存接话设置"));
   $("saveAutoReplyBtn")?.addEventListener("click", () => saveAll($("saveAutoReplyBtn"), "保存自动发送"));
+  $("replyAllowedChats")?.addEventListener("change", () => {
+    syncReplySenderFromForm();
+    renderReplyExcludedChatOptions();
+    loadExcludedMembersForSelectedChat().catch((error) => alert(error.message));
+  });
+  $("replyExcludedChat")?.addEventListener("change", () => {
+    if ($("replyExcludedSearch")) $("replyExcludedSearch").value = "";
+    state.excludedMembers.query = "";
+    loadExcludedMembersForSelectedChat().catch((error) => alert(error.message));
+  });
+  $("replyExcludedSearch")?.addEventListener("input", () => renderReplyExcludedMembers());
+  $("reloadExcludedMembersBtn")?.addEventListener("click", () => loadExcludedMembersForSelectedChat().catch((error) => alert(error.message)));
   $("saveLoginGuardBtn")?.addEventListener("click", () => saveAll($("saveLoginGuardBtn"), "保存守护"));
   $("loginGuardRunBtn")?.addEventListener("click", runLoginGuardOnce);
   $("loginGuardTestNotifyBtn")?.addEventListener("click", sendLoginGuardTestNotify);

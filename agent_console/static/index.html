@@ -371,6 +371,20 @@
                 <label><span>发送延迟最小</span><input id="sendDelayMin" type="number" min="0" step="0.1" /></label>
                 <label><span>发送延迟最大</span><input id="sendDelayMax" type="number" min="0" step="0.1" /></label>
                 <label class="span-2"><span>允许群聊</span><select id="replyAllowedChats" multiple size="4"></select></label>
+                <div class="span-2 reply-exclusion-panel">
+                  <div class="mini-panel-head">
+                    <div>
+                      <strong>排除接话成员</strong>
+                      <small>被勾选的成员发言或 @ 机器人时都会跳过。</small>
+                    </div>
+                    <button id="reloadExcludedMembersBtn" class="btn tiny" type="button">刷新成员</button>
+                  </div>
+                  <label><span>选择群聊</span><select id="replyExcludedChat"></select></label>
+                  <label><span>搜索群员</span><input id="replyExcludedSearch" type="search" placeholder="输入群昵称、昵称、alias 或 member_username" /></label>
+                  <div id="replyExcludedSelected" class="excluded-member-pills">暂无已排除成员</div>
+                  <div id="replyExcludedMembers" class="member-check-list">选择一个群后加载成员</div>
+                  <div id="replyExcludedSummary" class="muted-line">未设置排除成员</div>
+                </div>
               </div>
               <div id="autoReplyStatus" class="auto-reply-status">等待自动接话状态</div>
             </article>

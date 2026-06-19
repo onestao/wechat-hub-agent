@@ -1,5 +1,22 @@
 # Changelog
 
+## v0.4.1 - 2026-06-19
+
+### Added
+- Added per-group auto-reply member exclusion lists.
+- Added searchable group-member picker for exclusion settings.
+- Added a visible excluded-member list with removable member chips in the auto-reply console.
+
+### Changed
+- Auto-reply scoring, candidate scanning, and final execution now all honor excluded members.
+- Excluded member matching now checks member username, alias, group nickname, remark, nickname, and synced contact metadata.
+- The auto-reply settings form no longer refreshes over the user while they are editing exclusion settings.
+
+### Fixed
+- Fixed the exclusion panel showing “waiting for group list” when chats loaded after the auto-reply form rendered.
+- Fixed clearing all excluded members so old chat keys do not survive config deep-merge saves.
+- Fixed filtered member selection so searching does not accidentally remove already excluded members hidden by the current search.
+
 ## v0.4.0 - 2026-06-19
 
 ### Added

@@ -121,6 +121,7 @@ DEFAULT_CONFIG = {
         "maintenance_paused": False,
         "mode": "draft_only",
         "allowed_chats": [],
+        "excluded_members_by_chat": {},
         "send_to_active_chat_only": False,
         "require_manual_approval": True,
         "min_interval_seconds": 0,
@@ -340,6 +341,21 @@ def merge_dicts(base: dict, overlay: dict) -> dict:
     return base
 
 
+def sanitize_excluded_members_by_chat(value) -> dict:
+    if not isinstance(value, dict):
+        return {}
+    output: dict[str, list[str]] = {}
+    for raw_chat, raw_members in value.items():
+        chat = str(raw_chat or "").strip()
+        if not chat:
+            continue
+        members = raw_members if isinstance(raw_members, list) else []
+        cleaned = unique_texts([clean_contact_text(item) for item in members if clean_contact_text(item)])
+        if cleaned:
+            output[chat] = cleaned[:1000]
+    return output
+
+
 def normalize_config(config: dict) -> dict:
     legacy_llm = config.get("llm") if isinstance(config.get("llm"), dict) else {}
     if "llm_profiles" not in config or not config.get("llm_profiles"):
@@ -431,6 +447,7 @@ def normalize_config(config: dict) -> dict:
     if mode not in {"draft_only", "manual_send", "auto_send"}:
         mode = sender_defaults["mode"]
     allowed_chats = sender.get("allowed_chats") if isinstance(sender.get("allowed_chats"), list) else []
+    excluded_members_by_chat = sanitize_excluded_members_by_chat(sender.get("excluded_members_by_chat"))
     sender_min_interval = clamp_int(
         sender.get("min_interval_seconds"), sender_defaults["min_interval_seconds"], 0, 86400
     )
@@ -441,6 +458,7 @@ def normalize_config(config: dict) -> dict:
         "maintenance_paused": bool(sender.get("maintenance_paused", sender_defaults.get("maintenance_paused", False))),
         "mode": mode,
         "allowed_chats": [str(item).strip() for item in allowed_chats if str(item).strip()],
+        "excluded_members_by_chat": excluded_members_by_chat,
         "send_to_active_chat_only": False,
         "require_manual_approval": bool(
             sender.get("require_manual_approval", sender_defaults["require_manual_approval"])
@@ -693,6 +711,9 @@ def sanitize_config(payload: dict, current: dict) -> dict:
             "maintenance_paused": bool(raw.get("maintenance_paused", current_sender.get("maintenance_paused", False))),
             "mode": mode,
             "allowed_chats": [str(item).strip() for item in allowed if str(item).strip()],
+            "excluded_members_by_chat": sanitize_excluded_members_by_chat(
+                raw.get("excluded_members_by_chat", current_sender.get("excluded_members_by_chat", {}))
+            ),
             "send_to_active_chat_only": False,
             "require_manual_approval": bool(
                 raw.get("require_manual_approval", current_sender.get("require_manual_approval", True))
@@ -874,6 +895,8 @@ def save_config(payload: dict) -> dict:
             agent["auto_reply_enabled"] = True
             sanitized["agent"] = agent
     merged = normalize_config(merge_dicts(current, sanitized))
+    if isinstance(sanitized.get("reply_sender"), dict) and "excluded_members_by_chat" in sanitized["reply_sender"]:
+        merged.setdefault("reply_sender", {})["excluded_members_by_chat"] = sanitized["reply_sender"].get("excluded_members_by_chat") or {}
     write_json(CONFIG_FILE, merged)
     is_active = bool(auto_reply_activation_state(merged).get("active"))
     if save_source == "auto_reply" and is_active and not was_active:
@@ -7910,6 +7933,7 @@ def auto_reply_public_state(config: dict | None = None) -> dict:
         "mode": sender.get("mode") or "draft_only",
         "poll_interval_seconds": sender.get("poll_interval_seconds", 5),
         "allowed_chats": sender.get("allowed_chats") or [],
+        "excluded_members_by_chat": sender.get("excluded_members_by_chat") or {},
         "sender": state.get("sender") if isinstance(state.get("sender"), dict) else {},
     }
 
@@ -7980,6 +8004,66 @@ def is_auto_reply_allowed_chat(row: dict, allowed: set[str]) -> bool:
     chat_username = str(row.get("chat_username") or "").strip()
     chat_display = str(row.get("chat_display_name") or "").strip()
     return not allowed or chat_username in allowed or chat_display in allowed
+
+
+def excluded_members_for_chat(config: dict, chat_username: str, chat_display: str = "") -> set[str]:
+    sender = config.get("reply_sender", {}) if isinstance(config.get("reply_sender"), dict) else {}
+    raw = sender.get("excluded_members_by_chat") if isinstance(sender.get("excluded_members_by_chat"), dict) else {}
+    candidates = [str(chat_username or "").strip(), str(chat_display or "").strip()]
+    values: list[str] = []
+    for key in candidates:
+        if key and isinstance(raw.get(key), list):
+            values.extend(raw.get(key) or [])
+    return {clean_contact_text(item) for item in values if clean_contact_text(item)}
+
+
+def member_match_values_for_row(row: dict) -> set[str]:
+    chat_username = str(row.get("chat_username") or "").strip()
+    sender_key = clean_contact_text(row.get("sender_key"))
+    sender_name = clean_contact_text(row.get("sender_hint") or row.get("sender_name"))
+    if not sender_key:
+        sender_key, parsed_text = message_index_text(row)
+        sender_key = clean_contact_text(sender_key)
+        if not sender_name:
+            sender_name = clean_contact_text(sender_key)
+    contact = contact_directory(chat_username).get(sender_key, {}) if chat_username and sender_key else {}
+    mapped = chat_member_identity(chat_username, member_username=sender_key, group_nickname=sender_name) if chat_username else {}
+    values = {
+        sender_key,
+        sender_name,
+        clean_contact_text(mapped.get("member_username")),
+        clean_contact_text(mapped.get("alias")),
+        clean_contact_text(mapped.get("group_nickname")),
+        clean_contact_text(mapped.get("remark")),
+        clean_contact_text(mapped.get("nickname")),
+        clean_contact_text(contact.get("alias")),
+        clean_contact_text(contact.get("group_alias")),
+        clean_contact_text(contact.get("remark")),
+        clean_contact_text(contact.get("nick_name")),
+        group_display_name(sender_key, contact) if sender_key else "",
+    }
+    return {clean_contact_text(item) for item in values if clean_contact_text(item)}
+
+
+def auto_reply_excluded_member_info(config: dict, row: dict) -> dict:
+    chat_username = str(row.get("chat_username") or "").strip()
+    chat_display = str(row.get("chat_display_name") or "").strip()
+    excluded = excluded_members_for_chat(config, chat_username, chat_display)
+    if not excluded:
+        return {"excluded": False}
+    values = member_match_values_for_row(row)
+    normalized_excluded = {normalize_alias_match_text(item) for item in excluded if normalize_alias_match_text(item)}
+    normalized_values = {normalize_alias_match_text(item) for item in values if normalize_alias_match_text(item)}
+    matched = sorted((excluded & values) or (normalized_excluded & normalized_values))
+    if not matched:
+        return {"excluded": False}
+    return {
+        "excluded": True,
+        "matched": matched[0],
+        "member_values": sorted(values)[:20],
+        "chat_username": chat_username,
+        "chat_display_name": chat_display,
+    }
 
 
 def reset_auto_reply_watermarks_to_latest(config: dict) -> dict:
@@ -8142,6 +8226,13 @@ def auto_reply_candidate_messages(config: dict, state: dict, limit: int) -> list
         for row in rows:
             normalized = normalize_auto_message(row)
             if normalized.get("is_self_message"):
+                continue
+            if auto_reply_excluded_member_info(config, normalized).get("excluded"):
+                chat = str(row.get("chat_username") or "")
+                if chat:
+                    watermarks[chat] = chat_watermark(row)
+                    watermarks_changed = True
+                auto_reply_skip(normalized, "excluded_member")
                 continue
             if is_bot_mention_row(row, config):
                 if not mention_only or int(row.get("create_time") or 0) >= mention_only_since:
@@ -9611,6 +9702,11 @@ def auto_reply_execute_message(row: dict, config: dict) -> dict:
     mark_auto_reply_watermark(state, message)
     text = message.get("text") or ""
     set_auto_reply_live("candidate", message)
+    excluded_info = auto_reply_excluded_member_info(config, message)
+    if excluded_info.get("excluded"):
+        set_auto_reply_live("skipped", message, error="excluded_member", details={"reason": "excluded_member", **excluded_info})
+        auto_reply_skip(message, "excluded_member")
+        return {"ok": True, "skipped": True, "reason": "excluded_member", "excluded": excluded_info}
     if not text:
         set_auto_reply_live("skipped", message, error="empty_text")
         auto_reply_skip(message, "empty_text")
@@ -14847,7 +14943,7 @@ def evaluate_talk(payload: dict) -> dict:
     mode_key = payload.get("mode") or config.get("agent", {}).get("reply_mode", "normal")
     mode = config.get("talk_modes", {}).get(mode_key) or config.get("talk_modes", {}).get("normal", {})
     text = str(payload.get("text") or "").strip()
-    context = payload.get("context") or {}
+    context = dict(payload.get("context") or {})
     score = 0
     hits = []
     suppressions = []
@@ -14859,6 +14955,25 @@ def evaluate_talk(payload: dict) -> dict:
     }
     if not mention_info["mentions_bot"]:
         mention_info = detect_bot_mention(text, config, str(context.get("chat_username") or ""))
+    if not context.get("sender_excluded"):
+        context["sender_excluded"] = bool(
+            auto_reply_excluded_member_info(
+                config,
+                {
+                    "chat_username": context.get("chat_username") or payload.get("chat") or "",
+                    "chat_display_name": context.get("chat_display_name") or payload.get("chat_display_name") or "",
+                    "sender_key": context.get("sender_key") or context.get("member_username") or context.get("sender_hint") or "",
+                    "sender_hint": (
+                        context.get("sender_name")
+                        or context.get("group_nickname")
+                        or context.get("sender_hint")
+                        or context.get("member_username")
+                        or ""
+                    ),
+                    "text": text,
+                },
+            ).get("excluded")
+        )
 
     def add(name: str, value: int | float, kind: str = "positive") -> None:
         nonlocal score
@@ -14891,6 +15006,8 @@ def evaluate_talk(payload: dict) -> dict:
 
     if context.get("is_self_message"):
         suppressions.append({"name": "机器人自己发的消息", "effect": "ignore"})
+    if context.get("sender_excluded"):
+        suppressions.append({"name": "发言人在接话排除名单", "effect": "ignore"})
     if not context.get("group_auto_reply_enabled", config.get("agent", {}).get("auto_reply_enabled")) and not mention_info.get("mentions_bot"):
         suppressions.append({"name": "群未开启自动回复", "effect": "ignore"})
     if context.get("safety_risk"):
@@ -14973,9 +15090,21 @@ def infer_talk_context(message: dict | None, recent: list[dict], explicit: dict 
         contact = contact_directory(chat_username).get(sender_key, {})
         group_nickname = group_display_name(sender_key, contact) or group_nickname
         sender_name = group_nickname or sender_name
+    sender_excluded = bool(
+        auto_reply_excluded_member_info(
+            config,
+            {
+                "chat_username": chat_username,
+                "sender_key": sender_key,
+                "sender_hint": sender_name,
+                "chat_display_name": explicit.get("chat_display_name") or (message or {}).get("chat_display_name") or "",
+            },
+        ).get("excluded")
+    )
     context = {
         "chat_username": chat_username,
         "group_auto_reply_enabled": config.get("agent", {}).get("auto_reply_enabled"),
+        "sender_excluded": sender_excluded,
         "needs_memory": any(word in text for word in ("之前", "上次", "记得", "谁说过", "查记录", "总结", "上下文", "画像", "口头禅", "口癖", "爱说什么", "最常说")),
         "cold_room": False,
         "two_people_private_like": False,

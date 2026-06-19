@@ -15,7 +15,7 @@
   <a href="https://hub.docker.com/r/xiaoguiwucan/linux-wechat-agent">
     <img alt="DockerHub" src="https://img.shields.io/badge/DockerHub-xiaoguiwucan%2Flinux--wechat--agent-2496ED?style=for-the-badge&logo=docker&logoColor=white">
   </a>
-  <img alt="Release" src="https://img.shields.io/badge/Release-v0.4.0-00A86B?style=for-the-badge">
+  <img alt="Release" src="https://img.shields.io/badge/Release-v0.4.1-00A86B?style=for-the-badge">
   <img alt="Platforms" src="https://img.shields.io/badge/Platforms-amd64%20%7C%20arm64-6C5CE7?style=for-the-badge">
 </p>
 
@@ -57,10 +57,38 @@ WeChatAgent 把 Linux 微信窗口、聊天同步、长期记忆、AI 接话、�
 <table>
   <tr>
     <td width="20%" align="center">
+      <h3>v0.4.1</h3>
+      <strong>接话排除名单增强</strong><br>
+      <sub>2026-06-19</sub><br><br>
+      <img alt="v0.4.1" src="https://img.shields.io/badge/current-stable-00A86B?style=flat-square">
+    </td>
+    <td>
+      <strong>新增</strong>
+      <ul>
+        <li>按群配置“排除接话成员”，被排除成员发言或 @ 机器人都会跳过。</li>
+        <li>排除成员支持群员搜索，可按群昵称、昵称、alias、member username 快速过滤。</li>
+        <li>新增“当前群已排除成员”标签列表，可直观看到被排除的人并一键移除。</li>
+      </ul>
+      <strong>优化</strong>
+      <ul>
+        <li>接话评分、候选扫描和最终发送执行三层统一遵守排除名单。</li>
+        <li>排除匹配同时参考 member username、alias、群昵称、备注、昵称和同步联系人信息。</li>
+        <li>编辑自动回复配置时，状态轮询不会再覆盖正在操作的排除名单表单。</li>
+      </ul>
+      <strong>修复</strong>
+      <ul>
+        <li>修复排除成员面板初次打开时可能一直显示“等待同步群聊列表”。</li>
+        <li>修复清空排除名单后旧配置键仍残留的问题。</li>
+        <li>修复搜索过滤后勾选成员时，隐藏的已排除成员可能被误删的问题。</li>
+      </ul>
+    </td>
+  </tr>
+  <tr>
+    <td align="center">
       <h3>v0.4.0</h3>
       <strong>登录守护与记忆控制台增强</strong><br>
       <sub>2026-06-19</sub><br><br>
-      <img alt="v0.4.0" src="https://img.shields.io/badge/current-stable-00A86B?style=flat-square">
+      <img alt="v0.4.0" src="https://img.shields.io/badge/memory-console-4ECDC4?style=flat-square">
     </td>
     <td>
       <strong>新增</strong>
@@ -336,7 +364,7 @@ docker login
 构建并推送：
 
 ```bash
-./scripts/publish-dockerhub.sh docker.io/xiaoguiwucan/linux-wechat-agent 0.4.0
+./scripts/publish-dockerhub.sh docker.io/xiaoguiwucan/linux-wechat-agent 0.4.1
 ```
 
 如果你的 DockerHub 用户名不同，把命令和 `.env` 里的 `WECHAT_AGENT_IMAGE` 改成你的镜像名。

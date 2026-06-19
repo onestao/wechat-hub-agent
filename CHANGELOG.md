@@ -1,5 +1,26 @@
 # Changelog
 
+## v0.4.0 - 2026-06-19
+
+### Added
+- Added Clawbot-based WeChat login guard notifications with repeat reminders and manual check controls.
+- Added visual WeChat UI state detection for `login_required`, `login_pending`, and active chat states.
+- Added richer memory database management, grouped export/import entry points, and image memory gallery workflows.
+- Added image understanding skill configuration, model connectivity checks, and image upload testing support.
+- Added evidence-driven person profile rebuilding with progress state, profile tags, and relationship data improvements.
+
+### Changed
+- Improved overview universe layout, leaderboard responsiveness, rank styling, and high-density screen behavior.
+- Improved auto-reply routing, mention handling, self-message filtering, meme trigger behavior, and real-time reply status.
+- Improved summary/report generation templates, nickname mapping, and memory-backed chat summary behavior.
+- Improved skill management and built-in skill behavior for search, memes, article cards, and image-only replies.
+
+### Fixed
+- Fixed WeChat login recovery false positives where fresh sync status could incorrectly send “restored online”.
+- Fixed login guard auto-click coordinates for “我知道了” and “登录”, then waits for mobile confirmation instead of claiming recovery.
+- Fixed several settings persistence issues where saved mode, limit, and skill parameters could revert after refresh.
+- Fixed multiple UI clipping/overlap problems in leaderboards, profile cards, image gallery, and overview controls.
+
 ## v0.3.1 - 2026-06-18
 
 ### Changed

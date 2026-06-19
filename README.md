@@ -1,4 +1,35 @@
-# WeChatAgent · Linux 微信记忆与自动回复套件
+<div align="center">
+
+# WeChatAgent
+
+### Linux 微信记忆与自动回复套件
+
+<p>
+  <strong>把浏览器微信、聊天同步、长期记忆、AI 接话、技能系统、图片理解和可视化控制台打包成一套 Docker Compose 服务。</strong>
+</p>
+
+<p>
+  <a href="https://github.com/xiaoguiwucan/linux-wechat-agent">
+    <img alt="GitHub" src="https://img.shields.io/badge/GitHub-linux--wechat--agent-181717?style=for-the-badge&logo=github">
+  </a>
+  <a href="https://hub.docker.com/r/xiaoguiwucan/linux-wechat-agent">
+    <img alt="DockerHub" src="https://img.shields.io/badge/DockerHub-xiaoguiwucan%2Flinux--wechat--agent-2496ED?style=for-the-badge&logo=docker&logoColor=white">
+  </a>
+  <img alt="Release" src="https://img.shields.io/badge/Release-v0.4.0-00A86B?style=for-the-badge">
+  <img alt="Platforms" src="https://img.shields.io/badge/Platforms-amd64%20%7C%20arm64-6C5CE7?style=for-the-badge">
+</p>
+
+<p>
+  <code>微信窗口 3000</code>
+  ·
+  <code>控制台 8078</code>
+  ·
+  <code>AI 记忆 8090</code>
+  ·
+  <code>Docker Compose 一套部署</code>
+</p>
+
+</div>
 
 WeChatAgent 把 Linux 微信窗口、聊天同步、长期记忆、AI 接话、技能系统和可视化控制台打包成一套 Docker Compose 服务。目标是：在 NAS 或另一台电脑上登录微信后，直接拥有一个可观察、可配置、可扩展的微信群 Agent。
 
@@ -18,6 +49,139 @@ WeChatAgent 把 Linux 微信窗口、聊天同步、长期记忆、AI 接话、�
 | 图片记忆库 | 群图解析、标签入库、画廊展示、失败重试、按群导入导出 |
 | 控制台 | 服务状态、模型配置、模式参数、回复实时状态、宇宙总览、排行榜 |
 | 数据维护 | 按群导出/导入、全量备份、运行数据恢复 |
+
+## 版本更新
+
+> 每一个发布版本都必须写入 `CHANGELOG.md`。发布脚本会自动检查更新日志，缺少对应版本记录会拒绝发布镜像。
+
+<table>
+  <tr>
+    <td width="20%" align="center">
+      <h3>v0.4.0</h3>
+      <strong>登录守护与记忆控制台增强</strong><br>
+      <sub>2026-06-19</sub><br><br>
+      <img alt="v0.4.0" src="https://img.shields.io/badge/current-stable-00A86B?style=flat-square">
+    </td>
+    <td>
+      <strong>新增</strong>
+      <ul>
+        <li>Clawbot 微信掉线通知、重复提醒、手动检查和登录确认守护。</li>
+        <li>微信窗口视觉状态检测：区分 <code>login_required</code>、<code>login_pending</code> 和真实聊天界面。</li>
+        <li>记忆库管理、按群导出/导入、照片库画廊、图片解析入库和失败重试流程。</li>
+        <li>图片理解 Skill 的模型配置、连通性测试和上传图片测试能力。</li>
+        <li>证据驱动人物画像重建、进度状态、画像标签和关系数据增强。</li>
+      </ul>
+      <strong>优化</strong>
+      <ul>
+        <li>总览宇宙、排行榜、等级视觉、不同分辨率下的布局自适应。</li>
+        <li>自动回复的群组路由、蓝色 @、忽略自己消息、斗图触发和实时状态展示。</li>
+        <li>群总结模板、昵称映射、记忆库检索和图片总结展示效果。</li>
+      </ul>
+      <strong>修复</strong>
+      <ul>
+        <li>修复微信掉线后被 <code>sync_worker_fresh</code> 误判为“已恢复在线”的问题。</li>
+        <li>修复登录页“我知道了”和“登录”自动点击坐标，并在手机确认前保持等待状态。</li>
+        <li>修复多个模式参数、Skill 参数保存后刷新回退的问题。</li>
+      </ul>
+    </td>
+  </tr>
+  <tr>
+    <td align="center">
+      <h3>v0.3.1</h3>
+      <strong>多架构镜像发布</strong><br>
+      <sub>2026-06-18</sub><br><br>
+      <img alt="v0.3.1" src="https://img.shields.io/badge/docker-amd64%20%7C%20arm64-2496ED?style=flat-square">
+    </td>
+    <td>
+      <strong>更新内容</strong>
+      <ul>
+        <li>DockerHub 项目服务镜像发布为 <code>linux/amd64</code> 与 <code>linux/arm64</code> 多架构 manifest。</li>
+        <li>取消微信 GUI 服务默认 <code>linux/arm64</code> 平台锁定，x86 NAS 和 Intel/AMD 服务器可自动拉取对应架构。</li>
+        <li>更新 NAS、x86、ARM、Apple Silicon 部署说明。</li>
+        <li>发布脚本改为默认使用 <code>docker buildx build --platform linux/amd64,linux/arm64 --push</code>。</li>
+      </ul>
+      <strong>验证</strong>
+      <ul>
+        <li>确认 <code>ghcr.io/nickrunning/wechat-selkies:0.0.12-minimal</code> 同时支持 <code>linux/amd64</code> 和 <code>linux/arm64</code>。</li>
+      </ul>
+    </td>
+  </tr>
+  <tr>
+    <td align="center">
+      <h3>v0.3.0</h3>
+      <strong>正式 Docker 部署包</strong><br>
+      <sub>2026-06-18</sub><br><br>
+      <img alt="v0.3.0" src="https://img.shields.io/badge/release-docker%20compose-34495E?style=flat-square">
+    </td>
+    <td>
+      <strong>新增</strong>
+      <ul>
+        <li>生产部署向 Docker Compose 打包方案。</li>
+        <li><code>.env.example</code>，避免把本地路径、密钥、运行数据写死进仓库。</li>
+        <li>DockerHub 镜像工作流、本地开发 compose override、NAS/新电脑部署文档。</li>
+        <li>账号目录检测、数据库 key 提取、运行数据备份、恢复、本地开发启动和镜像发布脚本。</li>
+      </ul>
+      <strong>调整</strong>
+      <ul>
+        <li>用 <code>WECHAT_ACCOUNT_DIR_NAME</code> 替代硬编码微信账号目录。</li>
+        <li>控制台自动按配置发现微信数据库路径。</li>
+        <li>增加 <code>host.docker.internal</code> 映射，方便容器访问宿主机模型服务。</li>
+      </ul>
+      <strong>安全</strong>
+      <ul>
+        <li>确认 <code>.env</code>、<code>config/</code>、<code>runtime/</code>、微信 key、私有数据库和备份包不会进入 Git 或镜像。</li>
+      </ul>
+    </td>
+  </tr>
+  <tr>
+    <td align="center">
+      <h3>v0.2.0</h3>
+      <strong>自动自由接话</strong><br>
+      <sub>2026-06-15</sub><br><br>
+      <img alt="v0.2.0" src="https://img.shields.io/badge/agent-auto%20reply-8E44AD?style=flat-square">
+    </td>
+    <td>
+      <strong>新增</strong>
+      <ul>
+        <li>微信群自动自由接话 worker。</li>
+        <li>基于评分阈值的自动发送模式。</li>
+        <li>按群水位线，开启自动回复时不会翻旧账回复历史消息。</li>
+        <li>Outbox 记录评分、阈值、决策、触发原因和发送确认。</li>
+        <li>自动回复状态 API 与控制台配置：允许群、轮询间隔、随机延迟和模式参数。</li>
+      </ul>
+      <strong>调整</strong>
+      <ul>
+        <li>自动回复复用已验证的微信 UI 发送器：切群、粘贴、校验输入框、再发送。</li>
+        <li>微信窗口操作串行化，多个群的评分和扫描可以并行覆盖。</li>
+        <li>连续回复同一个群时复用当前聊天窗口，不重复搜索群名。</li>
+      </ul>
+    </td>
+  </tr>
+  <tr>
+    <td align="center">
+      <h3>v0.1.0</h3>
+      <strong>手动微信发送闭环</strong><br>
+      <sub>2026-06-15</sub><br><br>
+      <img alt="v0.1.0" src="https://img.shields.io/badge/mvp-manual%20send-F39C12?style=flat-square">
+    </td>
+    <td>
+      <strong>新增</strong>
+      <ul>
+        <li>控制台生成回复后，可以手动粘贴到微信或发送到微信。</li>
+        <li>自动切换目标群：支持 <code>值班群</code> 和 <code>PT站看片狂魔小群</code>。</li>
+        <li>短关键词搜索：<code>值班群</code> 搜索 <code>值班</code>，<code>PT站看片狂魔小群</code> 搜索 <code>PT</code>。</li>
+        <li>群切换和发送动作支持随机延迟。</li>
+        <li>回复 outbox 记录草稿和发送尝试。</li>
+      </ul>
+      <strong>修复</strong>
+      <ul>
+        <li>修复预览状态残留导致回复发到上一个群的问题。</li>
+        <li>修复完整群名搜索打开微信全局搜索页的问题。</li>
+        <li>修复小尺寸微信窗口识别、Selkies 剪贴板粘贴和输入框校验可靠性。</li>
+      </ul>
+    </td>
+  </tr>
+</table>
 
 ## 服务架构
 
@@ -172,7 +336,7 @@ docker login
 构建并推送：
 
 ```bash
-./scripts/publish-dockerhub.sh docker.io/xiaoguiwucan/linux-wechat-agent 0.2.0
+./scripts/publish-dockerhub.sh docker.io/xiaoguiwucan/linux-wechat-agent 0.4.0
 ```
 
 如果你的 DockerHub 用户名不同，把命令和 `.env` 里的 `WECHAT_AGENT_IMAGE` 改成你的镜像名。

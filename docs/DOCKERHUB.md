@@ -40,30 +40,32 @@ docker.io/你的用户名/linux-wechat-agent
 指定版本：
 
 ```bash
-./scripts/publish-dockerhub.sh docker.io/xiaoguiwucan/linux-wechat-agent 0.2.0
+./scripts/publish-dockerhub.sh docker.io/xiaoguiwucan/linux-wechat-agent 0.3.1
 ```
 
-脚本会推送：
+脚本默认用 buildx 推送多架构 manifest：
 
 ```text
-docker.io/xiaoguiwucan/linux-wechat-agent:0.2.0
+linux/amd64
+linux/arm64
+```
+
+并发布：
+
+```text
+docker.io/xiaoguiwucan/linux-wechat-agent:0.3.1
 docker.io/xiaoguiwucan/linux-wechat-agent:latest
 ```
 
 ## 多架构发布
 
-如果需要同时发布 amd64 和 arm64，可改用 buildx：
+默认已经同时发布 amd64 和 arm64。如需调整平台，可设置 `PLATFORMS`：
 
 ```bash
-docker buildx create --use --name wechatagent-builder
-docker buildx build \
-  --platform linux/amd64,linux/arm64 \
-  -t docker.io/xiaoguiwucan/linux-wechat-agent:0.2.0 \
-  -t docker.io/xiaoguiwucan/linux-wechat-agent:latest \
-  --push .
+PLATFORMS=linux/amd64,linux/arm64 ./scripts/publish-dockerhub.sh docker.io/xiaoguiwucan/linux-wechat-agent 0.3.1
 ```
 
-注意：项目服务镜像可以多架构，但 `wechat-selkies` 微信 GUI 镜像是否能在对应架构运行，取决于上游镜像。
+`wechat-selkies` 微信 GUI 镜像 `ghcr.io/nickrunning/wechat-selkies:0.0.12-minimal` 也已验证包含 `linux/amd64` 和 `linux/arm64`。
 
 ## 部署机器如何使用镜像
 

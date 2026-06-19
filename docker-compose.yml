@@ -1,7 +1,7 @@
 services:
   wechat-selkies:
     image: ${WECHAT_SELKIES_IMAGE:-ghcr.io/nickrunning/wechat-selkies:0.0.12-minimal}
-    platform: ${WECHAT_SELKIES_PLATFORM:-linux/arm64}
+    platform: ${WECHAT_SELKIES_PLATFORM:-}
     container_name: wechat-selkies
     restart: unless-stopped
     cap_add:

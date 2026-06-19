@@ -11,6 +11,8 @@ if [[ -z "${VERSION}" ]]; then
   exit 1
 fi
 
+"${ROOT_DIR}/scripts/check-release-changelog.sh" "${VERSION}"
+
 echo "[+] Building and pushing ${IMAGE}:${VERSION} for ${PLATFORMS}"
 docker buildx build \
   --platform "${PLATFORMS}" \

@@ -15,7 +15,7 @@
   <a href="https://hub.docker.com/r/xiaoguiwucan/linux-wechat-agent">
     <img alt="DockerHub" src="https://img.shields.io/badge/DockerHub-xiaoguiwucan%2Flinux--wechat--agent-2496ED?style=for-the-badge&logo=docker&logoColor=white">
   </a>
-  <img alt="Release" src="https://img.shields.io/badge/Release-v0.4.1-00A86B?style=for-the-badge">
+  <img alt="Release" src="https://img.shields.io/badge/Release-v0.4.2-00A86B?style=for-the-badge">
   <img alt="Platforms" src="https://img.shields.io/badge/Platforms-amd64%20%7C%20arm64-6C5CE7?style=for-the-badge">
 </p>
 
@@ -57,10 +57,41 @@ WeChatAgent 把 Linux 微信窗口、聊天同步、长期记忆、AI 接话、�
 <table>
   <tr>
     <td width="20%" align="center">
+      <h3>v0.4.2</h3>
+      <strong>接话稳定与人格蒸馏</strong><br>
+      <sub>2026-06-20</sub><br><br>
+      <img alt="v0.4.2" src="https://img.shields.io/badge/current-stable-00A86B?style=flat-square">
+    </td>
+    <td>
+      <strong>新增</strong>
+      <ul>
+        <li>新增独立“系统日志”菜单，支持分类、等级、关键词筛选和实时刷新，失败原因会按秒记录。</li>
+        <li>新增当前群 Top10 人格蒸馏库：人格卡、证据原话、手动切换、测试改写和 12 小时刷新入口。</li>
+        <li>新增单群独立接话策略：每个群可单独配置模式、阈值、斗图概率、切群延迟和发送延迟。</li>
+        <li>新增性格改写总开关，想要更快回复时可以关闭额外 LLM 改写链路。</li>
+      </ul>
+      <strong>优化</strong>
+      <ul>
+        <li>启用单群策略的群会自动进入自动回复扫描范围，不再依赖旧白名单是否完整。</li>
+        <li>微信切群使用短关键词：<code>PT</code>、<code>值班</code>、<code>测试</code>，其他群默认使用前两位搜索。</li>
+        <li>文本和图片发送都会重新打开并验证目标群，降低复用旧聊天窗口导致发错群的风险。</li>
+        <li>保留 v0.4.1 的按群排除接话成员功能，并接入新自动回复链路。</li>
+      </ul>
+      <strong>修复</strong>
+      <ul>
+        <li>修复多群自动回复只处理一个群、其他群无反应的问题。</li>
+        <li>修复从测试群切到其他群时可能把回复发到上一个群的风险。</li>
+        <li>修复群日报图片发送状态里引用未定义变量的问题。</li>
+        <li>修复微信同步读取 FTS 辅助库和 SQLite malformed 时导致同步不稳定的问题。</li>
+      </ul>
+    </td>
+  </tr>
+  <tr>
+    <td width="20%" align="center">
       <h3>v0.4.1</h3>
       <strong>接话排除名单增强</strong><br>
       <sub>2026-06-19</sub><br><br>
-      <img alt="v0.4.1" src="https://img.shields.io/badge/current-stable-00A86B?style=flat-square">
+      <img alt="v0.4.1" src="https://img.shields.io/badge/member-exclusion-75D6FF?style=flat-square">
     </td>
     <td>
       <strong>新增</strong>
@@ -364,7 +395,7 @@ docker login
 构建并推送：
 
 ```bash
-./scripts/publish-dockerhub.sh docker.io/xiaoguiwucan/linux-wechat-agent 0.4.1
+./scripts/publish-dockerhub.sh docker.io/xiaoguiwucan/linux-wechat-agent 0.4.2
 ```
 
 如果你的 DockerHub 用户名不同，把命令和 `.env` 里的 `WECHAT_AGENT_IMAGE` 改成你的镜像名。

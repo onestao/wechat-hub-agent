@@ -1,5 +1,27 @@
 # Changelog
 
+## v0.4.2 - 2026-06-20
+
+### Added
+- Added a dedicated system log console with category, level, keyword search, live refresh, and detailed failure records.
+- Added Top10 style-persona distillation for each group, including persona cards, evidence retrieval, manual persona switching, and optional LLM style rewriting.
+- Added per-group auto-reply strategy settings for mode, threshold, meme probability, and switch/send delay overrides.
+- Added a global style-rewrite toggle so auto replies can skip the extra rewrite model call when speed matters.
+
+### Changed
+- Auto-reply allowed chats now include enabled per-group settings, so a group with its own strategy is no longer silently ignored if the old whitelist is incomplete.
+- WeChat group switching uses short stable search keywords, including `PT`, `值班`, and `测试`, with generic two-character fallback for other groups.
+- Text and image sending now force target-chat verification instead of trusting stale cached active chat state, reducing wrong-group sends.
+- Auto-reply no longer sends local fallback text when the LLM or memory evidence fails; failures are recorded in the log console instead.
+- The v0.4.1 per-group excluded-member UI and backend guard are preserved alongside the new persona/logging features.
+
+### Fixed
+- Fixed a wrong-group send risk where replies could reuse a previous active chat after switching between groups.
+- Fixed message scanning so multiple configured groups can be considered instead of only one active group.
+- Fixed daily report live-status code that referenced an unset variable before image sending.
+- Fixed WeChat memory sync instability caused by FTS auxiliary databases and added a REINDEX/integrity retry path for malformed SQLite reads.
+- Fixed release branch reconciliation so v0.4.2 keeps v0.4.1 documentation, changelog, and release checks.
+
 ## v0.4.1 - 2026-06-19
 
 ### Added

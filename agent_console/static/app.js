@@ -12,10 +12,15 @@ const state = {
   lastMessages: [],
   suite: null,
   semanticRuns: null,
-  profileRebuild: null,
   autoReply: null,
+  systemLogs: { events: [], stats: {}, categories: [], levels: [] },
+  systemLogFilter: { category: "all", level: "all", query: "" },
+  systemLogSearchTimer: 0,
   loginGuard: null,
   clawbot: null,
+  styleCard: null,
+  stylePersonas: null,
+  selectedStylePersonaKey: "",
   skills: { skills: [], runs: [], stats: {} },
   database: null,
   photos: { items: [], stats: {}, auto: {}, status: "all", selectedUid: "" },
@@ -25,9 +30,9 @@ const state = {
   preview: null,
   lastOutbox: null,
   talkSettingsDirty: false,
+  selectedChatReplyChat: "",
   loginGuardDirty: false,
   excludedMembers: { chat: "", members: [], loading: false, query: "" },
-  profileRebuildPolling: false,
   memoryUi: {
     tab: "people",
     selectedPersonId: null,
@@ -53,9 +58,6 @@ const state = {
     lastX: 0,
     lastY: 0,
   },
-  overviewSemanticSignature: "",
-  overviewFullRefreshInFlight: false,
-  lastOverviewFullRefreshAt: 0,
 };
 
 const $ = (id) => document.getElementById(id);
@@ -71,6 +73,7 @@ const pageMeta = {
   memory: ["群记忆中枢", "人物画像、长期事实、群故事线和聚焦关系都来自 AI 记忆库。"],
   database: ["记忆数据库", "查看当前群组的数据库容量、模块记录数，并执行按群备份/导入。"],
   photos: ["照片数据库", "按群展示图片记忆、视觉解析结果、标签和失败重试。"],
+  logs: ["系统日志", "按分类、等级、关键词实时查看运行日志和失败详情。"],
   test: ["模型测试", "向当前活跃模型发送一次短测试。"],
 };
 
@@ -152,6 +155,19 @@ function fmtIsoTime(value) {
   return date.toLocaleTimeString("zh-CN", { hour12: false });
 }
 
+function fmtShortDateTime(value) {
+  if (!value) return "--";
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return String(value);
+  return date.toLocaleString("zh-CN", {
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false,
+  });
+}
+
 function compactServerError(payload) {
   if (!payload || typeof payload !== "object") return "请求失败";
   const parts = [];
@@ -211,42 +227,6 @@ function statusLiteUrl() {
 
 function activeMemoryChat() {
   return state.chats.find((chat) => chat.username === state.memoryChat) || null;
-}
-
-function overviewSemanticSignature(payload = {}) {
-  const memory = payload.memory || state.memory || {};
-  const scope = payload.semantic_memory?.scope || state.semantic?.scope || {};
-  return [
-    state.memoryChat || "all",
-    Number(memory.messages || 0),
-    Number(memory.ai_indexed_messages || 0),
-    Number(memory.latest_message_time || 0),
-    Number(scope.message_count || 0),
-    Number(scope.end_time || 0),
-  ].join(":");
-}
-
-function rememberOverviewSemanticSignature(payload = {}) {
-  state.overviewSemanticSignature = overviewSemanticSignature(payload);
-}
-
-function needsOverviewFullRefresh(payload = {}) {
-  if (state.view !== "overview") return false;
-  if (state.overviewFullRefreshInFlight) return false;
-  if (Date.now() - Number(state.lastOverviewFullRefreshAt || 0) < 3500) return false;
-  const nextSignature = overviewSemanticSignature(payload);
-  return Boolean(state.semantic?.graph) && nextSignature !== state.overviewSemanticSignature;
-}
-
-async function refreshOverviewSemanticIfNeeded(payload = {}) {
-  if (!needsOverviewFullRefresh(payload)) return;
-  state.overviewFullRefreshInFlight = true;
-  state.lastOverviewFullRefreshAt = Date.now();
-  try {
-    await refreshFullStatus({ skipAuxViews: true });
-  } finally {
-    state.overviewFullRefreshInFlight = false;
-  }
 }
 
 function resetMemorySelection() {
@@ -385,6 +365,124 @@ function compactJson(value) {
   return JSON.stringify(copy, null, 2);
 }
 
+function eventTone(level) {
+  if (level === "error") return "bad";
+  if (level === "warning") return "warn";
+  if (level === "success") return "ok";
+  return "info";
+}
+
+function systemLogCategoryLabel(key) {
+  const found = (state.systemLogs?.categories || []).find((item) => item.category === key);
+  return found?.label || key || "系统";
+}
+
+async function loadSystemLogs() {
+  const params = new URLSearchParams({ limit: "80" });
+  const filter = state.systemLogFilter || {};
+  if (filter.category && filter.category !== "all") params.set("category", filter.category);
+  if (filter.level && filter.level !== "all") params.set("level", filter.level);
+  if (filter.query) params.set("q", filter.query);
+  const payload = await fetchJson(`/api/system-logs?${params.toString()}`);
+  state.systemLogs = payload;
+  renderSystemLogs();
+}
+
+function systemLogDetailText(event) {
+  const detail = {
+    error: event.error || "",
+    chat_username: event.chat_username || "",
+    chat_display_name: event.chat_display_name || "",
+    message_uid: event.message_uid || "",
+    source_text: event.source_text || "",
+    details: event.details || {},
+  };
+  return JSON.stringify(detail, null, 2);
+}
+
+function renderSystemLogs() {
+  const card = $("systemLogCard");
+  if (!card) return;
+  const payload = state.systemLogs || {};
+  const events = payload.events || [];
+  const stats = payload.stats || {};
+  if ($("navLogCount")) $("navLogCount").textContent = fmtNumber(stats.total || 0);
+  const latest = events[0] || {};
+  const errors = (stats.by_level || []).find((item) => item.level === "error")?.count || 0;
+  const warnings = (stats.by_level || []).find((item) => item.level === "warning")?.count || 0;
+  const tone = eventTone(latest.level || (errors ? "error" : warnings ? "warning" : "info"));
+  card.classList.toggle("bad", tone === "bad");
+  card.classList.toggle("warn", tone === "warn");
+  card.classList.toggle("ok", tone === "ok");
+  $("systemLogHeadline").textContent = latest.message || "系统日志待命";
+  $("systemLogUpdated").textContent = latest.created_at ? fmtIsoTime(latest.created_at) : "自动刷新";
+
+  const categoryStats = stats.by_category || [];
+  $("systemLogStats").innerHTML = [
+    `<span><b>${fmtNumber(stats.total || 0)}</b> 总事件</span>`,
+    `<span class="${errors ? "bad" : ""}"><b>${fmtNumber(errors)}</b> 错误</span>`,
+    `<span class="${warnings ? "warn" : ""}"><b>${fmtNumber(warnings)}</b> 警告</span>`,
+    ...categoryStats.slice(0, 4).map((item) => `<span><b>${fmtNumber(item.count)}</b> ${escapeHtml(item.label || item.category)}</span>`),
+  ].join("");
+
+  const levelStats = stats.by_level || [];
+  const categories = [{ category: "all", label: "全部" }, ...(payload.categories || [])];
+  const levels = [{ level: "all", label: "全部等级" }, ...(payload.levels || [])];
+  const activeCategory = state.systemLogFilter?.category || "all";
+  const activeLevel = state.systemLogFilter?.level || "all";
+  if ($("systemLogSearch")) $("systemLogSearch").value = state.systemLogFilter?.query || "";
+  const categoryFilters = categories
+    .map((item) => {
+      const active = activeCategory === item.category;
+      const count = item.category === "all" ? stats.total : (categoryStats.find((stat) => stat.category === item.category)?.count || 0);
+      return `<button type="button" class="${active ? "active" : ""}" data-system-log-category="${escapeAttr(item.category)}">${escapeHtml(item.label)} <span>${fmtNumber(count)}</span></button>`;
+    })
+    .join("");
+  const levelFilters = levels
+    .map((item) => {
+      const active = activeLevel === item.level;
+      const count = item.level === "all" ? stats.total : (levelStats.find((stat) => stat.level === item.level)?.count || 0);
+      return `<button type="button" class="${active ? "active" : ""} ${eventTone(item.level)}" data-system-log-level="${escapeAttr(item.level)}">${escapeHtml(item.label)} <span>${fmtNumber(count)}</span></button>`;
+    })
+    .join("");
+  const topErrors = (stats.error_counts || []).slice(0, 3)
+    .map((item) => `<span class="system-log-hot">${escapeHtml(systemLogCategoryLabel(item.category))} · ${escapeHtml(item.message)} <b>${fmtNumber(item.count)}</b></span>`)
+    .join("");
+  $("systemLogFilters").innerHTML = `
+    <div class="system-log-filter-line">${categoryFilters}</div>
+    <div class="system-log-filter-line levels">${levelFilters}</div>
+    ${topErrors ? `<div class="system-log-hotline">${topErrors}</div>` : ""}
+  `;
+
+  $("systemLogList").innerHTML = events.length
+    ? events.slice(0, 80).map((event) => {
+        const rowTone = eventTone(event.level);
+        const meta = [
+          event.created_at ? fmtIsoTime(event.created_at) : "",
+          event.category_label || systemLogCategoryLabel(event.category),
+          event.chat_display_name ? `群 ${event.chat_display_name}` : "",
+          event.message_uid ? `消息 ${event.message_uid}` : "",
+        ].filter(Boolean).join(" · ");
+        const detail = event.error || event.source_text || "";
+        const detailJson = systemLogDetailText(event);
+        return `
+          <details class="system-log-row ${rowTone}">
+            <summary>
+            <i></i>
+            <div>
+              <strong>${escapeHtml(event.message || event.error || "系统事件")}</strong>
+              <span>${escapeHtml(meta)}</span>
+              ${detail ? `<em>${escapeHtml(detail)}</em>` : ""}
+            </div>
+            <b>${escapeHtml(event.level_label || event.level || "信息")}</b>
+            </summary>
+            <pre>${escapeHtml(detailJson)}</pre>
+          </details>
+        `;
+      }).join("")
+    : `<div class="empty-state">暂无系统日志</div>`;
+}
+
 function switchView(view) {
   state.view = pageMeta[view] ? view : "overview";
   document.body.dataset.view = state.view;
@@ -395,9 +493,11 @@ function switchView(view) {
   $("pageSubtitle").textContent = subtitle;
   if (state.view === "chat" && !state.chats.length) loadChats();
   if (state.view === "services") loadSuiteStatus();
+  if (state.view === "persona") loadStylePersonas().catch((error) => console.warn(error));
   if (state.view === "skills") loadSkills().catch((error) => console.warn(error));
   if (state.view === "database") loadDatabaseOverview().catch((error) => console.warn(error));
   if (state.view === "photos") loadPhotos().catch((error) => console.warn(error));
+  if (state.view === "logs") loadSystemLogs().catch((error) => console.warn(error));
   if (state.view === "overview") setTimeout(fitGraph, 0);
 }
 
@@ -412,19 +512,19 @@ function mergeRuntimeStatus(payload) {
     state.config.talk_modes = payload.config.talk_modes || state.config.talk_modes;
     state.config.talk_scoring = payload.config.talk_scoring || state.config.talk_scoring;
     state.config.reply_sender = payload.config.reply_sender || state.config.reply_sender;
+    state.config.chat_reply_settings = payload.config.chat_reply_settings || state.config.chat_reply_settings || {};
+    state.config.style_clone = payload.config.style_clone || state.config.style_clone;
+    state.config.style_personas = payload.config.style_personas || state.config.style_personas;
     if (!state.loginGuardDirty) state.config.login_guard = payload.config.login_guard || state.config.login_guard;
   }
   state.memory = payload.memory;
   if (payload.semantic_memory) state.semantic = payload.semantic_memory;
   state.semanticRuns = payload.semantic_runs || state.semanticRuns;
-  state.profileRebuild = payload.profile_rebuild || payload.semantic_memory?.profile_rebuild || state.profileRebuild;
   state.autoReply = payload.auto_reply || state.autoReply;
   state.loginGuard = payload.login_guard || state.loginGuard;
   renderAutoReplyStatus();
   renderLoginGuardStatus();
   renderMemoryChatSelects();
-  renderProfileRebuildState();
-  ensureProfileRebuildPolling();
 }
 
 async function setMemoryChat(username, options = {}) {
@@ -498,11 +598,26 @@ function renderProfiles() {
 function fillAgent() {
   const config = state.config;
   const agent = config.agent || {};
+  const style = config.style_clone || {};
+  const personas = config.style_personas || {};
   $("agentEnabled").checked = Boolean(agent.enabled);
   $("autoReplyEnabled").checked = Boolean(agent.auto_reply_enabled);
+  if ($("styleRewriteGlobalEnabled")) $("styleRewriteGlobalEnabled").checked = agent.style_rewrite_enabled !== false;
   if ($("agentAliases")) $("agentAliases").value = (agent.aliases || []).join("\n");
   $("personality").value = agent.personality || "";
   $("safetyPolicy").value = agent.safety_policy || "";
+  if ($("styleCloneEnabled")) $("styleCloneEnabled").checked = Boolean(style.enabled);
+  if ($("styleCloneRewriteEnabled")) $("styleCloneRewriteEnabled").checked = style.rewrite_enabled !== false;
+  if ($("styleCloneStrength")) $("styleCloneStrength").value = style.strength ?? 0.72;
+  if ($("styleCloneMaxChars")) $("styleCloneMaxChars").value = style.max_reply_chars ?? 180;
+  if ($("stylePersonaEnabled")) $("stylePersonaEnabled").checked = Boolean(personas.enabled);
+  if ($("stylePersonaRewriteEnabled")) $("stylePersonaRewriteEnabled").checked = personas.rewrite_enabled !== false;
+  if ($("stylePersonaAutoRefresh")) $("stylePersonaAutoRefresh").checked = personas.auto_refresh_enabled !== false;
+  if ($("stylePersonaShowEvidence")) $("stylePersonaShowEvidence").checked = Boolean(personas.show_evidence);
+  if ($("stylePersonaStrength")) $("stylePersonaStrength").value = personas.strength ?? 0.9;
+  if ($("stylePersonaMaxChars")) $("stylePersonaMaxChars").value = personas.max_reply_chars ?? 180;
+  if ($("stylePersonaMinMessages")) $("stylePersonaMinMessages").value = personas.min_text_messages ?? 80;
+  if ($("stylePersonaRefreshHours")) $("stylePersonaRefreshHours").value = personas.refresh_interval_hours ?? 12;
   const select = $("replyMode");
   select.innerHTML = "";
   for (const [key, mode] of Object.entries(config.talk_modes || {})) {
@@ -521,11 +636,382 @@ function syncAgentFromForm() {
     ...(state.config.agent || {}),
     enabled: $("agentEnabled").checked,
     auto_reply_enabled: $("autoReplyEnabled").checked,
+    style_rewrite_enabled: $("styleRewriteGlobalEnabled") ? $("styleRewriteGlobalEnabled").checked : true,
     reply_mode: $("replyMode").value,
     aliases: $("agentAliases") ? $("agentAliases").value.split(/\n|,/).map((item) => item.trim()).filter(Boolean) : state.config.agent?.aliases || [],
     personality: $("personality").value,
     safety_policy: $("safetyPolicy").value,
   };
+  if ($("styleCloneEnabled")) {
+    state.config.style_clone = {
+      ...(state.config.style_clone || {}),
+      enabled: $("styleCloneEnabled").checked,
+      rewrite_enabled: $("styleCloneRewriteEnabled") ? $("styleCloneRewriteEnabled").checked : true,
+      chat_username: state.config.style_clone?.chat_username || "18725461928@chatroom",
+      chat_display_name: state.config.style_clone?.chat_display_name || "PT站看片狂魔小群",
+      person_key: state.config.style_clone?.person_key || "saarjoye",
+      display_name: state.config.style_clone?.display_name || "污妖王",
+      strength: Number($("styleCloneStrength")?.value || 0.72),
+      max_reply_chars: Number($("styleCloneMaxChars")?.value || 180),
+      cache_hours: Number(state.config.style_clone?.cache_hours ?? 12),
+    };
+  }
+  if ($("stylePersonaEnabled")) {
+    state.config.style_personas = {
+      ...(state.config.style_personas || {}),
+      enabled: $("stylePersonaEnabled").checked,
+      rewrite_enabled: $("stylePersonaRewriteEnabled") ? $("stylePersonaRewriteEnabled").checked : true,
+      mode: "manual",
+      selected_by_chat: state.config.style_personas?.selected_by_chat || {},
+      auto_refresh_enabled: $("stylePersonaAutoRefresh") ? $("stylePersonaAutoRefresh").checked : true,
+      refresh_interval_hours: Number($("stylePersonaRefreshHours")?.value || 12),
+      min_text_messages: Number($("stylePersonaMinMessages")?.value || 80),
+      strength: Number($("stylePersonaStrength")?.value || 0.9),
+      max_reply_chars: Number($("stylePersonaMaxChars")?.value || 180),
+      show_evidence: $("stylePersonaShowEvidence") ? $("stylePersonaShowEvidence").checked : false,
+    };
+  }
+}
+
+function styleList(items, cls = "") {
+  const list = Array.isArray(items) ? items.filter(Boolean) : [];
+  if (!list.length) return `<span class="muted">暂无</span>`;
+  return `<div class="style-chip-row ${cls}">${list.map((item) => {
+    const text = typeof item === "string" ? item : item.text || "";
+    const count = typeof item === "object" && item?.count ? item.count : "";
+    return `<span><b>${escapeHtml(text)}</b>${count ? `<em>${fmtNumber(count)}</em>` : ""}</span>`;
+  }).join("")}</div>`;
+}
+
+function styleTokenCloud(items, cls = "") {
+  const list = Array.isArray(items) ? items.filter(Boolean) : [];
+  if (!list.length) return `<span class="muted">暂无</span>`;
+  return `<div class="style-token-cloud ${cls}">${list.map((item, index) => {
+    const text = typeof item === "string" ? item : item.text || "";
+    const count = typeof item === "object" && item?.count ? item.count : "";
+    const tier = index < 3 ? "hot" : index < 7 ? "warm" : "calm";
+    return `<span class="${tier}"><b>${escapeHtml(text)}</b>${count ? `<em>${fmtNumber(count)}</em>` : ""}</span>`;
+  }).join("")}</div>`;
+}
+
+function styleRules(items) {
+  const list = Array.isArray(items) ? items.filter(Boolean) : [];
+  if (!list.length) return `<p class="muted">暂无规则。</p>`;
+  return `<ol class="style-rule-list">${list.slice(0, 7).map((item, index) => `<li><i>${index + 1}</i><span>${escapeHtml(typeof item === "string" ? item : item.text || "")}</span></li>`).join("")}</ol>`;
+}
+
+function stylePersonaChatValue() {
+  return $("stylePersonaChat")?.value || state.memoryChat || state.selectedChat?.username || state.config?.style_clone?.chat_username || "";
+}
+
+function renderStylePersonaChatSelect() {
+  const select = $("stylePersonaChat");
+  if (!select) return;
+  const current = stylePersonaChatValue();
+  const chats = state.chats?.length ? state.chats : (state.memory?.chats || []);
+  const existing = new Set();
+  select.innerHTML = "";
+  for (const chat of chats) {
+    const username = chat.username || chat.chat_username;
+    if (!username || existing.has(username)) continue;
+    existing.add(username);
+    const option = document.createElement("option");
+    option.value = username;
+    option.textContent = `${chat.display_name || chat.chat_display_name || username} · ${fmtNumber(chat.message_count || chat.count || 0)}`;
+    select.appendChild(option);
+  }
+  if (current && !existing.has(current)) {
+    const option = document.createElement("option");
+    option.value = current;
+    option.textContent = state.stylePersonas?.chat_display_name || current;
+    select.appendChild(option);
+  }
+  select.value = current || select.options[0]?.value || "";
+}
+
+async function loadStyleCard(force = false) {
+  return loadStylePersonas(force);
+}
+
+async function loadStylePersonas(force = false) {
+  if (!state.config) return;
+  renderStylePersonaChatSelect();
+  const chat = stylePersonaChatValue();
+  const status = $("styleCloneStatus");
+  if (status) {
+    status.className = "style-clone-status loading";
+    status.innerHTML = `<span>${force ? "刷新中" : "加载中"}</span><strong>正在读取当前群 Top10 人格库</strong>`;
+  }
+  const params = new URLSearchParams();
+  if (chat) params.set("chat", chat);
+  const payload = await fetchJson(`/api/style-personas?${params.toString()}`);
+  state.stylePersonas = payload;
+  state.selectedStylePersonaKey = payload.selected_person_key || state.selectedStylePersonaKey || payload.top10?.[0]?.person_key || "";
+  state.styleCard = payload.cards?.[state.selectedStylePersonaKey] || null;
+  renderStylePersonas(payload);
+}
+
+function selectedStylePersona() {
+  const top10 = state.stylePersonas?.top10 || [];
+  return top10.find((item) => item.person_key === state.selectedStylePersonaKey) || top10[0] || null;
+}
+
+function renderStylePersonas(payload = state.stylePersonas || {}) {
+  renderStylePersonaChatSelect();
+  renderStylePersonaTopList(payload);
+  const selected = selectedStylePersona();
+  state.styleCard = selected ? (payload.cards || {})[selected.person_key] || null : null;
+  renderStyleCloneCard({ style_card: state.styleCard, selected_person: selected });
+}
+
+function renderStylePersonaTopList(payload = {}) {
+  const root = $("stylePersonaTopList");
+  if (!root) return;
+  const top10 = payload.top10 || [];
+  const status = $("styleCloneStatus");
+  const build = payload.build_state || {};
+  if (status) {
+    if (build.running) {
+      const pct = build.total ? Math.round((Number(build.done || 0) / Number(build.total || 1)) * 100) : 0;
+      status.className = "style-clone-status loading";
+      status.innerHTML = `<span>构建中</span><strong>${escapeHtml(build.current || "Top10 人格")} · ${fmtNumber(build.done || 0)} / ${fmtNumber(build.total || 0)}</strong><em>${pct}%</em>`;
+    } else {
+      const selected = top10.find((item) => item.person_key === payload.selected_person_key);
+      status.className = "style-clone-status";
+      status.innerHTML = `<span>${payload.settings?.enabled ? "已启用" : "未启用"}</span><strong>${escapeHtml(payload.chat_display_name || "当前群")} · ${selected ? `当前人格 ${selected.display_name}` : "未选择人格"}</strong><em>Top10 ${fmtNumber(top10.length)}</em>`;
+    }
+  }
+  if (!top10.length) {
+    root.innerHTML = `<div class="empty-state">当前群还没有可用 Top10 成员。</div>`;
+    return;
+  }
+  root.innerHTML = top10.map((person) => {
+    const active = person.person_key === state.selectedStylePersonaKey;
+    const enabled = person.person_key === payload.selected_person_key;
+    const avatar = person.avatar_url ? `<img src="${escapeAttr(person.avatar_url)}" alt="">` : escapeHtml(personInitial({ display_name: person.display_name }));
+    const quality = person.quality_score || {};
+    const sampleBad = person.sample_status !== "ok";
+    return `
+      <button type="button" class="style-persona-card ${active ? "active" : ""} ${enabled ? "enabled" : ""} ${sampleBad ? "weak" : ""}" data-style-person="${escapeAttr(person.person_key)}">
+        <span class="style-persona-rank">#${person.rank || "-"}</span>
+        <span class="style-persona-avatar">${avatar}</span>
+        <span class="style-persona-info">
+          <strong>${escapeHtml(person.display_name || person.person_key)}</strong>
+          <em>${escapeHtml(person.level || "D")} · ${fmtNumber(person.text_message_count || person.message_count || 0)} 样本</em>
+        </span>
+        <span class="style-persona-score">${person.has_card ? `${fmtNumber(quality.total || 0)}分` : "未构建"}</span>
+      </button>
+    `;
+  }).join("");
+}
+
+function renderStyleCloneCard(payload = {}) {
+  const root = $("styleCloneCard");
+  if (!root) return;
+  const card = state.styleCard || payload.style_card;
+  const selected = payload.selected_person || selectedStylePersona();
+  if (!selected && !card) {
+    root.innerHTML = `<div class="empty-state">先选择当前群 Top10 成员。</div>`;
+    return;
+  }
+  if (!card) {
+    const avatar = selected?.avatar_url ? `<img src="${escapeAttr(selected.avatar_url)}" alt="">` : escapeHtml(personInitial({ display_name: selected?.display_name || "" }));
+    root.innerHTML = `
+      <section class="style-hero-card placeholder">
+        <div class="style-avatar-wrap"><div class="style-avatar">${avatar}</div><span>${escapeHtml(selected?.level || "D")}</span></div>
+        <div class="style-hero-main">
+          <div class="style-hero-title">
+            <div><div class="style-kicker">人格档案 · 待构建</div><h4>${escapeHtml(selected?.display_name || "群友")}</h4></div>
+            <div class="style-meta-pills"><span><b>${fmtNumber(selected?.text_message_count || selected?.message_count || 0)}</b>样本</span><span><b>#${selected?.rank || "-"}</b>排行</span></div>
+          </div>
+          <p>还没有 LLM 深度人格卡。点击“批量构建 Top10”后会生成节奏、句式、场景指纹和证据原话。</p>
+        </div>
+      </section>
+    `;
+    return;
+  }
+  const detail = card.card || {};
+  const stats = card.stats || {};
+  const quality = card.quality_score || detail.quality_score || {};
+  const avatar = card.avatar_url ? `<img src="${escapeAttr(card.avatar_url)}" alt="">` : escapeHtml(personInitial({ display_name: card.display_name || selected?.display_name || "群友" }));
+  const phraseItems = (stats.short_phrases || detail.catchphrases || []).slice(0, 14);
+  const termItems = (stats.terms || []).slice(0, 14);
+  const quotes = (stats.representative_quotes || detail.examples || []).slice(0, 8);
+  const scenes = (detail.scene_profiles || []).slice(0, 6);
+  const patterns = (detail.signature_patterns || []).slice(0, 8);
+  const updatedLabel = fmtShortDateTime(card.updated_at);
+  root.innerHTML = `
+    <section class="style-hero-card">
+      <div class="style-avatar-wrap"><div class="style-avatar">${avatar}</div><span>${escapeHtml(selected?.level || "STYLE")}</span></div>
+      <div class="style-hero-main">
+        <div class="style-hero-title">
+          <div>
+            <div class="style-kicker">赛博人格档案 · ${escapeHtml(quality.label || "已装载")}</div>
+            <h4>${escapeHtml(card.display_name || selected?.display_name || "群友")}</h4>
+          </div>
+          <div class="style-meta-pills">
+            <span><b>${fmtNumber(stats.message_count || 0)}</b>样本</span>
+            <span><b>${escapeHtml(stats.avg_length || 0)}</b>均字</span>
+            <span><b>${fmtNumber(quality.total || 0)}</b>质量分</span>
+            <span><b>${escapeHtml(updatedLabel)}</b>更新</span>
+          </div>
+        </div>
+        <p>${escapeHtml(detail.summary || "正在从历史发言提炼说话方式。")}</p>
+        ${styleList(detail.tags || [], "glow")}
+      </div>
+    </section>
+    <div class="style-loadout">
+      <article class="style-module module-phrases"><h5><span>高频短句</span><em>Catchphrase</em></h5>${styleTokenCloud(phraseItems, "phrase")}</article>
+      <article class="style-module module-terms"><h5><span>高频词条</span><em>Keywords</em></h5>${styleTokenCloud(termItems, "term")}</article>
+      <article class="style-module module-rules"><h5><span>语气规则</span><em>Tone</em></h5>${styleRules(detail.tone_rules || [])}</article>
+      <article class="style-module module-rules"><h5><span>改写规则</span><em>Rewrite</em></h5>${styleRules(detail.rewrite_rules || [])}</article>
+      <article class="style-module module-rules"><h5><span>场景指纹</span><em>Scene</em></h5>${styleRules(scenes.map((item) => `${item.scene || "场景"}：${item.style || item.text || ""}`))}</article>
+      <article class="style-module module-rules"><h5><span>句式模板</span><em>Pattern</em></h5>${styleRules(patterns)}</article>
+    </div>
+    <article class="style-quotes">
+      <h5><span>代表发言检索</span><em>Evidence Clips</em></h5>
+      ${quotes.length ? quotes.map((item, index) => {
+        const text = typeof item === "string" ? item : item.text || "";
+        return `<blockquote><i>${String(index + 1).padStart(2, "0")}</i><div><span>${escapeHtml(item.time || item.scene || "")}</span>${escapeHtml(text)}</div></blockquote>`;
+      }).join("") : `<p class="muted">暂无代表发言。</p>`}
+    </article>
+  `;
+}
+
+async function rebuildStyleCard() {
+  return rebuildStylePersonas();
+}
+
+async function rebuildStylePersonas() {
+  const button = $("rebuildStylePersonasBtn");
+  const label = button?.textContent || "批量构建 Top10";
+  if (button) {
+    button.disabled = true;
+    button.textContent = "重建中";
+  }
+  try {
+    syncAgentFromForm();
+    const chat = stylePersonaChatValue();
+    const payload = await fetchJson("/api/style-personas/rebuild", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ chat_username: chat, mode: "top10", force: true }),
+    });
+    await loadStylePersonas(true);
+    const output = $("stylePersonaTestOutput");
+    if (output) {
+      const okCount = (payload.results || []).filter((item) => item.ok).length;
+      const failed = (payload.failures || []).map((item) => `${item.display_name || item.person_key}: ${item.error}`).join("\n");
+      output.textContent = `Top10 构建完成：成功 ${okCount}，失败 ${payload.failures?.length || 0}${failed ? `\n\n失败项：\n${failed}` : ""}`;
+    }
+  } catch (error) {
+    const status = $("styleCloneStatus");
+    if (status) {
+      status.className = "style-clone-status bad";
+      status.innerHTML = `<span>失败</span><strong>Top10 人格构建失败</strong><em>${escapeHtml(error.message)}</em>`;
+    }
+  } finally {
+    if (button) {
+      button.disabled = false;
+      button.textContent = label;
+    }
+  }
+}
+
+async function testStyleRewrite() {
+  return testStylePersonaRewrite();
+}
+
+async function selectStylePersona(personKey) {
+  if (!personKey) return;
+  state.selectedStylePersonaKey = personKey;
+  renderStylePersonas();
+  const selected = selectedStylePersona();
+  const payload = await fetchJson("/api/style-personas/select", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ chat_username: stylePersonaChatValue(), person_key: personKey, enabled: true }),
+  });
+  state.stylePersonas = payload;
+  state.selectedStylePersonaKey = payload.selected_person_key || personKey;
+  state.styleCard = payload.cards?.[state.selectedStylePersonaKey] || null;
+  state.config.style_personas = {
+    ...(state.config.style_personas || {}),
+    ...(payload.settings || {}),
+  };
+  renderStylePersonas(payload);
+  const output = $("stylePersonaTestOutput");
+  if (output && selected) output.textContent = `已切换当前群人格：${selected.display_name || personKey}`;
+}
+
+async function loadStylePersonaEvidence() {
+  const button = $("stylePersonaEvidenceBtn");
+  const output = $("stylePersonaTestOutput");
+  const label = button?.textContent || "检索原话";
+  if (button) {
+    button.disabled = true;
+    button.textContent = "检索中";
+  }
+  if (output) output.textContent = "正在检索这个人的历史原话...";
+  try {
+    const payload = await fetchJson("/api/style-personas/evidence", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        chat_username: stylePersonaChatValue(),
+        person_key: state.selectedStylePersonaKey,
+        message: $("stylePersonaMessageInput")?.value || "",
+        reply: $("stylePersonaReplyInput")?.value || "",
+        limit: 8,
+      }),
+    });
+    if (output) {
+      output.textContent = (payload.evidence || []).length
+        ? (payload.evidence || []).map((item, index) => `${index + 1}. [${item.scene || "场景"}｜${item.score || 0}分] ${item.text || ""}\n   ${item.reason || ""}`).join("\n\n")
+        : "没有检索到可用原话。";
+    }
+  } catch (error) {
+    if (output) output.textContent = `检索失败：${error.message}`;
+  } finally {
+    if (button) {
+      button.disabled = false;
+      button.textContent = label;
+    }
+  }
+}
+
+async function testStylePersonaRewrite() {
+  const button = $("testStylePersonaRewriteBtn");
+  const output = $("stylePersonaTestOutput");
+  const label = button?.textContent || "测试贴脸改写";
+  if (button) {
+    button.disabled = true;
+    button.textContent = "改写中";
+  }
+  if (output) output.textContent = "正在调用 LLM 改写...";
+  try {
+    syncAgentFromForm();
+    const payload = await fetchJson("/api/style-personas/test-rewrite", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        chat_username: stylePersonaChatValue(),
+        person_key: state.selectedStylePersonaKey,
+        message: $("stylePersonaMessageInput")?.value || "",
+        text: $("stylePersonaReplyInput")?.value || "",
+      }),
+    });
+    const result = payload.style_persona || {};
+    const evidence = (result.evidence || []).map((item, index) => `${index + 1}. ${item.text || ""}`).join("\n");
+    if (output) output.textContent = `原句：${payload.original}\n\n贴脸版：${payload.rewrite || ""}\n\n像真度：${result.style_score || 0} / 100\n说明：${result.style_notes || "无"}${result.overuse_warnings?.length ? `\n警告：${result.overuse_warnings.join("；")}` : ""}\n\n参考原话：\n${evidence || "无"}`;
+  } catch (error) {
+    if (output) output.textContent = `改写失败：${error.message}`;
+  } finally {
+    if (button) {
+      button.disabled = false;
+      button.textContent = label;
+    }
+  }
 }
 
 function renderModeCards() {
@@ -663,17 +1149,6 @@ function markTalkSettingsDirty() {
 function fillReplySenderForm() {
   const sender = state.config?.reply_sender || {};
   if (!$("replySenderEnabled")) return;
-  const active = document.activeElement;
-  if (
-    active &&
-    active !== document.body &&
-    (
-      active.closest?.(".auto-reply-grid") ||
-      active.closest?.(".reply-exclusion-panel")
-    )
-  ) {
-    return;
-  }
   $("replySenderEnabled").checked = Boolean(sender.enabled);
   if ($("replySenderPaused")) $("replySenderPaused").checked = Boolean(sender.maintenance_paused);
   $("replySenderMode").value = sender.mode || "draft_only";
@@ -684,10 +1159,6 @@ function fillReplySenderForm() {
   $("sendDelayMin").value = sender.send_delay_min_seconds ?? 1.2;
   $("sendDelayMax").value = sender.send_delay_max_seconds ?? 4.8;
   renderReplyAllowedChats();
-  renderReplyExcludedChatOptions();
-  loadExcludedMembersForSelectedChat().catch((error) => {
-    if ($("replyExcludedMembers")) $("replyExcludedMembers").innerHTML = `<div class="empty-state compact">成员加载失败：${escapeHtml(error.message)}</div>`;
-  });
 }
 
 function loginGuardPhaseInfo(phase, guard = {}) {
@@ -789,28 +1260,6 @@ function markLoginGuardDirty() {
   syncLoginGuardFromForm();
 }
 
-function loginGuardCheckSummary(payload) {
-  const guard = payload?.state || payload?.login_guard || state.loginGuard || {};
-  const info = loginGuardPhaseInfo(guard.phase, guard);
-  if (payload?.skipped) {
-    if (payload.reason === "disabled") return "检查完成：登录守护已关闭，没有执行检测。";
-    if (payload.reason === "no_sync_signal") return "检查完成：暂时没有同步信号，还不能判断微信是否掉线。";
-    return `检查完成：已跳过${payload.reason ? `（${payload.reason}）` : ""}。`;
-  }
-  if (payload?.online) return "检查完成：微信在线，不发送 Clawbot 通知。";
-  const notify = payload?.notify || {};
-  if (notify.ok) return "检查完成：疑似掉线，已尝试点击登录并发送 Clawbot 通知。";
-  if (notify.error) return `检查完成：${info.text}，但通知失败：${notify.error}`;
-  if (payload?.action?.ok) return "检查完成：疑似掉线，已点击登录，等待手机确认。";
-  return `检查完成：${info.text}。`;
-}
-
-function loginGuardNotifySummary(payload) {
-  const notify = payload?.notify || {};
-  if (notify.ok) return "测试通知已发送：请看绑定 Clawbot 的手机微信。";
-  return `测试通知失败：${notify.error || payload?.message || "请检查 Clawbot URL 和 token"}`;
-}
-
 function renderClawbotStatus() {
   const data = state.clawbot || {};
   if ($("clawbotContainerState")) {
@@ -841,9 +1290,7 @@ function renderClawbotStatus() {
   if ($("clawbotHint")) {
     $("clawbotHint").textContent = data.bot_count
       ? "已检测到登录账号。可以点击“应用到守护”，自动配置 Clawbot 通知。"
-      : data.auth_error
-        ? `授权文件读取异常：${data.auth_error}`
-        : "扫码授权后，请用该微信给“微信ClawBot”发一条消息激活 API。";
+      : "扫码授权后，请用该微信给“微信ClawBot”发一条消息激活 API。";
   }
 }
 
@@ -861,11 +1308,10 @@ async function clawbotAction(action, button) {
   }
   try {
     const endpoint = action === "start" ? "/api/clawbot/start" : action === "login" ? "/api/clawbot/login" : "/api/clawbot/apply";
-    const selectedBot = document.querySelector("[data-clawbot-bot].active")?.dataset?.clawbotBot || "";
     const payload = await fetchJson(endpoint, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ bot_id: selectedBot }),
+      body: JSON.stringify({}),
     });
     if (payload.clawbot) state.clawbot = payload.clawbot;
     if (payload.config) {
@@ -875,7 +1321,7 @@ async function clawbotAction(action, button) {
     }
     await refreshClawbotStatus();
     if (action === "login") {
-      let remaining = 18;
+      let remaining = 12;
       const timer = setInterval(() => {
         refreshClawbotStatus().catch(() => {});
         remaining -= 1;
@@ -908,7 +1354,7 @@ function renderReplyAllowedChats() {
 }
 
 function groupChatsForReplyConfig() {
-  return (state.chats || []).filter((chat) => String(chat.username || "").includes("@chatroom") || chat.is_group);
+  return groupChatsForReply();
 }
 
 function memberDisplayName(member) {
@@ -1104,6 +1550,135 @@ function renderExcludedSummary() {
   root.textContent = parts.length ? `全部已排除：${parts.join(" · ")}` : "未设置排除成员";
 }
 
+function groupChatsForReply() {
+  return (state.chats || []).filter((chat) => String(chat.username || "").includes("@chatroom") || chat.is_group);
+}
+
+function chatDisplayName(username) {
+  const chat = (state.chats || []).find((item) => item.username === username);
+  return chat?.display_name || username || "未选择群";
+}
+
+function globalMemeSettings() {
+  return state.config?.skills?.meme_sender || {};
+}
+
+function defaultChatReplySetting(chat = "") {
+  const mode = state.config?.agent?.reply_mode || "normal";
+  const threshold = Number(state.config?.talk_modes?.[mode]?.threshold ?? 50);
+  const sender = state.config?.reply_sender || {};
+  const meme = globalMemeSettings();
+  return {
+    enabled: true,
+    use_global: true,
+    reply_mode: mode,
+    threshold_override: threshold,
+    meme_auto_enabled: meme.auto_enabled !== false,
+    meme_probability: Number(meme.probability ?? 0),
+    switch_delay_min_seconds: Number(sender.switch_delay_min_seconds ?? 1),
+    switch_delay_max_seconds: Number(sender.switch_delay_max_seconds ?? 2.2),
+    send_delay_min_seconds: Number(sender.send_delay_min_seconds ?? 1.2),
+    send_delay_max_seconds: Number(sender.send_delay_max_seconds ?? 4.8),
+  };
+}
+
+function renderChatReplyModeOptions(targetMode = "") {
+  const select = $("chatReplyMode");
+  if (!select || !state.config) return;
+  const current = targetMode || state.config.agent?.reply_mode || "normal";
+  select.innerHTML = "";
+  for (const [key, mode] of Object.entries(state.config.talk_modes || {})) {
+    const option = document.createElement("option");
+    option.value = key;
+    option.textContent = `${mode.label || modeNames[key] || key} · 全局 ${mode.threshold}`;
+    select.appendChild(option);
+  }
+  select.value = state.config.talk_modes?.[current] ? current : (state.config.agent?.reply_mode || "normal");
+}
+
+function selectedChatReplySetting() {
+  const chat = $("chatReplySelect")?.value || state.selectedChatReplyChat || "";
+  const saved = state.config?.chat_reply_settings?.[chat];
+  return { ...defaultChatReplySetting(chat), ...(saved || {}) };
+}
+
+function fillChatReplyForm() {
+  const select = $("chatReplySelect");
+  if (!select || !state.config) return;
+  const chats = groupChatsForReply();
+  const previous = state.selectedChatReplyChat || select.value || state.memoryChat || state.selectedChat?.username || state.config.reply_sender?.allowed_chats?.[0] || chats[0]?.username || "";
+  select.innerHTML = chats.map((chat) => `<option value="${escapeAttr(chat.username)}">${escapeHtml(chat.display_name || chat.username)}</option>`).join("");
+  if (!select.innerHTML) select.innerHTML = `<option value="" disabled>等待同步群聊列表</option>`;
+  select.value = chats.some((chat) => chat.username === previous) ? previous : (chats[0]?.username || "");
+  state.selectedChatReplyChat = select.value || "";
+  const setting = selectedChatReplySetting();
+  renderChatReplyModeOptions(setting.reply_mode || state.config.agent?.reply_mode || "normal");
+  $("chatReplyEnabled").checked = setting.enabled !== false;
+  $("chatReplyUseGlobal").checked = setting.use_global !== false;
+  $("chatReplyMode").value = setting.reply_mode || state.config.agent?.reply_mode || "normal";
+  $("chatReplyThreshold").value = Number(setting.threshold_override ?? state.config.talk_modes?.[$("chatReplyMode").value]?.threshold ?? 50);
+  $("chatReplyMemeAuto").checked = setting.meme_auto_enabled !== false;
+  $("chatReplyMemeProbability").value = Math.round(Number(setting.meme_probability || 0) * 100);
+  $("chatReplySwitchDelayMin").value = setting.switch_delay_min_seconds ?? state.config.reply_sender?.switch_delay_min_seconds ?? 1;
+  $("chatReplySwitchDelayMax").value = setting.switch_delay_max_seconds ?? state.config.reply_sender?.switch_delay_max_seconds ?? 2.2;
+  $("chatReplySendDelayMin").value = setting.send_delay_min_seconds ?? state.config.reply_sender?.send_delay_min_seconds ?? 1.2;
+  $("chatReplySendDelayMax").value = setting.send_delay_max_seconds ?? state.config.reply_sender?.send_delay_max_seconds ?? 4.8;
+  updateChatReplyEffective();
+}
+
+function collectChatReplySettingFromForm() {
+  const mode = $("chatReplyMode")?.value || state.config?.agent?.reply_mode || "normal";
+  return {
+    enabled: $("chatReplyEnabled")?.checked !== false,
+    use_global: $("chatReplyUseGlobal")?.checked !== false,
+    reply_mode: mode,
+    threshold_override: Number($("chatReplyThreshold")?.value || state.config?.talk_modes?.[mode]?.threshold || 50),
+    meme_auto_enabled: $("chatReplyMemeAuto")?.checked !== false,
+    meme_probability: Math.max(0, Math.min(1, Number($("chatReplyMemeProbability")?.value || 0) / 100)),
+    switch_delay_min_seconds: Number($("chatReplySwitchDelayMin")?.value || 0),
+    switch_delay_max_seconds: Number($("chatReplySwitchDelayMax")?.value || 0),
+    send_delay_min_seconds: Number($("chatReplySendDelayMin")?.value || 0),
+    send_delay_max_seconds: Number($("chatReplySendDelayMax")?.value || 0),
+  };
+}
+
+function syncChatReplyFromForm() {
+  if (!$("chatReplySelect") || !state.config) return;
+  const chat = $("chatReplySelect").value || "";
+  if (!chat) return;
+  state.selectedChatReplyChat = chat;
+  state.config.chat_reply_settings = {
+    ...(state.config.chat_reply_settings || {}),
+    [chat]: collectChatReplySettingFromForm(),
+  };
+}
+
+function updateChatReplyEffective() {
+  if (!$("chatReplyEffective") || !state.config) return;
+  const chat = $("chatReplySelect")?.value || "";
+  const setting = collectChatReplySettingFromForm();
+  const globalMode = state.config.agent?.reply_mode || "normal";
+  const effectiveMode = setting.use_global ? globalMode : setting.reply_mode;
+  const globalThreshold = Number(state.config.talk_modes?.[globalMode]?.threshold ?? 50);
+  const effectiveThreshold = setting.use_global ? globalThreshold : Number(setting.threshold_override ?? globalThreshold);
+  const globalMeme = globalMemeSettings();
+  const memeProbability = setting.use_global ? Math.round(Number(globalMeme.probability || 0) * 100) : Math.round(Number(setting.meme_probability || 0) * 100);
+  const customInputs = [
+    "chatReplyMode", "chatReplyThreshold", "chatReplyMemeAuto", "chatReplyMemeProbability",
+    "chatReplySwitchDelayMin", "chatReplySwitchDelayMax", "chatReplySendDelayMin", "chatReplySendDelayMax",
+  ];
+  customInputs.forEach((id) => { if ($(id)) $(id).disabled = setting.use_global; });
+  $("chatReplySelect")?.parentElement?.parentElement?.classList.toggle("disabled-custom", setting.use_global);
+  $("chatReplyEffective").innerHTML = `
+    <strong>${escapeHtml(chatDisplayName(chat))}</strong>
+    · ${setting.use_global ? "沿用全局" : "自定义"}
+    · ${setting.enabled ? "允许普通接话" : "普通接话关闭"}
+    · 模式 ${escapeHtml(modeNames[effectiveMode] || effectiveMode)}
+    · 阈值 ${escapeHtml(effectiveThreshold)}
+    · 随机斗图 ${escapeHtml(memeProbability)}%
+  `;
+}
+
 function syncReplySenderFromForm() {
   if (!$("replySenderEnabled") || !state.config) return;
   const selected = Array.from($("replyAllowedChats").selectedOptions || [])
@@ -1150,6 +1725,7 @@ function configSaveSource(button) {
   if (id === "saveAutoReplyBtn") return "auto_reply";
   if (id === "savePersonaBtn") return "persona";
   if (id === "saveTalkBtn") return "talk";
+  if (id === "saveChatReplyBtn") return "chat_reply";
   if (id === "saveModelsBtn") return "models";
   if (id === "saveMemoryBtn") return "memory";
   if (id === "saveLoginGuardBtn") return "login_guard";
@@ -1303,8 +1879,6 @@ function renderLayers() {
   fillSemanticExtractForm();
   renderSemanticRuns();
   renderSemanticDetails();
-  fillProfileRebuildForm();
-  renderProfileRebuildState();
 }
 
 function syncLayersFromForm() {
@@ -1314,7 +1888,6 @@ function syncLayersFromForm() {
   }
   if (state.config.memory_layers?.fact_review) state.config.memory_layers.fact_review.enabled = true;
   syncSemanticExtractFromForm();
-  syncProfileRebuildFromForm();
 }
 
 function fillSemanticExtractForm() {
@@ -1328,18 +1901,6 @@ function fillSemanticExtractForm() {
   renderChatSelect("semanticChat", settings.chat_username || "", true);
 }
 
-function fillProfileRebuildForm() {
-  const settings = state.config?.profile_rebuild || {};
-  if (!$("profileRebuildEnabled")) return;
-  $("profileRebuildEnabled").checked = settings.enabled !== false;
-  $("profileRebuildInterval").value = settings.interval_seconds ?? 43200;
-  $("profileRebuildMaxPeople").value = settings.max_people_per_chat ?? 120;
-  $("profileRebuildMinMessages").value = settings.min_messages_per_person ?? 2;
-  if ($("profileRebuildUseLlm")) $("profileRebuildUseLlm").checked = settings.use_llm !== false;
-  if ($("profileRebuildLlmMinMessages")) $("profileRebuildLlmMinMessages").value = settings.llm_min_messages ?? 3;
-  renderChatSelect("profileRebuildChat", settings.chat_username || "", true);
-}
-
 function syncSemanticExtractFromForm() {
   if (!$("semanticEnabled") || !state.config) return;
   state.config.semantic_extract = {
@@ -1350,33 +1911,6 @@ function syncSemanticExtractFromForm() {
     limit: Number($("semanticLimit").value || 60),
     batch_size: Number($("semanticBatch").value || 5),
     chat_username: $("semanticChat").value || "",
-  };
-}
-
-function syncProfileRebuildFromForm() {
-  if (!state.config) return;
-  if ($("profileRebuildEnabled")) {
-    state.config.profile_rebuild = {
-      ...(state.config.profile_rebuild || {}),
-      enabled: $("profileRebuildEnabled").checked,
-      interval_seconds: Number($("profileRebuildInterval").value || 43200),
-      chat_username: $("profileRebuildChat").value || "",
-      max_people_per_chat: Number($("profileRebuildMaxPeople").value || 120),
-      min_messages_per_person: Number($("profileRebuildMinMessages").value || 2),
-      use_llm: $("profileRebuildUseLlm") ? $("profileRebuildUseLlm").checked : true,
-      llm_min_messages: Number($("profileRebuildLlmMinMessages")?.value || 3),
-    };
-    return;
-  }
-  state.config.profile_rebuild = {
-    ...(state.config.profile_rebuild || {}),
-    enabled: state.config.profile_rebuild?.enabled !== false,
-    interval_seconds: Number(state.config.profile_rebuild?.interval_seconds || 43200),
-    chat_username: state.config.profile_rebuild?.chat_username || "",
-    max_people_per_chat: Number(state.config.profile_rebuild?.max_people_per_chat || 120),
-    min_messages_per_person: Number(state.config.profile_rebuild?.min_messages_per_person || 2),
-    use_llm: state.config.profile_rebuild?.use_llm !== false,
-    llm_min_messages: Number(state.config.profile_rebuild?.llm_min_messages || 3),
   };
 }
 
@@ -1503,124 +2037,6 @@ function renderMemoryConsole() {
   renderMemoryStories(summaries, facts, people);
   renderMemoryTags(summaries, facts, people, edges);
   renderMemoryRelations(people, facts, edges, summaries);
-  renderProfileRebuildState();
-}
-
-function renderProfileRebuildState() {
-  const payload = state.profileRebuild || state.semantic?.profile_rebuild || {};
-  const rebuildState = payload.state || {};
-  const counts = rebuildState.last_counts || {};
-  const progress = rebuildState.progress || {};
-  const percent = clamp(Number(progress.percent ?? (rebuildState.running ? 3 : 100)), 0, 100);
-  const phaseLabels = {
-    queued: "排队准备画像",
-    starting: "启动画像扫描",
-    scanning: "扫描历史消息",
-    building: "正在捏人设标签",
-    llm_building: "AI 正在生成贴脸画像",
-    writing: "写入画像证据",
-    done_chat: "当前群已完成",
-    skipped: "当前群暂无可重建成员",
-    done: "画像已更新",
-    error: "画像重建异常",
-  };
-  const phaseText = phaseLabels[progress.phase] || (rebuildState.running ? "正在重建画像" : "画像待命");
-  const currentChat = progress.current_chat_display_name || progress.current_chat || "";
-  const currentPerson = progress.current_person_display_name || progress.current_person_key || "";
-  const progressMeta = rebuildState.running
-    ? [
-        currentChat ? `当前：${currentChat}` : "",
-        currentPerson ? `成员：${currentPerson}` : "",
-        progress.total_chats ? `群 ${fmtNumber(progress.current_chat_index || 0)} / ${fmtNumber(progress.total_chats)}` : "",
-        progress.people_total ? `成员 ${fmtNumber(progress.people_done || 0)} / ${fmtNumber(progress.people_total)}` : "",
-        `证据 ${fmtNumber(progress.claims || 0)}`,
-        `关系 ${fmtNumber(progress.relations || 0)}`,
-      ].filter(Boolean).join(" · ")
-    : (rebuildState.last_finished_at ? `上次完成：${rebuildState.last_finished_at}` : "点击手动更新画像可立即重建");
-  for (const id of ["profileRebuildState", "profileRebuildSettingsState"]) {
-    const statePill = $(id);
-    if (statePill) {
-      statePill.className = `pill ${rebuildState.running ? "warn" : rebuildState.ok === false ? "bad" : "ok"}`;
-      statePill.textContent = rebuildState.running ? "画像重建中" : rebuildState.ok === false ? "画像异常" : "画像正常";
-    }
-  }
-  const runs = payload.runs || [];
-  const latest = runs[0] || {};
-  const skipText = formatProfileRebuildSkipReason(rebuildState.last_skip_reason);
-  const status = [
-    rebuildState.running ? phaseText : "每 12 小时自动重建，也可手动更新",
-    rebuildState.last_finished_at ? `上次 ${rebuildState.last_finished_at}` : "",
-    skipText ? `状态 ${skipText}` : "",
-    rebuildState.last_error ? `错误 ${rebuildState.last_error}` : "",
-  ].filter(Boolean).join(" · ");
-  const html = `
-    <div class="profile-rebuild-copy">
-      <strong>${escapeHtml(status || "等待画像重建")}</strong>
-      <span>来源：当前群/全部群的历史消息、群昵称映射、互动关系和证据原文。</span>
-    </div>
-    <div class="profile-rebuild-progress" aria-label="画像重建进度">
-      <i style="width:${percent}%"></i>
-    </div>
-    <div class="profile-rebuild-progress-meta">
-      <span>${escapeHtml(phaseText)}</span>
-      <b>${escapeHtml(progressMeta)}</b>
-      <em>${Math.round(percent)}%</em>
-    </div>
-    <div class="profile-rebuild-kpis">
-      <span>人物 <b>${fmtNumber(counts.people ?? latest.people_count ?? 0)}</b></span>
-      <span>画像证据 <b>${fmtNumber(counts.claims ?? latest.claims_count ?? state.semantic?.totals?.profile_claims ?? 0)}</b></span>
-      <span>关系 <b>${fmtNumber(counts.relations ?? latest.relations_count ?? state.semantic?.totals?.person_relations ?? 0)}</b></span>
-      <span>消息 <b>${fmtNumber(counts.messages ?? latest.message_count ?? 0)}</b></span>
-    </div>
-  `;
-  ["profileRebuildPanel", "profileRebuildSettingsPanel"].forEach((id) => {
-    const root = $(id);
-    if (root) root.innerHTML = html;
-  });
-}
-
-function formatProfileRebuildSkipReason(reason) {
-  const text = String(reason || "").trim();
-  if (!text) return "";
-  const match = text.match(/^next_rebuild_in_(\d+)s$/);
-  if (match) return `下次自动更新约 ${fmtDuration(Number(match[1]) * 1000)} 后`;
-  if (text === "disabled") return "已关闭自动重建";
-  return text;
-}
-
-function profileRebuildRunning() {
-  const payload = state.profileRebuild || state.semantic?.profile_rebuild || {};
-  return Boolean(payload.state?.running);
-}
-
-async function refreshProfileRebuildState() {
-  const payload = await fetchJson("/api/memory/profile-rebuild-state?limit=8");
-  state.profileRebuild = payload;
-  renderProfileRebuildState();
-  return payload;
-}
-
-function ensureProfileRebuildPolling() {
-  if (state.profileRebuildPolling || !profileRebuildRunning()) return;
-  state.profileRebuildPolling = true;
-  (async () => {
-    try {
-      for (let index = 0; index < 720; index += 1) {
-        const payload = await refreshProfileRebuildState();
-        if (!payload.state?.running) {
-          await refreshFullStatus();
-          if (state.view === "memory") renderMemoryConsole();
-          break;
-        }
-        await new Promise((resolve) => setTimeout(resolve, 1500));
-      }
-    } catch (error) {
-      console.warn("profile rebuild polling failed", error);
-    } finally {
-      state.profileRebuildPolling = false;
-      if (profileRebuildRunning()) setTimeout(ensureProfileRebuildPolling, 3000);
-    }
-  })();
 }
 
 function activeMemoryItems(items) {
@@ -1676,23 +2092,21 @@ function renderMemoryPeople(people, facts, edges) {
       card.className = `memory-person-card ${id === state.memoryUi.selectedPersonId ? "active" : ""}`;
       card.dataset.personId = id;
       const initials = personInitial(person);
-	      const tags = personTags(person, facts, edges).slice(0, 5);
-	      const avatar = person.avatar_url || "";
-	      const claimCount = Array.isArray(person.claims) ? person.claims.length : Number(person.profile_claim_refs?.length || 0);
-	      const relationCount = Array.isArray(person.relations) ? person.relations.length : 0;
-	      card.innerHTML = `
-	        <div class="memory-person-top">
-	          <div class="memory-avatar ${memoryAvatarTone(index)}">${avatar ? `<img src="${escapeAttr(avatar)}" alt="">` : escapeHtml(initials)}</div>
-	          <div>
-	            <strong>${escapeHtml(person.display_name || person.person_key || "未知成员")}</strong>
-	            <span>${escapeHtml(person.person_key || "群成员")}</span>
-	          </div>
-	          <em>${formatConfidence(person.confidence)}</em>
-	        </div>
-	        <p>${escapeHtml(personSummary(person))}</p>
-	        ${renderMemoryTagsInline(tags, "person")}
-	        <div class="memory-person-foot"><span>${fmtNumber(person.message_count || person.derived?.message_count || 0)} 发言 · ${fmtNumber(claimCount)} 证据</span><span>${fmtNumber(relationCount)} 关系</span></div>
-	      `;
+      const tags = personTags(person, facts, edges).slice(0, 5);
+      const avatar = person.avatar_url || "";
+      card.innerHTML = `
+        <div class="memory-person-top">
+          <div class="memory-avatar ${memoryAvatarTone(index)}">${avatar ? `<img src="${escapeAttr(avatar)}" alt="">` : escapeHtml(initials)}</div>
+          <div>
+            <strong>${escapeHtml(person.display_name || person.person_key || "未知成员")}</strong>
+            <span>${escapeHtml(person.person_key || "群成员")}</span>
+          </div>
+          <em>${formatConfidence(person.confidence)}</em>
+        </div>
+        <p>${escapeHtml(personSummary(person))}</p>
+        ${renderMemoryTagsInline(tags, "person")}
+        <div class="memory-person-foot"><span>${fmtNumber(person.message_count || person.derived?.message_count || 0)} 条发言</span><span>${fmtTime(person.latest_time)}</span></div>
+      `;
       card.addEventListener("click", () => {
         state.memoryUi.selectedPersonId = id;
         renderMemoryPeople(people, facts, edges);
@@ -1712,8 +2126,6 @@ function memoryPersonSearchText(person) {
     formatObjectValue(person.traits),
     ...(person.storyline || []),
     ...(person.recent_snippets || []),
-    ...(person.claims || []).map((claim) => `${claim.claim_type || ""} ${claim.label || ""} ${claim.value || ""}`),
-    ...(person.relations || []).map((relation) => `${relation.source_display_name || ""} ${relation.relation || ""} ${relation.target_display_name || relation.target_key || ""}`),
   ].filter(Boolean).join(" ");
 }
 
@@ -1727,11 +2139,6 @@ function memoryAvatarTone(index) {
 }
 
 function personSummary(person) {
-  const priority = ["llm_profile", "llm_style", "llm_catchphrase", "catchphrase", "signature", "quote", "style", "topic", "activity"];
-  const primaryClaim = priority
-    .map((type) => (person.claims || []).find((claim) => claim.claim_type === type))
-    .find(Boolean);
-  if (primaryClaim) return `${primaryClaim.label || "画像"}：${primaryClaim.value || primaryClaim.label}`;
   const story = (person.storyline || []).find(Boolean);
   if (story) return story;
   const traits = formatObjectValue(person.traits || {});
@@ -1745,58 +2152,14 @@ function personTags(person, facts, edges) {
   return personRichTags(person, facts, edges).map((item) => item.label);
 }
 
-const genericProfileTags = new Set([
-  "PT雷达兵",
-  "一句话验货员",
-  "实测催更官",
-  "低频冒泡雷达",
-  "机器人饲养员",
-  "群聊点火器",
-  "技术党",
-  "气氛组",
-  "吃瓜群众",
-  "群聊发动机",
-  "核心活跃",
-  "高频参与",
-  "稳定出现",
-  "推断画像",
-  "长期画像",
-  "event",
-]);
-
 function personRichTags(person, facts = [], edges = []) {
   const tags = [];
   const add = (label, tone = "topic", weight = 1) => {
-    const text = String(label || "").replace(/^(AI标签|标签|关注点|互动建议|AI证据)[:：]\s*/, "").trim();
+    const text = String(label || "").trim();
     if (!text) return;
-    if (genericProfileTags.has(text)) return;
-    if (text.length > 24) return;
     tags.push({ label: text, tone, weight });
   };
-  const tagClaims = [];
-  const otherClaims = [];
-  for (const claim of person.claims || []) {
-    if (claim.claim_type === "llm_tag") tagClaims.push(claim);
-    else otherClaims.push(claim);
-  }
-  tagClaims.slice(0, 8).forEach((claim) => add(claim.value || claim.label, "rose", 5));
-  otherClaims.forEach((claim) => {
-    const tone = claim.claim_type === "llm_interest"
-      ? "fact"
-      : claim.claim_type === "llm_style"
-        ? "violet"
-        : claim.claim_type === "llm_catchphrase" || claim.claim_type === "catchphrase" || claim.claim_type === "signature"
-          ? "amber"
-          : claim.claim_type === "topic"
-            ? "fact"
-            : claim.claim_type === "style"
-              ? "trait"
-              : claim.claim_type === "activity"
-                ? "confidence"
-                : "";
-    if (!tone) return;
-    add(claim.value || claim.label, tone, Math.min(4, 2 + Math.round(Number(claim.confidence || 0) * 2)));
-  });
+  for (const key of Object.keys(person.preferences || {})) tags.push(key);
   for (const key of Object.keys(person.preferences || {})) add(key, "preference", 3);
   const traits = person.traits || {};
   if (Array.isArray(traits["性格倾向"])) traits["性格倾向"].slice(0, 4).forEach((item) => add(item, "trait", 3));
@@ -1849,14 +2212,12 @@ function renderMemoryPersonDetail(person, facts, edges) {
     const name = person.display_name || person.person_key || "";
     return name && text.includes(name);
   }).slice(0, 6);
-	  const relatedEdges = edges.filter((edge) => {
-	    const text = `${edge.source_node} ${edge.relation} ${edge.target_node}`;
-	    const name = person.display_name || person.person_key || "";
-	    return name && text.includes(name);
-	  }).slice(0, 6);
-	  const claims = person.claims || [];
-	  const relations = person.relations || [];
-	  const richTags = personRichTags(person, facts, edges);
+  const relatedEdges = edges.filter((edge) => {
+    const text = `${edge.source_node} ${edge.relation} ${edge.target_node}`;
+    const name = person.display_name || person.person_key || "";
+    return name && text.includes(name);
+  }).slice(0, 6);
+  const richTags = personRichTags(person, facts, edges);
   const editableControls = person.inferred
     ? `<div class="memory-inferred-note">这是根据聊天片段生成的推断画像；自动抽取生成正式人物画像后，可以在这里编辑保存。</div>`
     : `
@@ -1874,52 +2235,22 @@ function renderMemoryPersonDetail(person, facts, edges) {
         <p>${escapeHtml(person.person_key || "群成员")} · ${fmtNumber(person.message_count || person.derived?.message_count || 0)} 条相关发言</p>
       </div>
     </section>
-	    ${memoryDetailSection("画像标签", renderMemoryTagObjects(richTags))}
-	    ${memoryDetailSection("证据驱动画像", renderProfileClaims(claims))}
-	    ${memoryDetailSection("核心画像", `<p>${escapeHtml(personSummary(person))}</p>`)}
-	    ${memoryDetailSection("属性", memoryKvGrid([
-	      ["最近活跃", fmtTime(person.latest_time) || "未知"],
-	      ["画像来源", claims.length ? "全历史证据重建" : person.inferred ? "聊天片段推断" : "LLM 长期画像"],
-	      ["证据结论", `${fmtNumber(claims.length)} 条`],
-	      ["人物关系", `${fmtNumber(relations.length)} 条`],
-	      ["更新时间", person.updated_at || "--"],
-	      ["状态", person.status || "active"],
-	    ]))}
+    ${memoryDetailSection("画像标签", renderMemoryTagObjects(richTags))}
+    ${memoryDetailSection("核心画像", `<p>${escapeHtml(personSummary(person))}</p>`)}
+    ${memoryDetailSection("属性", memoryKvGrid([
+      ["最近活跃", fmtTime(person.latest_time) || "未知"],
+      ["画像来源", person.inferred ? "聊天片段推断" : "LLM 长期画像"],
+      ["更新时间", person.updated_at || "--"],
+      ["状态", person.status || "active"],
+    ]))}
     ${memoryDetailSection("性格归纳", renderMemoryObject(person.traits, "trait"))}
     ${memoryDetailSection("偏好", renderMemoryObject(person.preferences, "preference"))}
     ${memoryDetailSection("故事线", renderMemoryTimeline(person.storyline || []))}
     ${memoryDetailSection("最近证据片段", renderMemoryQuotes(person.recent_snippets || person.evidence || []))}
     ${memoryDetailSection("关联事实", relatedFacts.length ? relatedFacts.map((fact) => `<div class="memory-mini-fact"><strong>${escapeHtml(fact.subject)}</strong><span>${escapeHtml(`${fact.predicate} ${fact.object}`)}</span></div>`).join("") : `<p class="muted">暂无直接关联事实。</p>`)}
-	    ${memoryDetailSection("人物关系", renderPersonRelations(relations) || (relatedEdges.length ? relatedEdges.map((edge) => `<div class="memory-mini-fact"><strong>${escapeHtml(nodeLabel(edge.source_node))}</strong><span>${escapeHtml(`${edge.relation} -> ${nodeLabel(edge.target_node)}`)}</span></div>`).join("") : `<p class="muted">暂无直接关系边。</p>`))}
-	    ${editableControls}
-	  `;
-	}
-
-function renderProfileClaims(claims) {
-  if (!Array.isArray(claims) || !claims.length) return `<p class="muted">暂无全历史证据画像，等待 12 小时重建或点击“重建画像”。</p>`;
-  return `<div class="profile-claim-list">${claims.slice(0, 12).map((claim) => {
-    const quotes = (claim.source_quotes || []).filter((item) => item && (item.text || item.sender));
-    return `
-      <article class="profile-claim ${escapeAttr(claim.claim_type || "claim")}">
-        <div class="profile-claim-head">
-          <strong>${escapeHtml(claim.label || claim.claim_type || "画像结论")}</strong>
-          <span>${escapeHtml(claim.claim_type || "claim")} · ${formatConfidence(claim.confidence)} · 支持 ${fmtNumber(claim.support_count || 0)}</span>
-        </div>
-        <p>${escapeHtml(claim.value || claim.label || "")}</p>
-        ${quotes.length ? `<div class="profile-claim-quotes">${quotes.slice(0, 3).map((quote) => `<blockquote><b>${escapeHtml(quote.sender || claim.display_name || "群友")}</b><span>${escapeHtml(quote.text || "")}</span></blockquote>`).join("")}</div>` : ""}
-      </article>
-    `;
-  }).join("")}</div>`;
-}
-
-function renderPersonRelations(relations) {
-  if (!Array.isArray(relations) || !relations.length) return "";
-  return `<div class="person-relation-list">${relations.slice(0, 12).map((relation) => `
-    <article class="person-relation-card ${escapeAttr(relation.target_kind || "person")}">
-      <strong>${escapeHtml(relation.source_display_name || relation.source_person_key || "成员")} ${escapeHtml(relation.relation || "关联")} ${escapeHtml(relation.target_display_name || relation.target_key || "对象")}</strong>
-      <span>${escapeHtml(relation.target_kind || "person")} · ${formatConfidence(relation.confidence)} · 支持 ${fmtNumber(relation.support_count || 0)}</span>
-    </article>
-  `).join("")}</div>`;
+    ${memoryDetailSection("关系", relatedEdges.length ? relatedEdges.map((edge) => `<div class="memory-mini-fact"><strong>${escapeHtml(nodeLabel(edge.source_node))}</strong><span>${escapeHtml(`${edge.relation} -> ${nodeLabel(edge.target_node)}`)}</span></div>`).join("") : `<p class="muted">暂无直接关系边。</p>`)}
+    ${editableControls}
+  `;
 }
 
 function renderMemoryFacts(facts) {
@@ -1998,7 +2329,7 @@ function renderFactAutoStatus(facts) {
     </div>
     <div class="auto-kpis">
       <span>最近新增事实 <b>${fmtNumber(lastCounts.facts || latestRun.facts_count || 0)}</b></span>
-      <span>本地兜底 <b>${fmtNumber(lastCounts.local_facts || latestRun.details?.local_people_refresh?.local_facts || 0)}</b></span>
+      <span>本地规则入库 <b>${fmtNumber(lastCounts.local_facts || latestRun.details?.local_people_refresh?.local_facts || 0)}</b></span>
     </div>
   `;
 }
@@ -2141,22 +2472,14 @@ function renderMemoryTags(summaries, facts, people, edges) {
 function renderMemoryRelations(people, facts, edges, summaries) {
   const focusRoot = $("memoryFocusList");
   if (!focusRoot) return;
-  const relationGraph = state.semantic?.relationship_graph || {};
-  const focusNodes = relationGraph.focus_nodes || [];
   const focuses = [
-    ...focusNodes.map((node, index) => {
-      const person = people.find((item) => (item.person_key || item.username) === node.person_key) || node;
-      return {
-      id: `person:${node.person_key || memoryItemId(person, String(index))}`,
+    ...people.slice(0, 12).map((person, index) => ({
+      id: `person:${memoryItemId(person, String(index))}`,
       label: person.display_name || person.person_key || "群成员",
-      sub: `${fmtNumber(node.message_count || person.message_count || person.derived?.message_count || 0)} 发言 · ${fmtNumber(node.claim_count || person.claims?.length || 0)} 证据`,
+      sub: `${fmtNumber(person.message_count || person.derived?.message_count || 0)} 条发言`,
       type: "person",
       source: person,
-      avatar_url: node.avatar_url || person.avatar_url || "",
-      claim_count: node.claim_count || 0,
-      relation_count: node.relation_count || 0,
-    };
-    }),
+    })),
     ...summaries.slice(0, 3).map((summary) => ({
       id: `summary:${summary.chat_username || summary.chat_display_name}`,
       label: summary.chat_display_name || "群摘要",
@@ -2172,11 +2495,11 @@ function renderMemoryRelations(people, facts, edges, summaries) {
   if (!focuses.length) {
     renderEmpty(focusRoot, "暂无可聚焦对象");
   } else {
-	    focuses.forEach((focus, index) => {
-	      const item = document.createElement("button");
-	      item.type = "button";
-	      item.className = `memory-focus-item ${focus.id === state.memoryUi.selectedFocusId ? "active" : ""}`;
-	      item.innerHTML = `<div class="memory-avatar ${memoryAvatarTone(index)}">${focus.avatar_url ? `<img src="${escapeAttr(focus.avatar_url)}" alt="">` : escapeHtml(String(focus.label).slice(0, 1))}</div><div><strong>${escapeHtml(focus.label)}</strong><span>${escapeHtml(focus.sub)}</span></div>`;
+    focuses.forEach((focus, index) => {
+      const item = document.createElement("button");
+      item.type = "button";
+      item.className = `memory-focus-item ${focus.id === state.memoryUi.selectedFocusId ? "active" : ""}`;
+      item.innerHTML = `<div class="memory-avatar ${memoryAvatarTone(index)}">${escapeHtml(String(focus.label).slice(0, 1))}</div><div><strong>${escapeHtml(focus.label)}</strong><span>${escapeHtml(focus.sub)}</span></div>`;
       item.addEventListener("click", () => {
         state.memoryUi.selectedFocusId = focus.id;
         renderMemoryRelations(people, facts, edges, summaries);
@@ -2198,115 +2521,64 @@ function renderMemoryRelationCanvas(focus, people, facts, edges, summaries) {
     return;
   }
   const label = focus.label;
-  const source = focus.source || {};
-  const focusPersonKey = source.person_key || source.username || String(focus.id || "").replace(/^person:/, "");
-  const claims = source.claims || [];
-  const relations = source.relations || [];
-  const topClaims = claims.slice(0, 6);
-  const evidenceQuotes = [];
-  for (const claim of claims) {
-    for (const quote of claim.source_quotes || []) {
-      if (quote?.text) evidenceQuotes.push({ ...quote, claim: claim.label || claim.claim_type || "画像证据" });
-      if (evidenceQuotes.length >= 6) break;
-    }
-    if (evidenceQuotes.length >= 6) break;
-  }
-  const relatedFacts = facts.filter((fact) => {
-    const text = `${fact.subject} ${fact.object} ${fact.predicate}`;
-    return [label, focusPersonKey].some((key) => key && text.includes(key));
-  }).slice(0, 8);
-  const peopleGroup = uniqueRelationItems(relations
-    .filter((relation) => relation.target_kind === "person" || relation.source_person_key !== focusPersonKey)
-    .map((relation) => {
-      const otherKey = relation.source_person_key === focusPersonKey ? relation.target_key : relation.source_person_key;
-      const otherName = relation.source_person_key === focusPersonKey ? relation.target_display_name : relation.source_display_name;
-      const person = people.find((item) => (item.person_key || item.username) === otherKey);
-      return {
-        title: otherName || person?.display_name || otherKey || "成员",
-        sub: `${relation.relation || "关联"} · 支持 ${fmtNumber(relation.support_count || 0)}`,
-        quote: relation.source_quotes?.[0]?.text || "",
-        tone: "person",
-      };
-    })).slice(0, 8);
-  const topicGroup = uniqueRelationItems(relations
-    .filter((relation) => relation.target_kind === "topic")
-    .map((relation) => ({
-      title: relation.target_display_name || relation.target_key || "话题",
-      sub: `${relation.relation || "常聊话题"} · 支持 ${fmtNumber(relation.support_count || 0)}`,
-      quote: relation.source_quotes?.[0]?.text || "",
-      tone: "topic",
-    }))).slice(0, 8);
-  const claimGroup = claims.slice(0, 10).map((claim) => ({
-    title: claim.label || claim.claim_type || "画像",
-    sub: `${claim.value || claim.label || ""} · ${formatConfidence(claim.confidence)} · ${fmtNumber(claim.support_count || 0)} 证据`,
-    quote: claim.source_quotes?.[0]?.text || "",
-    tone: claim.claim_type === "topic" ? "topic" : "edge",
-  }));
+  const relatedFacts = facts.filter((fact) => `${fact.subject} ${fact.object} ${fact.predicate}`.includes(label)).slice(0, 5);
+  const relatedEdges = edges.filter((edge) => `${edge.source_node} ${edge.target_node} ${edge.relation}`.includes(label)).slice(0, 8);
+  const relatedPeople = people.filter((person) => {
+    const name = person.display_name || person.person_key || "";
+    return name && name !== label && relatedEdges.some((edge) => `${edge.source_node} ${edge.target_node}`.includes(name));
+  }).slice(0, 5);
+  const fallbackPeople = people.filter((person) => (person.display_name || person.person_key) !== label).slice(0, Math.max(0, 5 - relatedPeople.length));
+  const peopleGroup = uniqueRelationItems([...relatedPeople, ...fallbackPeople].map((person) => ({
+    title: person.display_name || person.person_key || "成员",
+    sub: `${fmtNumber(person.message_count || person.derived?.message_count || 0)} 条发言`,
+    tone: "person",
+  }))).slice(0, 5);
   const factGroup = relatedFacts.map((fact) => ({
     title: fact.subject || "事实",
     sub: `${fact.predicate || fact.category || "事实"} · ${formatConfidence(fact.confidence)}`,
     tone: factTone(fact.category),
   }));
+  const relationGroup = relatedEdges.map((edge) => ({
+    title: edge.relation || "关系",
+    sub: `${nodeLabel(edge.source_node)} -> ${nodeLabel(edge.target_node)}`,
+    tone: "edge",
+  }));
+  const topics = summaries.flatMap((summary) => summary.topics || []).slice(0, 5);
+  const topicGroup = topics.map((topic) => ({ title: topic, sub: "群主题", tone: "topic" }));
   const groups = [
-    { title: "互动成员", tone: "person", items: peopleGroup },
-    { title: "证据画像", tone: "edge", items: claimGroup },
-    { title: "常聊话题", tone: "topic", items: topicGroup },
-    { title: "关联事实", tone: "fact", items: factGroup },
+    { title: "相关成员", tone: "person", items: peopleGroup },
+    { title: "关系边", tone: "edge", items: relationGroup },
+    { title: "事实证据", tone: "fact", items: factGroup },
+    { title: "群主题", tone: "topic", items: topicGroup },
   ];
   const nodeCount = groups.reduce((sum, group) => sum + group.items.length, 0);
   canvas.innerHTML = `
-    <div class="relation-report">
-      <section class="relation-report-hero">
-        <div class="memory-avatar ${memoryAvatarTone(0)}">${focus.avatar_url ? `<img src="${escapeAttr(focus.avatar_url)}" alt="">` : escapeHtml(String(label || "?").slice(0, 1))}</div>
-        <div>
-          <span>${escapeHtml(focus.type === "person" ? "人物关系报告" : "群摘要关系报告")}</span>
-          <strong>${escapeHtml(label)}</strong>
-          <small>${escapeHtml(focus.sub || "聚焦对象")} · 可读关系 ${fmtNumber(nodeCount)}</small>
-        </div>
-      </section>
-      <section class="relation-profile-strip">
-        ${topClaims.length ? topClaims.map((claim) => `
-          <article class="relation-profile-chip ${escapeAttr(claim.claim_type || "claim")}">
-            <span>${escapeHtml(claim.label || claim.claim_type || "画像")}</span>
-            <strong>${escapeHtml(claim.value || claim.label || "")}</strong>
-            <small>${formatConfidence(claim.confidence)} · ${fmtNumber(claim.support_count || 0)} 证据</small>
-          </article>
-        `).join("") : `<p class="muted">暂无画像结论，点击人物页“重建画像”后会按全历史消息生成。</p>`}
+    <div class="relation-board">
+      <section class="relation-core">
+        <span>${escapeHtml(focus.type === "person" ? "人物" : "摘要")}</span>
+        <strong>${escapeHtml(label)}</strong>
+        <small>${escapeHtml(focus.sub || "聚焦对象")}</small>
       </section>
       ${groups.map((group) => `
-        <section class="relation-report-section ${escapeAttr(group.tone)}">
+        <section class="relation-column ${escapeAttr(group.tone)}">
           <h4>${escapeHtml(group.title)} <span>${fmtNumber(group.items.length)}</span></h4>
           <div>
             ${group.items.length ? group.items.map((item) => `
-              <article class="relation-report-item ${escapeAttr(item.tone)}">
-                <div>
-                  <strong>${escapeHtml(item.title)}</strong>
-                  <span>${escapeHtml(item.sub || "")}</span>
-                </div>
-                ${item.quote ? `<blockquote>${escapeHtml(item.quote)}</blockquote>` : ""}
+              <article class="relation-item ${escapeAttr(item.tone)}">
+                <strong>${escapeHtml(item.title)}</strong>
+                <span>${escapeHtml(item.sub || "")}</span>
               </article>
             `).join("") : `<p class="muted">暂无直接关联</p>`}
           </div>
         </section>
       `).join("")}
-      <section class="relation-report-section evidence">
-        <h4>代表证据 <span>${fmtNumber(evidenceQuotes.length)}</span></h4>
-        <div>
-          ${evidenceQuotes.length ? evidenceQuotes.map((quote) => `
-            <article class="relation-report-item evidence">
-              <div><strong>${escapeHtml(quote.claim || "证据")}</strong><span>${escapeHtml(`${quote.sender || label} · ${quote.time ? fmtTime(quote.time) : ""}`)}</span></div>
-              <blockquote>${escapeHtml(quote.text || "")}</blockquote>
-            </article>
-          `).join("") : `<p class="muted">暂无可展示原文证据。</p>`}
-        </div>
-      </section>
     </div>
   `;
   detail.innerHTML = `
-    ${memoryDetailSection("核心对象", `<p>${escapeHtml(focus.label)} 当前关联 ${fmtNumber(nodeCount)} 个可读节点。这里按“互动成员、证据画像、常聊话题、关联事实”分区展示，每条关系都带支持次数。</p>`)}
+    ${memoryDetailSection("核心对象", `<p>${escapeHtml(focus.label)} 当前关联 ${fmtNumber(nodeCount)} 个可读节点。新版关系视图按“成员、关系、事实、主题”分区展示，不再用难读的散点图。</p>`)}
     ${memoryDetailSection("关联事实", relatedFacts.length ? relatedFacts.map((fact) => `<div class="memory-mini-fact"><strong>${escapeHtml(fact.subject)}</strong><span>${escapeHtml(`${fact.predicate} ${fact.object}`)}</span></div>`).join("") : `<p class="muted">暂无直接事实。</p>`)}
-    ${memoryDetailSection("人物关系", renderPersonRelations(relations) || `<p class="muted">暂无直接关系边。</p>`)}
-    ${memoryDetailSection("画像证据", renderProfileClaims(claims))}
+    ${memoryDetailSection("关系边", relatedEdges.length ? relatedEdges.map((edge) => `<div class="memory-mini-fact"><strong>${escapeHtml(nodeLabel(edge.source_node))}</strong><span>${escapeHtml(`${edge.relation} -> ${nodeLabel(edge.target_node)}`)}</span></div>`).join("") : `<p class="muted">暂无直接关系边。</p>`)}
+    ${memoryDetailSection("主题", renderMemoryTagSpans(topics, "topic"))}
   `;
 }
 
@@ -2453,15 +2725,14 @@ function renderDatabaseConsole() {
   const data = state.database || {};
   renderMemoryChatSelects();
   setText("databaseScopeName", data.chat_display_name || activeMemoryChat()?.display_name || state.memoryChat || "--");
-  setText("databaseTotalSize", data.core_database_size || data.total_size || formatSize(data.core_database_bytes ?? data.total_bytes));
-  setText("databaseRuntimeSize", data.runtime_total_size || formatSize(data.runtime_total_bytes));
+  setText("databaseTotalSize", data.total_size || formatSize(data.total_bytes));
   const dbGrid = $("databaseDbGrid");
   if (dbGrid) {
     dbGrid.innerHTML = (data.databases || []).map((db) => `
       <div class="db-card">
         <div><strong>${db.type === "memory" ? "原始微信记忆库" : "AI 派生记忆库"}</strong><span>${escapeHtml(db.path || "")}</span></div>
         <b>${escapeHtml(db.size || formatSize(db.bytes))}</b>
-        <small>文件大小实时计算 · 当前群估算 ${escapeHtml(db.scoped_estimated_size || formatSize(db.scoped_estimated_bytes))}</small>
+        <small>当前群估算 ${escapeHtml(db.scoped_estimated_size || formatSize(db.scoped_estimated_bytes))}</small>
       </div>
     `).join("") || `<div class="empty">等待数据库信息</div>`;
   }
@@ -2475,7 +2746,7 @@ function renderDatabaseConsole() {
           <small>${escapeHtml(item.table)} · ${item.database === "memory" ? "原始库" : "AI库"}</small>
         </span>
         <em>${fmtNumber(item.scoped_rows)} / ${fmtNumber(item.total_rows)}</em>
-        <b title="当前群估算容量"><small>估算</small>${formatSize(item.estimated_bytes)}</b>
+        <b>${formatSize(item.estimated_bytes)}</b>
       </label>
     `).join("") || `<div class="empty">暂无模块</div>`;
   }
@@ -3166,30 +3437,25 @@ function graphNodeHtml(node) {
   `;
 }
 
-const PERSON_RANK_TIERS = [
-  { rank: "水王+", min: 20000, label: "终极水王" },
-  { rank: "水王", min: 10000, label: "群聊水王" },
-  { rank: "超神", min: 5000, label: "超神主宰" },
-  { rank: "SSS", min: 2000, label: "星河主力" },
-  { rank: "SS", min: 500, label: "超级核心" },
-  { rank: "S", min: 300, label: "核心贡献者" },
-  { rank: "A", min: 100, label: "高活跃成员" },
-  { rank: "B", min: 60, label: "稳定参与" },
-  { rank: "C", min: 30, label: "低频参与" },
-  { rank: "D", min: 0, label: "偶尔冒泡" },
-];
-
 function personRank(node) {
   const count = Number(node.meta?.message_count || node.count || 0);
-  return (PERSON_RANK_TIERS.find((tier) => count >= tier.min) || PERSON_RANK_TIERS[PERSON_RANK_TIERS.length - 1]).rank;
+  if (count >= 20000) return "水王";
+  if (count >= 10000) return "超神";
+  if (count >= 5000) return "SSS";
+  if (count >= 2000) return "SS";
+  if (count >= 500) return "S";
+  if (count >= 100) return "A";
+  if (count >= 60) return "B";
+  if (count >= 30) return "C";
+  return "D";
 }
 
 function personRankLabel(rank) {
-  return PERSON_RANK_TIERS.find((tier) => tier.rank === rank)?.label || "群成员";
+  return { 水王: "群聊水王", 超神: "超神主宰", SSS: "星河主力", SS: "超级核心", S: "核心贡献者", A: "高活跃成员", B: "稳定参与", C: "低频参与", D: "偶尔冒泡" }[rank] || "群成员";
 }
 
 function rankClassName(rank) {
-  return { "水王+": "water", 水王: "water", 超神: "god", SSS: "sss", SS: "ss", S: "s", A: "a", B: "b", C: "c", D: "d" }[rank] || "d";
+  return { 水王: "water", 超神: "god", SSS: "sss", SS: "ss", S: "s", A: "a", B: "b", C: "c", D: "d" }[rank] || "d";
 }
 
 function graphNodeBody(node) {
@@ -3273,7 +3539,7 @@ function graphNodeSize(node) {
   if (node.kind === "summary") return { w: 298, h: 298 };
   if (node.kind === "person") {
     const rank = personRank(node);
-    if (rank === "水王+" || rank === "水王") return { w: 292, h: 152 };
+    if (rank === "水王") return { w: 292, h: 152 };
     if (rank === "超神") return { w: 280, h: 146 };
     if (rank === "SSS") return { w: 266, h: 140 };
     if (rank === "SS") return { w: 254, h: 134 };
@@ -3671,21 +3937,22 @@ async function load() {
   state.memory = payload.memory;
   state.semantic = payload.semantic_memory;
   state.semanticRuns = payload.semantic_runs;
-  state.profileRebuild = payload.profile_rebuild || payload.semantic_memory?.profile_rebuild || state.profileRebuild;
-  rememberOverviewSemanticSignature(payload);
   state.autoReply = payload.auto_reply;
   state.loginGuard = payload.login_guard;
   state.activeProfileId = payload.config.active_llm_profile_id;
   renderProfiles();
   fillProfileForm(activeProfile());
   fillAgent();
+  renderStyleCloneCard();
   renderTalkModes();
   fillReplySenderForm();
+  fillChatReplyForm();
   fillLoginGuardForm();
   renderLayers();
   renderLastTest(payload.last_test || {});
   updateTop();
-  await Promise.allSettled([loadChats(), loadSuiteStatus()]);
+  await Promise.allSettled([loadChats(), loadSuiteStatus(), loadSystemLogs()]);
+  fillChatReplyForm();
   renderDebugModeOptions();
   renderSemanticRuns();
   renderAutoReplyStatus();
@@ -3698,7 +3965,6 @@ async function load() {
 async function refreshStatus() {
   const payload = await fetchJson(statusLiteUrl());
   mergeRuntimeStatus(payload);
-  await refreshOverviewSemanticIfNeeded(payload);
   updateTop();
   renderProfiles();
   renderSemanticRuns();
@@ -3707,21 +3973,19 @@ async function refreshStatus() {
   if (state.view === "skills") await loadSkills();
   if (state.view === "database") await loadDatabaseOverview();
   if (state.view === "photos") await loadPhotos();
+  if (state.view === "logs") await loadSystemLogs().catch(() => {});
 }
 
-async function refreshFullStatus(options = {}) {
+async function refreshFullStatus() {
   const payload = await fetchJson(statusUrl());
   mergeRuntimeStatus(payload);
-  rememberOverviewSemanticSignature(payload);
   updateTop();
   renderProfiles();
   renderSemanticDetails();
   renderSemanticRuns();
-  if (!options.skipAuxViews) {
-    if (state.view === "services") await loadSuiteStatus();
-    if (state.view === "chat") await loadChats(true);
-    if (state.view === "skills") await loadSkills();
-  }
+  if (state.view === "services") await loadSuiteStatus();
+  if (state.view === "chat") await loadChats(true);
+  if (state.view === "skills") await loadSkills();
 }
 
 async function refreshAutoReplyLive() {
@@ -3750,6 +4014,7 @@ async function loadChats(refreshMessages = false) {
       if ($("replyExcludedMembers")) $("replyExcludedMembers").innerHTML = `<div class="empty-state compact">成员加载失败：${escapeHtml(error.message)}</div>`;
     });
   }
+  fillChatReplyForm();
   renderMemoryChatSelects();
   if (!state.selectedChat && state.chats.length) await selectChat(state.chats[0].username);
   else if (refreshMessages && state.selectedChat) await loadCurrentMessages();
@@ -4709,43 +4974,9 @@ async function runLoginGuardOnce() {
     });
     state.loginGuard = payload.state || payload.login_guard || state.loginGuard;
     renderLoginGuardStatus();
-    setText("loginGuardPanelHint", loginGuardCheckSummary(payload));
     fillLoginGuardForm();
   } catch (error) {
     if ($("loginGuardPanelHint")) $("loginGuardPanelHint").textContent = `检查失败：${error.message}`;
-    alert(error.message);
-  } finally {
-    button.disabled = false;
-    button.textContent = original;
-  }
-}
-
-async function sendLoginGuardTestNotify() {
-  const button = $("loginGuardTestNotifyBtn");
-  if (!button) return;
-  syncLoginGuardFromForm();
-  const original = button.textContent;
-  button.disabled = true;
-  button.textContent = "发送中";
-  setText("loginGuardPanelHint", "正在发送 Clawbot 测试通知...");
-  try {
-    await fetchJson("/api/config", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(collectConfig("login_guard")),
-    });
-    state.loginGuardDirty = false;
-    const payload = await fetchJson("/api/login-guard/test-notify", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({}),
-    });
-    state.loginGuard = payload.state || state.loginGuard;
-    renderLoginGuardStatus();
-    setText("loginGuardPanelHint", loginGuardNotifySummary(payload));
-    fillLoginGuardForm();
-  } catch (error) {
-    setText("loginGuardPanelHint", `测试通知失败：${error.message}`);
     alert(error.message);
   } finally {
     button.disabled = false;
@@ -4793,6 +5024,7 @@ async function saveAll(button, label = "保存") {
     fillAgent();
     renderTalkModes();
     fillReplySenderForm();
+    fillChatReplyForm();
     state.loginGuardDirty = false;
     fillLoginGuardForm();
     renderLoginGuardStatus();
@@ -4814,6 +5046,7 @@ function collectConfig(source = "") {
   syncAgentFromForm();
   syncTalkFromForm();
   syncReplySenderFromForm();
+  if (["talk", "auto_reply", "chat_reply"].includes(source)) syncChatReplyFromForm();
   syncLoginGuardFromForm();
   syncLayersFromForm();
   if (source === "auto_reply") applyAutoReplySaveIntent();
@@ -4963,66 +5196,6 @@ async function mutateMemory(button) {
   }
 }
 
-async function rebuildProfilesNow(button) {
-  syncProfileRebuildFromForm();
-  const original = button?.textContent || "";
-  if (button) {
-    button.disabled = true;
-    button.textContent = "更新中";
-  }
-  const statePill = $("profileRebuildState");
-  if (statePill) {
-    statePill.className = "pill warn";
-    statePill.textContent = "画像重建中";
-  }
-  try {
-    const profileSettings = state.config?.profile_rebuild || {};
-    const chat = button?.id === "rebuildProfilesSettingsBtn"
-      ? (profileSettings.chat_username || state.memoryChat || "")
-      : (state.memoryChat || profileSettings.chat_username || "");
-    const payload = await fetchJson("/api/memory/rebuild-profiles", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        chat,
-        async: true,
-        force: true,
-        max_people_per_chat: profileSettings.max_people_per_chat || 120,
-        min_messages_per_person: profileSettings.min_messages_per_person || 2,
-        use_llm: true,
-        llm_min_messages: profileSettings.llm_min_messages || 3,
-      }),
-    });
-    state.profileRebuild = payload.profile_rebuild || state.profileRebuild;
-    renderProfileRebuildState();
-    ensureProfileRebuildPolling();
-    await pollProfileRebuildUntilDone();
-    state.memoryUi.selectedPersonId = null;
-    await refreshFullStatus();
-    renderMemoryConsole();
-  } catch (error) {
-    alert(`画像重建失败：${error.message}`);
-    if (statePill) {
-      statePill.className = "pill bad";
-      statePill.textContent = "画像异常";
-    }
-  } finally {
-    if (button) {
-      button.disabled = false;
-      button.textContent = original;
-    }
-  }
-}
-
-async function pollProfileRebuildUntilDone() {
-  for (let index = 0; index < 240; index += 1) {
-    const payload = await refreshProfileRebuildState();
-    if (!payload.state?.running) return payload;
-    await new Promise((resolve) => setTimeout(resolve, 1000));
-  }
-  throw new Error("画像重建仍在运行，请稍后刷新查看结果");
-}
-
 function collectDebugPayload() {
   return {
     chat: $("debugChat").value || state.selectedChat?.username || "",
@@ -5118,8 +5291,11 @@ async function previewReply() {
       `${fmtNumber(payload.memory?.people?.length || 0)} 人物`,
       `${fmtNumber(payload.memory?.vector_memories?.length || 0)} 历史片段`,
     ].join(" · ");
+    const styleBits = payload.style_clone?.style_card?.display_name
+      ? ` · ${payload.style_clone.applied ? "已套用" : "未改写"}${payload.style_clone.style_card.display_name}风格`
+      : "";
     $("replyPreview").textContent = payload.ok
-      ? `${payload.reply || "模型没有返回可用文本"}\n\n---\n建议：${payload.scoring?.decision || "--"} · ${memoryBits} · sent=false`
+      ? `${payload.reply || "模型没有返回可用文本"}\n\n---\n建议：${payload.scoring?.decision || "--"} · ${memoryBits}${styleBits} · sent=false`
       : `生成失败：${JSON.stringify(payload.error || payload.llm || payload, null, 2)}`;
     setReplySendState(payload.ok ? "候选回复已生成，尚未粘贴到微信" : "候选回复不可用", payload.ok ? "" : "bad");
   } catch (error) {
@@ -5297,8 +5473,24 @@ function bindEvents() {
   $("addProfileBtn").addEventListener("click", addProfile);
   $("saveModelsBtn").addEventListener("click", () => saveAll($("saveModelsBtn"), "保存模型"));
   $("savePersonaBtn").addEventListener("click", () => saveAll($("savePersonaBtn"), "保存人格"));
+  $("rebuildStyleCardBtn")?.addEventListener("click", rebuildStyleCard);
+  $("testStyleRewriteBtn")?.addEventListener("click", testStyleRewrite);
+  $("stylePersonaChat")?.addEventListener("change", () => {
+    state.selectedStylePersonaKey = "";
+    loadStylePersonas().catch((error) => alert(error.message));
+  });
+  $("refreshStylePersonasBtn")?.addEventListener("click", () => loadStylePersonas(true).catch((error) => alert(error.message)));
+  $("rebuildStylePersonasBtn")?.addEventListener("click", rebuildStylePersonas);
+  $("stylePersonaTopList")?.addEventListener("click", (event) => {
+    const button = event.target.closest("[data-style-person]");
+    if (!button) return;
+    selectStylePersona(button.dataset.stylePerson).catch((error) => alert(error.message));
+  });
+  $("stylePersonaEvidenceBtn")?.addEventListener("click", loadStylePersonaEvidence);
+  $("testStylePersonaRewriteBtn")?.addEventListener("click", testStylePersonaRewrite);
   $("saveTalkBtn").addEventListener("click", () => saveAll($("saveTalkBtn"), "保存接话设置"));
   $("saveAutoReplyBtn")?.addEventListener("click", () => saveAll($("saveAutoReplyBtn"), "保存自动发送"));
+  $("saveChatReplyBtn")?.addEventListener("click", () => saveAll($("saveChatReplyBtn"), "保存单群策略"));
   $("replyAllowedChats")?.addEventListener("change", () => {
     syncReplySenderFromForm();
     renderReplyExcludedChatOptions();
@@ -5311,18 +5503,35 @@ function bindEvents() {
   });
   $("replyExcludedSearch")?.addEventListener("input", () => renderReplyExcludedMembers());
   $("reloadExcludedMembersBtn")?.addEventListener("click", () => loadExcludedMembersForSelectedChat().catch((error) => alert(error.message)));
+  $("chatReplySelect")?.addEventListener("change", () => {
+    state.selectedChatReplyChat = $("chatReplySelect").value || "";
+    fillChatReplyForm();
+  });
+  $("chatReplyMode")?.addEventListener("change", () => {
+    const mode = $("chatReplyMode").value || state.config?.agent?.reply_mode || "normal";
+    if ($("chatReplyThreshold")) $("chatReplyThreshold").value = Number(state.config?.talk_modes?.[mode]?.threshold ?? 50);
+    updateChatReplyEffective();
+  });
+  [
+    "chatReplyEnabled",
+    "chatReplyUseGlobal",
+    "chatReplyThreshold",
+    "chatReplyMemeAuto",
+    "chatReplyMemeProbability",
+    "chatReplySwitchDelayMin",
+    "chatReplySwitchDelayMax",
+    "chatReplySendDelayMin",
+    "chatReplySendDelayMax",
+  ].forEach((id) => {
+    $(id)?.addEventListener("input", updateChatReplyEffective);
+    $(id)?.addEventListener("change", updateChatReplyEffective);
+  });
   $("saveLoginGuardBtn")?.addEventListener("click", () => saveAll($("saveLoginGuardBtn"), "保存守护"));
   $("loginGuardRunBtn")?.addEventListener("click", runLoginGuardOnce);
-  $("loginGuardTestNotifyBtn")?.addEventListener("click", sendLoginGuardTestNotify);
   $("clawbotStartBtn")?.addEventListener("click", (event) => clawbotAction("start", event.currentTarget));
   $("clawbotLoginBtn")?.addEventListener("click", (event) => clawbotAction("login", event.currentTarget));
   $("clawbotApplyBtn")?.addEventListener("click", (event) => clawbotAction("apply", event.currentTarget));
   $("clawbotRefreshBtn")?.addEventListener("click", () => refreshClawbotStatus().catch((error) => alert(error.message)));
-  $("clawbotBots")?.addEventListener("click", (event) => {
-    const button = event.target.closest("[data-clawbot-bot]");
-    if (!button) return;
-    document.querySelectorAll("[data-clawbot-bot]").forEach((item) => item.classList.toggle("active", item === button));
-  });
   [
     "loginGuardEnabled",
     "loginGuardAutoClick",
@@ -5339,23 +5548,9 @@ function bindEvents() {
   ].forEach((id) => {
     $(id)?.addEventListener("input", markLoginGuardDirty);
     $(id)?.addEventListener("change", markLoginGuardDirty);
-	  });
-  [
-    "profileRebuildEnabled",
-    "profileRebuildInterval",
-    "profileRebuildMaxPeople",
-    "profileRebuildMinMessages",
-    "profileRebuildUseLlm",
-    "profileRebuildLlmMinMessages",
-    "profileRebuildChat",
-  ].forEach((id) => {
-    $(id)?.addEventListener("input", syncProfileRebuildFromForm);
-    $(id)?.addEventListener("change", syncProfileRebuildFromForm);
   });
-	  $("saveMemoryBtn").addEventListener("click", () => saveAll($("saveMemoryBtn"), "保存记忆设置"));
-	  $("rebuildProfilesBtn")?.addEventListener("click", (event) => rebuildProfilesNow(event.currentTarget));
-	  $("rebuildProfilesSettingsBtn")?.addEventListener("click", (event) => rebuildProfilesNow(event.currentTarget));
-	  $("cleanupLogsBtn")?.addEventListener("click", cleanupLogs);
+  $("saveMemoryBtn").addEventListener("click", () => saveAll($("saveMemoryBtn"), "保存记忆设置"));
+  $("cleanupLogsBtn")?.addEventListener("click", cleanupLogs);
   $("modelsBtn").addEventListener("click", fetchModels);
   $("checkBtn").addEventListener("click", checkLLM);
   $("testBtn").addEventListener("click", testLLM);
@@ -5401,6 +5596,26 @@ function bindEvents() {
   window.addEventListener("resize", () => {
     if (state.view === "overview") fitGraph();
   });
+  $("systemLogFilters")?.addEventListener("click", (event) => {
+    const categoryButton = event.target.closest("[data-system-log-category]");
+    const levelButton = event.target.closest("[data-system-log-level]");
+    const button = categoryButton || levelButton;
+    if (!button) return;
+    if (categoryButton) {
+      state.systemLogFilter = { ...(state.systemLogFilter || {}), category: categoryButton.dataset.systemLogCategory || "all" };
+    }
+    if (levelButton) {
+      state.systemLogFilter = { ...(state.systemLogFilter || {}), level: levelButton.dataset.systemLogLevel || "all" };
+    }
+    loadSystemLogs().catch((error) => console.warn(error));
+  });
+  $("systemLogSearch")?.addEventListener("input", (event) => {
+    clearTimeout(state.systemLogSearchTimer);
+    state.systemLogFilter = { ...(state.systemLogFilter || {}), query: event.target.value.trim() };
+    state.systemLogSearchTimer = setTimeout(() => {
+      loadSystemLogs().catch((error) => console.warn(error));
+    }, 260);
+  });
 }
 
 bindEvents();
@@ -5412,3 +5627,6 @@ load().catch((error) => {
 });
 setInterval(() => refreshStatus().catch(() => {}), 5000);
 setInterval(() => refreshAutoReplyLive().catch(() => {}), 1500);
+setInterval(() => {
+  if (state.view === "logs") loadSystemLogs().catch(() => {});
+}, 2000);

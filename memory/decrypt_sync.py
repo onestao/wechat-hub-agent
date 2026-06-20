@@ -104,6 +104,12 @@ def key_for_rel(keys: dict, rel_path: str) -> dict | None:
     return None
 
 
+def should_skip_source_db(rel_path: str) -> bool:
+    """Skip WeChat auxiliary indexes that are not required for message ingest."""
+    name = Path(rel_path).name.lower()
+    return name.endswith("_fts.db")
+
+
 def file_state(path: Path) -> dict:
     if not path.exists():
         return {"exists": False, "mtime_ns": 0, "size": 0}
@@ -160,6 +166,16 @@ def refresh_decrypted(
 
     for db_path in sorted(source_db_dir.rglob("*.db")):
         rel_path = db_path.relative_to(source_db_dir).as_posix()
+        if should_skip_source_db(rel_path):
+            result["skipped"].append(rel_path)
+            state.pop(rel_path, None)
+            out_path = decrypted_dir / rel_path
+            for candidate in (out_path, Path(str(out_path) + "-wal"), Path(str(out_path) + "-shm")):
+                try:
+                    candidate.unlink()
+                except FileNotFoundError:
+                    pass
+            continue
         key_info = key_for_rel(keys, rel_path)
         if not key_info:
             result["missing_key"].append(rel_path)

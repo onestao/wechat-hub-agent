@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import signal
+import sqlite3
 import sys
 import time
 from datetime import datetime, timezone
@@ -36,6 +37,15 @@ def handle_stop(signum, frame) -> None:  # noqa: ARG001
     STOP = True
 
 
+def repair_memory_indexes(memory_db: Path) -> dict:
+    started = time.time()
+    with sqlite3.connect(memory_db, timeout=30) as conn:
+        conn.execute("PRAGMA busy_timeout=30000")
+        conn.execute("REINDEX")
+        check = conn.execute("PRAGMA integrity_check").fetchone()[0]
+    return {"ok": check == "ok", "integrity_check": check, "elapsed_seconds": round(time.time() - started, 3)}
+
+
 def run_once(args) -> dict:
     started = time.time()
     refresh = refresh_decrypted(
@@ -45,7 +55,16 @@ def run_once(args) -> dict:
         state_file=args.decrypt_state_file,
         force=args.force_refresh,
     )
-    ingest = ingest_memory(args.decrypted_dir, args.memory_db)
+    repair = None
+    try:
+        ingest = ingest_memory(args.decrypted_dir, args.memory_db)
+    except sqlite3.DatabaseError as exc:
+        if "database disk image is malformed" not in str(exc).lower():
+            raise
+        repair = repair_memory_indexes(args.memory_db)
+        if not repair.get("ok"):
+            raise
+        ingest = ingest_memory(args.decrypted_dir, args.memory_db)
     media = sync_media(args)
     return {
         "ok": not refresh["failed"],
@@ -54,6 +73,7 @@ def run_once(args) -> dict:
         "elapsed_seconds": round(time.time() - started, 3),
         "interval_seconds": args.interval,
         "refresh": refresh,
+        "repair": repair,
         "ingest": ingest,
         "media": media,
     }

@@ -49,12 +49,13 @@ RUNTIME_DIR = ROOT / "runtime/agent-console"
 CONFIG_FILE = RUNTIME_DIR / "config.json"
 STATUS_FILE = RUNTIME_DIR / "status.json"
 SEMANTIC_STATE_FILE = RUNTIME_DIR / "semantic_extract_state.json"
-PROFILE_REBUILD_STATE_FILE = RUNTIME_DIR / "profile_rebuild_state.json"
 AUTO_REPLY_STATE_FILE = RUNTIME_DIR / "auto_reply_state.json"
 IMAGE_AUTO_STATE_FILE = RUNTIME_DIR / "image_auto_state.json"
 LOGIN_GUARD_STATE_FILE = RUNTIME_DIR / "login_guard_state.json"
+SYSTEM_LOG_FILE = RUNTIME_DIR / "system_events.jsonl"
 REPORT_LLM_CACHE_FILE = RUNTIME_DIR / "report_llm_cache.json"
 REPORT_LLM_CACHE_VERSION = "v10"
+STYLE_CARDS_FILE = RUNTIME_DIR / "style_cards.json"
 SKILLS_DIR = RUNTIME_DIR / "skills"
 SKILL_IMPORTS_DIR = SKILLS_DIR / "installed"
 SKILL_ARTIFACTS_DIR = SKILLS_DIR / "artifacts"
@@ -110,11 +111,35 @@ DEFAULT_CONFIG = {
         "enabled": True,
         "reply_mode": "normal",
         "auto_reply_enabled": False,
+        "style_rewrite_enabled": True,
         "personality": (
             "你是一个谨慎、友好、低打扰的微信群助手。回答前优先参考群聊上下文和长期记忆。"
             "不确定时明确说明不确定，不主动编造事实。"
         ),
         "safety_policy": "不回答危险、隐私、账号、资金、违法和高风险操作请求。",
+    },
+    "style_clone": {
+        "enabled": False,
+        "rewrite_enabled": True,
+        "chat_username": "18725461928@chatroom",
+        "chat_display_name": "PT站看片狂魔小群",
+        "person_key": "saarjoye",
+        "display_name": "污妖王",
+        "strength": 0.72,
+        "cache_hours": 12,
+        "max_reply_chars": 180,
+    },
+    "style_personas": {
+        "enabled": False,
+        "rewrite_enabled": True,
+        "mode": "manual",
+        "selected_by_chat": {},
+        "auto_refresh_enabled": True,
+        "refresh_interval_hours": 12,
+        "min_text_messages": 80,
+        "strength": 0.9,
+        "max_reply_chars": 180,
+        "show_evidence": False,
     },
     "reply_sender": {
         "enabled": False,
@@ -135,6 +160,7 @@ DEFAULT_CONFIG = {
         "send_delay_min_seconds": 1.2,
         "send_delay_max_seconds": 4.8,
     },
+    "chat_reply_settings": {},
     "login_guard": {
         "enabled": True,
         "check_interval_seconds": 60,
@@ -202,15 +228,6 @@ DEFAULT_CONFIG = {
         "batch_size": 1,
         "chat_username": "",
     },
-    "profile_rebuild": {
-        "enabled": True,
-        "interval_seconds": 43200,
-        "chat_username": "",
-        "max_people_per_chat": 120,
-        "min_messages_per_person": 2,
-        "use_llm": True,
-        "llm_min_messages": 3,
-    },
     "skills": {
         "enabled": True,
         "blue_mention_enabled": False,
@@ -237,7 +254,7 @@ DEFAULT_CONFIG = {
             "tavily_search_depth": "advanced",
             "tavily_search_max_results": 5,
             "tavily_timeout_seconds": 25,
-            "fallback_to_llm": True,
+            "fallback_to_llm": False,
         },
         "image_understanding": {
             "enabled": True,
@@ -271,11 +288,13 @@ DEFAULT_CONFIG = {
 HEALTH_CACHE: dict[str, dict] = {}
 HEALTH_LOCK = threading.Lock()
 SEMANTIC_LOCK = threading.Lock()
-PROFILE_REBUILD_LOCK = threading.Lock()
 AUTO_REPLY_STATE_LOCK = threading.RLock()
 IMAGE_AUTO_STATE_LOCK = threading.RLock()
 LOGIN_GUARD_LOCK = threading.RLock()
+SYSTEM_LOG_LOCK = threading.RLock()
 WECHAT_SEND_LOCK = threading.Lock()
+STYLE_PERSONA_LOCK = threading.RLock()
+STYLE_PERSONA_BUILD_STATE: dict[str, dict] = {}
 
 MEMORY_EXTRACT_SYSTEM_PROMPT = (
     "你是微信群长期记忆抽取器。只输出一个紧凑 JSON 对象，不要 Markdown，不要解释。"
@@ -406,9 +425,44 @@ def normalize_config(config: dict) -> dict:
         "aliases": unique_texts([str(item).strip() for item in aliases if str(item).strip()])[:30],
         "enabled": bool(agent.get("enabled", agent_defaults["enabled"])),
         "auto_reply_enabled": bool(agent.get("auto_reply_enabled", agent_defaults["auto_reply_enabled"])),
+        "style_rewrite_enabled": bool(agent.get("style_rewrite_enabled", agent_defaults["style_rewrite_enabled"])),
     }
     if config.get("agent", {}).get("reply_mode") not in config.get("talk_modes", {}):
         config["agent"]["reply_mode"] = "normal"
+    style_defaults = DEFAULT_CONFIG["style_clone"]
+    style = config.get("style_clone") if isinstance(config.get("style_clone"), dict) else {}
+    config["style_clone"] = {
+        "enabled": bool(style.get("enabled", style_defaults["enabled"])),
+        "rewrite_enabled": bool(style.get("rewrite_enabled", style_defaults["rewrite_enabled"])),
+        "chat_username": str(style.get("chat_username") or style_defaults["chat_username"]).strip()[:200],
+        "chat_display_name": str(style.get("chat_display_name") or style_defaults["chat_display_name"]).strip()[:200],
+        "person_key": clean_contact_text(style.get("person_key") or style_defaults["person_key"])[:200],
+        "display_name": clean_contact_text(style.get("display_name") or style_defaults["display_name"])[:80],
+        "strength": clamp_float(style.get("strength"), style_defaults["strength"], 0.0, 1.0),
+        "cache_hours": clamp_int(style.get("cache_hours"), style_defaults["cache_hours"], 0, 24 * 30),
+        "max_reply_chars": clamp_int(style.get("max_reply_chars"), style_defaults["max_reply_chars"], 40, 1200),
+    }
+    persona_defaults = DEFAULT_CONFIG["style_personas"]
+    personas = config.get("style_personas") if isinstance(config.get("style_personas"), dict) else {}
+    selected_by_chat = personas.get("selected_by_chat") if isinstance(personas.get("selected_by_chat"), dict) else {}
+    config["style_personas"] = {
+        "enabled": bool(personas.get("enabled", persona_defaults["enabled"])),
+        "rewrite_enabled": bool(personas.get("rewrite_enabled", persona_defaults["rewrite_enabled"])),
+        "mode": str(personas.get("mode") or persona_defaults["mode"]).strip() or "manual",
+        "selected_by_chat": {
+            str(chat).strip()[:200]: clean_contact_text(person)[:200]
+            for chat, person in selected_by_chat.items()
+            if str(chat).strip() and clean_contact_text(person)
+        },
+        "auto_refresh_enabled": bool(personas.get("auto_refresh_enabled", persona_defaults["auto_refresh_enabled"])),
+        "refresh_interval_hours": clamp_int(
+            personas.get("refresh_interval_hours"), persona_defaults["refresh_interval_hours"], 1, 24 * 30
+        ),
+        "min_text_messages": clamp_int(personas.get("min_text_messages"), persona_defaults["min_text_messages"], 20, 2000),
+        "strength": clamp_float(personas.get("strength"), persona_defaults["strength"], 0.0, 1.0),
+        "max_reply_chars": clamp_int(personas.get("max_reply_chars"), persona_defaults["max_reply_chars"], 40, 1200),
+        "show_evidence": bool(personas.get("show_evidence", persona_defaults["show_evidence"])),
+    }
     talk_modes = config.get("talk_modes") if isinstance(config.get("talk_modes"), dict) else {}
     normalized_modes = {}
     for key, defaults in DEFAULT_CONFIG["talk_modes"].items():
@@ -447,12 +501,12 @@ def normalize_config(config: dict) -> dict:
     if mode not in {"draft_only", "manual_send", "auto_send"}:
         mode = sender_defaults["mode"]
     allowed_chats = sender.get("allowed_chats") if isinstance(sender.get("allowed_chats"), list) else []
-    excluded_members_by_chat = sanitize_excluded_members_by_chat(sender.get("excluded_members_by_chat"))
     sender_min_interval = clamp_int(
         sender.get("min_interval_seconds"), sender_defaults["min_interval_seconds"], 0, 86400
     )
     sender_hourly_limit = clamp_int(sender.get("hourly_limit"), sender_defaults["hourly_limit"], 0, 1000)
     sender_streak_limit = clamp_int(sender.get("streak_limit"), sender_defaults["streak_limit"], 0, 1000)
+    excluded_members_by_chat = sanitize_excluded_members_by_chat(sender.get("excluded_members_by_chat"))
     config["reply_sender"] = {
         "enabled": bool(sender.get("enabled", sender_defaults["enabled"])),
         "maintenance_paused": bool(sender.get("maintenance_paused", sender_defaults.get("maintenance_paused", False))),
@@ -488,6 +542,7 @@ def normalize_config(config: dict) -> dict:
             sender.get("send_delay_max_seconds"), sender_defaults["send_delay_max_seconds"], 0.0, 120.0
         ),
     }
+    config["chat_reply_settings"] = normalize_chat_reply_settings(config.get("chat_reply_settings"), config)
     guard_defaults = DEFAULT_CONFIG["login_guard"]
     guard = config.get("login_guard") if isinstance(config.get("login_guard"), dict) else {}
     notify_channel = str(guard.get("notify_channel") or guard_defaults["notify_channel"]).strip()
@@ -524,25 +579,6 @@ def normalize_config(config: dict) -> dict:
         "limit": clamp_int(semantic.get("limit"), defaults["limit"], 1, 500),
         "batch_size": clamp_int(semantic.get("batch_size"), defaults["batch_size"], 1, 10),
         "chat_username": str(semantic.get("chat_username") or "").strip(),
-    }
-    profile_rebuild = config.get("profile_rebuild") if isinstance(config.get("profile_rebuild"), dict) else {}
-    defaults = DEFAULT_CONFIG["profile_rebuild"]
-    config["profile_rebuild"] = {
-        "enabled": bool(profile_rebuild.get("enabled", defaults["enabled"])),
-        "interval_seconds": clamp_int(
-            profile_rebuild.get("interval_seconds"), defaults["interval_seconds"], 3600, 604800
-        ),
-        "chat_username": str(profile_rebuild.get("chat_username") or "").strip(),
-        "max_people_per_chat": clamp_int(
-            profile_rebuild.get("max_people_per_chat"), defaults["max_people_per_chat"], 5, 500
-        ),
-        "min_messages_per_person": clamp_int(
-            profile_rebuild.get("min_messages_per_person"), defaults["min_messages_per_person"], 1, 50
-        ),
-        "use_llm": bool(profile_rebuild.get("use_llm", defaults.get("use_llm", True))),
-        "llm_min_messages": clamp_int(
-            profile_rebuild.get("llm_min_messages"), defaults.get("llm_min_messages", 3), 1, 100
-        ),
     }
     skills_raw = config.get("skills") if isinstance(config.get("skills"), dict) else {}
     config["skills"] = sanitize_skills_config(skills_raw, skills_raw or DEFAULT_CONFIG["skills"])
@@ -678,12 +714,62 @@ def sanitize_config(payload: dict, current: dict) -> dict:
             agent["enabled"] = bool(agent["enabled"])
         if "auto_reply_enabled" in agent:
             agent["auto_reply_enabled"] = bool(agent["auto_reply_enabled"])
+        if "style_rewrite_enabled" in agent:
+            agent["style_rewrite_enabled"] = bool(agent["style_rewrite_enabled"])
         if "aliases" in agent:
             raw_aliases = agent["aliases"] if isinstance(agent["aliases"], list) else str(agent["aliases"] or "").splitlines()
             agent["aliases"] = unique_texts([str(item).strip() for item in raw_aliases if str(item).strip()])[:30]
         if agent.get("reply_mode") not in current.get("talk_modes", {}):
             agent["reply_mode"] = current.get("agent", {}).get("reply_mode", "normal")
         result["agent"] = agent
+    if isinstance(payload.get("style_clone"), dict):
+        raw = payload["style_clone"]
+        current_style = current.get("style_clone", DEFAULT_CONFIG["style_clone"])
+        result["style_clone"] = {
+            "enabled": bool(raw.get("enabled", current_style.get("enabled", False))),
+            "rewrite_enabled": bool(raw.get("rewrite_enabled", current_style.get("rewrite_enabled", True))),
+            "chat_username": str(raw.get("chat_username") or current_style.get("chat_username") or "").strip()[:200],
+            "chat_display_name": str(
+                raw.get("chat_display_name") or current_style.get("chat_display_name") or ""
+            ).strip()[:200],
+            "person_key": clean_contact_text(raw.get("person_key") or current_style.get("person_key") or "")[:200],
+            "display_name": clean_contact_text(raw.get("display_name") or current_style.get("display_name") or "")[:80],
+            "strength": clamp_float(raw.get("strength"), current_style.get("strength", 0.72), 0.0, 1.0),
+            "cache_hours": clamp_int(raw.get("cache_hours"), current_style.get("cache_hours", 12), 0, 24 * 30),
+            "max_reply_chars": clamp_int(
+                raw.get("max_reply_chars"), current_style.get("max_reply_chars", 180), 40, 1200
+            ),
+        }
+    if isinstance(payload.get("style_personas"), dict):
+        raw = payload["style_personas"]
+        current_personas = current.get("style_personas", DEFAULT_CONFIG["style_personas"])
+        selected = raw.get("selected_by_chat")
+        if not isinstance(selected, dict):
+            selected = current_personas.get("selected_by_chat") if isinstance(current_personas.get("selected_by_chat"), dict) else {}
+        result["style_personas"] = {
+            "enabled": bool(raw.get("enabled", current_personas.get("enabled", False))),
+            "rewrite_enabled": bool(raw.get("rewrite_enabled", current_personas.get("rewrite_enabled", True))),
+            "mode": str(raw.get("mode") or current_personas.get("mode") or "manual").strip()[:40] or "manual",
+            "selected_by_chat": {
+                str(chat).strip()[:200]: clean_contact_text(person)[:200]
+                for chat, person in selected.items()
+                if str(chat).strip() and clean_contact_text(person)
+            },
+            "auto_refresh_enabled": bool(
+                raw.get("auto_refresh_enabled", current_personas.get("auto_refresh_enabled", True))
+            ),
+            "refresh_interval_hours": clamp_int(
+                raw.get("refresh_interval_hours"), current_personas.get("refresh_interval_hours", 12), 1, 24 * 30
+            ),
+            "min_text_messages": clamp_int(
+                raw.get("min_text_messages"), current_personas.get("min_text_messages", 80), 20, 2000
+            ),
+            "strength": clamp_float(raw.get("strength"), current_personas.get("strength", 0.9), 0.0, 1.0),
+            "max_reply_chars": clamp_int(
+                raw.get("max_reply_chars"), current_personas.get("max_reply_chars", 180), 40, 1200
+            ),
+            "show_evidence": bool(raw.get("show_evidence", current_personas.get("show_evidence", False))),
+        }
     if isinstance(payload.get("talk_modes"), dict):
         modes = {}
         for key, raw in payload["talk_modes"].items():
@@ -769,6 +855,8 @@ def sanitize_config(payload: dict, current: dict) -> dict:
                 120.0,
             ),
         }
+    if isinstance(payload.get("chat_reply_settings"), dict):
+        result["chat_reply_settings"] = normalize_chat_reply_settings(payload.get("chat_reply_settings"), current)
     if isinstance(payload.get("login_guard"), dict):
         raw = payload["login_guard"]
         current_guard = current.get("login_guard", DEFAULT_CONFIG["login_guard"])
@@ -842,41 +930,6 @@ def sanitize_config(payload: dict, current: dict) -> dict:
             ),
             "chat_username": str(raw.get("chat_username") or "").strip(),
         }
-    if isinstance(payload.get("profile_rebuild"), dict):
-        raw = payload["profile_rebuild"]
-        current_profile = current.get("profile_rebuild", DEFAULT_CONFIG["profile_rebuild"])
-        result["profile_rebuild"] = {
-            "enabled": bool(raw.get("enabled", current_profile.get("enabled", True))),
-            "interval_seconds": clamp_int(
-                raw.get("interval_seconds"),
-                current_profile.get("interval_seconds", DEFAULT_CONFIG["profile_rebuild"]["interval_seconds"]),
-                3600,
-                604800,
-            ),
-            "chat_username": str(raw.get("chat_username") or current_profile.get("chat_username") or "").strip(),
-            "max_people_per_chat": clamp_int(
-                raw.get("max_people_per_chat"),
-                current_profile.get("max_people_per_chat", DEFAULT_CONFIG["profile_rebuild"]["max_people_per_chat"]),
-                5,
-                500,
-            ),
-            "min_messages_per_person": clamp_int(
-                raw.get("min_messages_per_person"),
-                current_profile.get(
-                    "min_messages_per_person",
-                    DEFAULT_CONFIG["profile_rebuild"]["min_messages_per_person"],
-                ),
-                1,
-                50,
-            ),
-            "use_llm": bool(raw.get("use_llm", current_profile.get("use_llm", True))),
-            "llm_min_messages": clamp_int(
-                raw.get("llm_min_messages"),
-                current_profile.get("llm_min_messages", DEFAULT_CONFIG["profile_rebuild"].get("llm_min_messages", 3)),
-                1,
-                100,
-            ),
-        }
     if isinstance(payload.get("skills"), dict):
         result["skills"] = sanitize_skills_config(payload["skills"], current.get("skills", DEFAULT_CONFIG["skills"]))
     return result
@@ -895,13 +948,14 @@ def save_config(payload: dict) -> dict:
             agent["auto_reply_enabled"] = True
             sanitized["agent"] = agent
     merged = normalize_config(merge_dicts(current, sanitized))
-    if isinstance(sanitized.get("reply_sender"), dict) and "excluded_members_by_chat" in sanitized["reply_sender"]:
-        merged.setdefault("reply_sender", {})["excluded_members_by_chat"] = sanitized["reply_sender"].get("excluded_members_by_chat") or {}
     write_json(CONFIG_FILE, merged)
     is_active = bool(auto_reply_activation_state(merged).get("active"))
     if save_source == "auto_reply" and is_active and not was_active:
         reset = reset_auto_reply_watermarks_to_latest(merged)
         add_auto_reply_event("enabled", "自动接话已启用，从当前最新消息开始监听", reset)
+    if isinstance(sanitized.get("reply_sender"), dict) and "excluded_members_by_chat" in sanitized["reply_sender"]:
+        merged.setdefault("reply_sender", {})["excluded_members_by_chat"] = sanitized["reply_sender"].get("excluded_members_by_chat") or {}
+        write_json(CONFIG_FILE, merged)
     return public_config(merged)
 
 
@@ -988,7 +1042,7 @@ def sanitize_skills_config(raw: dict, current: dict | None = None) -> dict:
                 5,
                 60,
             ),
-            "fallback_to_llm": bool(web_raw.get("fallback_to_llm", web_current.get("fallback_to_llm", True))),
+            "fallback_to_llm": False,
         },
         "image_understanding": {
             "enabled": bool(image_raw.get("enabled", image_current.get("enabled", True))),
@@ -1059,6 +1113,112 @@ def sanitize_skills_config(raw: dict, current: dict | None = None) -> dict:
     }
 
 
+def normalize_chat_reply_settings(raw: dict | None, config: dict | None = None) -> dict:
+    config = config if isinstance(config, dict) else {}
+    raw = raw if isinstance(raw, dict) else {}
+    global_mode = str(config.get("agent", {}).get("reply_mode") or "normal")
+    mode_keys = set((config.get("talk_modes") or DEFAULT_CONFIG["talk_modes"]).keys())
+    sender = config.get("reply_sender") if isinstance(config.get("reply_sender"), dict) else DEFAULT_CONFIG["reply_sender"]
+    meme = (
+        config.get("skills", {}).get("meme_sender")
+        if isinstance(config.get("skills", {}).get("meme_sender"), dict)
+        else DEFAULT_CONFIG["skills"]["meme_sender"]
+    )
+    normalized: dict[str, dict] = {}
+    for chat_username, value in raw.items():
+        chat = str(chat_username or "").strip()
+        if not chat:
+            continue
+        item = value if isinstance(value, dict) else {}
+        mode = str(item.get("reply_mode") or global_mode or "normal").strip()
+        if mode not in mode_keys:
+            mode = global_mode if global_mode in mode_keys else "normal"
+        use_global = bool(item.get("use_global", True))
+        threshold_raw = item.get("threshold_override")
+        threshold_override = None if threshold_raw in (None, "", "global") else clamp_int(threshold_raw, 0, 0, 100)
+        normalized[chat[:200]] = {
+            "enabled": bool(item.get("enabled", True)),
+            "use_global": use_global,
+            "reply_mode": mode,
+            "threshold_override": threshold_override,
+            "meme_auto_enabled": bool(item.get("meme_auto_enabled", meme.get("auto_enabled", True))),
+            "meme_probability": clamp_float(item.get("meme_probability"), meme.get("probability", 0.0), 0.0, 1.0),
+            "switch_delay_min_seconds": clamp_float(
+                item.get("switch_delay_min_seconds"), sender.get("switch_delay_min_seconds", 1.0), 0.0, 30.0
+            ),
+            "switch_delay_max_seconds": clamp_float(
+                item.get("switch_delay_max_seconds"), sender.get("switch_delay_max_seconds", 2.2), 0.0, 60.0
+            ),
+            "send_delay_min_seconds": clamp_float(
+                item.get("send_delay_min_seconds"), sender.get("send_delay_min_seconds", 1.2), 0.0, 30.0
+            ),
+            "send_delay_max_seconds": clamp_float(
+                item.get("send_delay_max_seconds"), sender.get("send_delay_max_seconds", 4.8), 0.0, 120.0
+            ),
+        }
+    return normalized
+
+
+def chat_reply_setting(config: dict, chat_username: str) -> dict:
+    settings = config.get("chat_reply_settings") if isinstance(config.get("chat_reply_settings"), dict) else {}
+    return settings.get(str(chat_username or "").strip()) if isinstance(settings.get(str(chat_username or "").strip()), dict) else {}
+
+
+def effective_reply_config(config: dict, chat_username: str = "") -> dict:
+    config = config if isinstance(config, dict) else read_config()
+    chat_username = str(chat_username or "").strip()
+    setting = chat_reply_setting(config, chat_username)
+    use_global = bool(setting.get("use_global", True)) or not setting
+    mode_key = str(config.get("agent", {}).get("reply_mode") or "normal").strip()
+    if not use_global:
+        mode_key = str(setting.get("reply_mode") or mode_key).strip()
+    if mode_key not in (config.get("talk_modes") or {}):
+        mode_key = "normal"
+    mode = dict((config.get("talk_modes") or {}).get(mode_key) or (config.get("talk_modes") or {}).get("normal") or {})
+    threshold_override = setting.get("threshold_override") if not use_global else None
+    if threshold_override is not None:
+        mode["threshold"] = clamp_int(threshold_override, int(mode.get("threshold") or 50), 0, 100)
+    return {
+        "chat_username": chat_username,
+        "configured": bool(setting),
+        "use_global": use_global,
+        "enabled": bool(setting.get("enabled", True)) if setting else True,
+        "reply_mode": mode_key,
+        "mode": mode,
+        "threshold_override": threshold_override,
+        "setting": setting,
+    }
+
+
+def effective_config_for_chat(config: dict, chat_username: str = "") -> dict:
+    effective = effective_reply_config(config, chat_username)
+    setting = effective.get("setting") if isinstance(effective.get("setting"), dict) else {}
+    if effective.get("use_global") or not setting:
+        return config
+    patched = json.loads(json.dumps(config, ensure_ascii=False))
+    patched.setdefault("agent", {})["reply_mode"] = effective.get("reply_mode") or patched.get("agent", {}).get("reply_mode", "normal")
+    mode_key = patched["agent"]["reply_mode"]
+    patched.setdefault("talk_modes", {})
+    patched["talk_modes"][mode_key] = {
+        **(patched["talk_modes"].get(mode_key) or {}),
+        **(effective.get("mode") or {}),
+    }
+    skills = patched.setdefault("skills", {})
+    meme = skills.setdefault("meme_sender", {})
+    meme["auto_enabled"] = bool(setting.get("meme_auto_enabled", meme.get("auto_enabled", True)))
+    meme["probability"] = clamp_float(setting.get("meme_probability"), meme.get("probability", 0.0), 0.0, 1.0)
+    sender = patched.setdefault("reply_sender", {})
+    for key in (
+        "switch_delay_min_seconds",
+        "switch_delay_max_seconds",
+        "send_delay_min_seconds",
+        "send_delay_max_seconds",
+    ):
+        if key in setting:
+            sender[key] = setting[key]
+    return patched
+
+
 def clamp_int(value, default: int, min_value: int, max_value: int) -> int:
     try:
         parsed = int(value)
@@ -1077,10 +1237,7 @@ def clamp_float(value, default: float, min_value: float, max_value: float) -> fl
 
 def db_connect(path: Path, readonly: bool = False) -> sqlite3.Connection:
     if readonly:
-        options = "mode=ro"
-        if path == MEMORY_DB:
-            options += "&immutable=1"
-        uri = f"{path.resolve().as_uri()}?{options}"
+        uri = f"{path.resolve().as_uri()}?mode=ro"
         conn = sqlite3.connect(uri, uri=True, timeout=10)
         conn.execute("PRAGMA query_only=ON")
     else:
@@ -1168,61 +1325,6 @@ def init_semantic_memory() -> None:
                 confidence REAL NOT NULL DEFAULT 0,
                 evidence_json TEXT NOT NULL DEFAULT '[]',
                 updated_at TEXT NOT NULL
-            );
-
-            CREATE TABLE IF NOT EXISTS ai_person_profile_claims (
-                claim_id TEXT PRIMARY KEY,
-                chat_username TEXT NOT NULL,
-                person_key TEXT NOT NULL,
-                display_name TEXT NOT NULL DEFAULT '',
-                claim_type TEXT NOT NULL,
-                label TEXT NOT NULL,
-                value TEXT NOT NULL DEFAULT '',
-                confidence REAL NOT NULL DEFAULT 0,
-                support_count INTEGER NOT NULL DEFAULT 0,
-                first_seen_time INTEGER,
-                last_seen_time INTEGER,
-                source_message_uids_json TEXT NOT NULL DEFAULT '[]',
-                source_quotes_json TEXT NOT NULL DEFAULT '[]',
-                status TEXT NOT NULL DEFAULT 'active',
-                review_note TEXT NOT NULL DEFAULT '',
-                reviewed_at TEXT,
-                updated_at TEXT NOT NULL
-            );
-
-            CREATE TABLE IF NOT EXISTS ai_person_relations (
-                relation_id TEXT PRIMARY KEY,
-                chat_username TEXT NOT NULL,
-                source_person_key TEXT NOT NULL,
-                source_display_name TEXT NOT NULL DEFAULT '',
-                target_kind TEXT NOT NULL DEFAULT 'person',
-                target_key TEXT NOT NULL,
-                target_display_name TEXT NOT NULL DEFAULT '',
-                relation TEXT NOT NULL,
-                confidence REAL NOT NULL DEFAULT 0,
-                support_count INTEGER NOT NULL DEFAULT 0,
-                first_seen_time INTEGER,
-                last_seen_time INTEGER,
-                source_message_uids_json TEXT NOT NULL DEFAULT '[]',
-                source_quotes_json TEXT NOT NULL DEFAULT '[]',
-                status TEXT NOT NULL DEFAULT 'active',
-                review_note TEXT NOT NULL DEFAULT '',
-                reviewed_at TEXT,
-                updated_at TEXT NOT NULL
-            );
-
-            CREATE TABLE IF NOT EXISTS ai_profile_rebuild_runs (
-                run_id INTEGER PRIMARY KEY AUTOINCREMENT,
-                started_at TEXT NOT NULL,
-                finished_at TEXT,
-                ok INTEGER NOT NULL DEFAULT 0,
-                chat_username TEXT,
-                people_count INTEGER NOT NULL DEFAULT 0,
-                claims_count INTEGER NOT NULL DEFAULT 0,
-                relations_count INTEGER NOT NULL DEFAULT 0,
-                message_count INTEGER NOT NULL DEFAULT 0,
-                error TEXT,
-                details_json TEXT NOT NULL DEFAULT '{}'
             );
 
             CREATE TABLE IF NOT EXISTS ai_memory_extract_runs (
@@ -1365,25 +1467,12 @@ def init_semantic_memory() -> None:
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_chat_member_identity_nickname ON chat_member_identity_map(chat_username, group_nickname)"
         )
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_person_claims_person ON ai_person_profile_claims(chat_username, person_key, status, confidence DESC)"
-        )
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_person_claims_type ON ai_person_profile_claims(chat_username, claim_type, status, support_count DESC)"
-        )
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_person_relations_source ON ai_person_relations(chat_username, source_person_key, status, confidence DESC)"
-        )
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_person_relations_target ON ai_person_relations(chat_username, target_key, status, confidence DESC)"
-        )
 
 
 def memory_status() -> dict:
     init_semantic_memory()
     return {
         "messages": db_count(MEMORY_DB, "SELECT COUNT(*) FROM messages"),
-        "latest_message_time": latest_memory_message_time(),
         "chats": db_count(MEMORY_DB, "SELECT COUNT(*) FROM chats"),
         "ai_chunks": db_count(AI_DB, "SELECT COUNT(*) FROM ai_chunks"),
         "ai_vectors": db_count(AI_DB, "SELECT COUNT(*) FROM ai_vectors"),
@@ -1445,19 +1534,6 @@ def file_size(path: Path) -> int:
         return path.stat().st_size if path.exists() else 0
     except OSError:
         return 0
-
-
-def directory_size(path: Path) -> int:
-    if not path.exists():
-        return 0
-    total = 0
-    try:
-        for item in path.rglob("*"):
-            if item.is_file():
-                total += file_size(item)
-    except OSError:
-        return total
-    return total
 
 
 def format_bytes(value: int) -> str:
@@ -1705,19 +1781,14 @@ def memory_database_overview(chat: str = "") -> dict:
                 "tables": table_stats,
             }
         )
-    core_database_bytes = sum(file_size(path) for path in (MEMORY_DB, AI_DB))
-    runtime_total_bytes = directory_size(ROOT / "runtime")
+    total_bytes = sum(file_size(path) for path in (MEMORY_DB, AI_DB))
     return {
         "ok": True,
         "chat_username": chat,
         "chat_display_name": chat_display_name_for(chat) if chat else "全部会话",
         "generated_at": now_iso(),
-        "total_bytes": core_database_bytes,
-        "total_size": format_bytes(core_database_bytes),
-        "core_database_bytes": core_database_bytes,
-        "core_database_size": format_bytes(core_database_bytes),
-        "runtime_total_bytes": runtime_total_bytes,
-        "runtime_total_size": format_bytes(runtime_total_bytes),
+        "total_bytes": total_bytes,
+        "total_size": format_bytes(total_bytes),
         "databases": databases,
         "modules": modules,
         "export_modules": [
@@ -2675,36 +2746,72 @@ def is_memory_task_text(text: str) -> bool:
     normalized = str(text or "").strip()
     if not normalized:
         return False
+    direct_keywords = (
+        "总结",
+        "汇总",
+        "概括",
+        "复盘",
+        "回顾",
+        "查记录",
+        "聊天记录",
+        "群里说了",
+        "群里聊了",
+        "今天群里",
+        "刚才群里",
+        "之前说",
+        "谁说过",
+        "记得",
+        "上下文",
+        "锐评",
+        "点评",
+        "评价下",
+        "评价一下",
+        "口头禅",
+        "爱说",
+        "常说",
+        "经常说",
+        "总是说",
+        "老说",
+        "说得最多",
+        "说的最多",
+        "高频词",
+        "高频短句",
+        "说话风格",
+        "人物画像",
+        "什么风格",
+    )
+    if any(word in normalized for word in direct_keywords):
+        return True
+    return bool(
+        re.search(r"(锐评|点评|评价|分析).{0,24}(行为|口头禅|说话|风格|习惯)", normalized)
+        or re.search(r"(谁|哪位|哪个).{0,12}(最爱说|常说|总说|说过)", normalized)
+        or re.search(r"(tql|xmsl|yyds|666|nb|牛逼).{0,16}(行为|口头禅|谁|总说|常说|爱说)", normalized, flags=re.I)
+    )
+
+
+def is_person_memory_task_text(text: str) -> bool:
+    normalized = str(text or "").strip()
+    if not normalized:
+        return False
     return any(
         word in normalized
         for word in (
-            "总结",
-            "汇总",
-            "概括",
-            "复盘",
-            "回顾",
-            "查记录",
-            "聊天记录",
-            "群里说了",
-            "群里聊了",
-            "今天群里",
-            "刚才群里",
-            "之前说",
-            "谁说过",
-            "记得",
-            "上下文",
-            "人物画像",
-            "用户画像",
-            "画像",
+            "锐评",
+            "点评",
+            "评价下",
+            "评价一下",
             "口头禅",
-            "口癖",
-            "爱说什么",
-            "常说什么",
-            "最常说",
-            "说的最多",
+            "爱说",
+            "常说",
+            "经常说",
+            "总是说",
+            "老说",
             "说得最多",
-            "经典发言",
-            "代表发言",
+            "说的最多",
+            "高频词",
+            "高频短句",
+            "说话风格",
+            "人物画像",
         )
     )
 
@@ -2712,9 +2819,23 @@ def is_memory_task_text(text: str) -> bool:
 def memory_task_max_tokens(text: str, default_value: int) -> int:
     if not is_memory_task_text(text):
         return default_value
+    if is_person_memory_task_text(text):
+        return max(default_value, 620)
     if any(word in text for word in ("详细", "完整", "展开", "全部", "长一点")):
         return max(default_value, 1200)
     return max(default_value, 900)
+
+
+def llm_result_truncated(result: dict | None) -> bool:
+    if not isinstance(result, dict):
+        return False
+    finish_reason = str(result.get("finish_reason") or "").lower()
+    if finish_reason == "length":
+        return True
+    error = result.get("error")
+    if isinstance(error, dict) and str(error.get("finish_reason") or "").lower() == "length":
+        return True
+    return False
 
 
 def request_llm(profile: dict, prompt: str, system_prompt: str | None = None) -> dict:
@@ -3227,12 +3348,103 @@ def verify_reply_draft_owner(reply_text: str, chat_username: str, timeout_second
     }
 
 
+def verify_opened_target_chat(open_details: dict | None, chat_username: str) -> dict:
+    details = open_details if isinstance(open_details, dict) else {}
+    chat_username = str(chat_username or "").strip()
+    after = details.get("after_position") if isinstance(details.get("after_position"), dict) else {}
+    before = details.get("before_position") if isinstance(details.get("before_position"), dict) else {}
+    after_row = after.get("row") if isinstance(after.get("row"), dict) else {}
+    before_row = before.get("row") if isinstance(before.get("row"), dict) else {}
+    controller = details.get("controller") if isinstance(details.get("controller"), dict) else {}
+    controller_payload = controller.get("controller") if isinstance(controller.get("controller"), dict) else {}
+    search_query = clean_contact_text(controller_payload.get("search_query") or "")
+    after_username = str(after_row.get("username") or "").strip()
+    before_sort = int(details.get("before_sort_timestamp") or before_row.get("sort_timestamp") or 0)
+    after_sort = int(details.get("after_sort_timestamp") or after_row.get("sort_timestamp") or 0)
+    after_index = clamp_int(after.get("index"), 9999, 0, 9999)
+    method_ok = str(details.get("method") or "") == "wechat_controller_open"
+    switched = not bool(details.get("skipped_switch"))
+    target_first = bool(chat_username and after_username == chat_username and after_index == 0)
+    sort_moved = bool(after_sort >= before_sort and (after_sort > before_sort or target_first))
+    ok = bool(method_ok and switched and target_first and search_query and sort_moved)
+    reasons = []
+    if not method_ok:
+        reasons.append("未执行微信搜索切群")
+    if not switched:
+        reasons.append("复用了缓存群窗口")
+    if not target_first:
+        reasons.append("目标群未出现在最近会话第一位")
+    if not search_query:
+        reasons.append("缺少微信搜索词")
+    if not sort_moved:
+        reasons.append("目标群会话位置未确认打开")
+    return {
+        "ok": ok,
+        "method": details.get("method") or "",
+        "search_query": search_query,
+        "target_chat_username": chat_username,
+        "after_username": after_username,
+        "after_index": after_index,
+        "before_sort_timestamp": before_sort,
+        "after_sort_timestamp": after_sort,
+        "skipped_switch": bool(details.get("skipped_switch")),
+        "reason": "" if ok else "；".join(reasons),
+    }
+
+
 def strip_plain_mention_prefix(reply_text: str, mention_display: str = "") -> str:
     text = str(reply_text or "").strip()
     name = clean_contact_text(mention_display)
     if name and text.startswith(f"@{name}"):
         return text[len(name) + 1 :].lstrip(" \t\r\n:：,，")
     return text
+
+
+def with_reply_mention(reply_text: str, mention_target: str = "", required: bool = False) -> str:
+    if not required:
+        return strip_plain_mention_prefix(reply_text, mention_target)
+    return ensure_reply_mentions_sender(reply_text, mention_target)
+
+
+def is_blue_mention_failure(error: str) -> bool:
+    text = str(error or "")
+    return "微信蓝色@校验失败" in text or "拒绝发送裸 alias" in text
+
+
+def sent_reply_text(send_result: dict, fallback: str = "") -> str:
+    details = send_result.get("details") if isinstance(send_result, dict) and isinstance(send_result.get("details"), dict) else {}
+    return str(details.get("reply_text_sent") or fallback or "").strip()
+
+
+def looks_like_internal_wechat_username(value: str) -> bool:
+    text = clean_contact_text(value).lower()
+    return bool(text and (text.startswith("wxid_") or text.endswith("@chatroom")))
+
+
+def mention_search_alias_from_contact(contact: dict | None, display: str = "", explicit_alias: str = "") -> tuple[str, str]:
+    contact = contact if isinstance(contact, dict) else {}
+    values = [
+        clean_contact_text(explicit_alias),
+        clean_contact_text(contact.get("alias")),
+        clean_contact_text(contact.get("remark")),
+        clean_contact_text(contact.get("nick_name")),
+        clean_contact_text(display),
+    ]
+    for value in values:
+        if not value or looks_like_internal_wechat_username(value):
+            continue
+        ascii_words = re.findall(r"[A-Za-z][A-Za-z0-9_-]{1,31}", value)
+        for word in ascii_words:
+            if len(word) >= 2:
+                source = (
+                    "alias"
+                    if value in {clean_contact_text(explicit_alias), clean_contact_text(contact.get("alias"))}
+                    else "latin_name"
+                )
+                return word, source
+        if value in {clean_contact_text(explicit_alias), clean_contact_text(contact.get("alias"))}:
+            return value, "alias"
+    return "", ""
 
 
 def resolve_reply_mention(chat_username: str, mention: dict | None = None, mention_target: str = "") -> dict:
@@ -3267,12 +3479,15 @@ def resolve_reply_mention(chat_username: str, mention: dict | None = None, menti
             member_username = clean_contact_text(mapped.get("member_username")) or member_username
             alias = clean_contact_text(mapped.get("alias")) or alias
             display = clean_contact_text(mapped.get("group_nickname")) or display
+    mention_alias, mention_alias_source = mention_search_alias_from_contact(contact, display, explicit_alias=alias)
     return {
         "member_username": member_username,
         "alias": alias,
+        "mention_alias": mention_alias,
+        "mention_alias_source": mention_alias_source,
         "group_nickname": display,
         "display": display,
-        "can_blue_mention": bool(alias),
+        "can_blue_mention": bool(mention_alias),
     }
 
 
@@ -3369,6 +3584,29 @@ def prepare_verified_wechat_chat(
     }
 
 
+def wechat_send_failure(
+    message: str,
+    error: str,
+    *,
+    chat_username: str = "",
+    chat_display_name: str = "",
+    details: dict | None = None,
+) -> dict:
+    result = {"ok": False, "error": str(error or message or "微信发送失败")}
+    if details is not None:
+        result["details"] = details
+    system_log_event(
+        "wechat_send",
+        "error",
+        message,
+        error=result["error"],
+        details=details or {},
+        chat_username=chat_username,
+        chat_display_name=chat_display_name,
+    )
+    return result
+
+
 def paste_reply_to_wechat(
     text: str,
     send: bool = False,
@@ -3376,24 +3614,61 @@ def paste_reply_to_wechat(
     chat_username: str = "",
     delays: dict | None = None,
     mention: dict | None = None,
+    mention_required: bool = False,
 ) -> dict:
     reply_text = str(text or "").strip()
     if not reply_text:
-        return {"ok": False, "error": "回复内容为空"}
+        return wechat_send_failure(
+            "微信发送准备失败，已按要求不发送",
+            "回复内容为空",
+            chat_username=chat_username,
+            chat_display_name=chat_display_name,
+            details={"stage": "prepare", "chat_username": chat_username, "chat_display_name": chat_display_name},
+        )
     if len(reply_text) > 4000:
-        return {"ok": False, "error": "回复内容过长，已拒绝粘贴"}
+        return wechat_send_failure(
+            "微信发送准备失败，已按要求不发送",
+            "回复内容过长，已拒绝粘贴",
+            chat_username=chat_username,
+            chat_display_name=chat_display_name,
+            details={"stage": "prepare", "text_length": len(reply_text)},
+        )
     target_name = preferred_chat_display_name(chat_username, chat_display_name) or clean_contact_text(chat_username)
     if not target_name:
-        return {"ok": False, "error": "缺少目标群名，拒绝粘贴以避免发错群"}
+        return wechat_send_failure(
+            "微信发送准备失败，已按要求不发送",
+            "缺少目标群名，拒绝粘贴以避免发错群",
+            chat_username=chat_username,
+            chat_display_name=chat_display_name,
+            details={"stage": "prepare", "chat_username": chat_username, "chat_display_name": chat_display_name},
+        )
     delays = dict(delays or reply_sender_delays())
     if not send:
         delays["send_delay_seconds"] = 0
-    mention_info = resolve_reply_mention(chat_username, mention or {})
-    if mention_info.get("alias"):
+    mention_info = resolve_reply_mention(chat_username, mention or {}) if mention_required else {}
+    mention_alias = clean_contact_text(mention_info.get("mention_alias") or mention_info.get("alias"))
+    can_blue_mention = bool(
+        mention_alias and mention_info.get("mention_alias_source") in {"alias", "latin_name"}
+    )
+    if mention_required and not can_blue_mention:
+        return wechat_send_failure(
+            "微信蓝色@准备失败，已按要求不发送",
+            "缺少可用于蓝色@的 alias，拒绝发送普通@文本",
+            chat_username=chat_username,
+            chat_display_name=target_name,
+            details={"stage": "mention_prepare", "target_chat": target_name, "mention": mention_info},
+        )
+    if mention_alias:
         reply_text = strip_plain_mention_prefix(reply_text, mention_info.get("group_nickname") or mention_info.get("display") or "")
-    verified = prepare_verified_wechat_chat(target_name, chat_username, delays=delays, allow_cached_active=True)
+    verified = prepare_verified_wechat_chat(target_name, chat_username, delays=delays, allow_cached_active=False)
     if not verified.get("ok"):
-        return verified
+        return wechat_send_failure(
+            "微信切群验证失败，已按要求不发送",
+            str(verified.get("error") or "prepare chat failed"),
+            chat_username=chat_username,
+            chat_display_name=target_name,
+            details={"stage": "prepare_verified_wechat_chat", "target_chat": target_name, "result": verified},
+        )
     paste_attempts = []
     result = None
     draft_verify = None
@@ -3407,7 +3682,7 @@ def paste_reply_to_wechat(
                 target_name,
                 chat_username,
                 delays={"switch_delay_seconds": 0.35},
-                allow_cached_active=not force_reopen,
+                allow_cached_active=False,
             )
             if force_reopen:
                 write_sender_state(
@@ -3430,13 +3705,13 @@ def paste_reply_to_wechat(
             "--send-delay",
             "0",
         ]
-        if mention_info.get("alias"):
+        if can_blue_mention:
             controller_args = [
                 "mention-paste",
                 "--text-b64",
                 b64_arg(reply_text),
                 "--mention-alias-b64",
-                b64_arg(mention_info.get("alias") or ""),
+                b64_arg(mention_alias),
                 "--mention-display-b64",
                 b64_arg(mention_info.get("group_nickname") or mention_info.get("display") or ""),
                 "--send-delay",
@@ -3444,14 +3719,68 @@ def paste_reply_to_wechat(
             ]
         result = run_wechat_controller(controller_args, timeout=35)
         paste_attempts.append({"attempt": attempt + 1, "paste": result})
+        if (
+            can_blue_mention
+            and not mention_required
+            and not result.get("ok")
+            and is_blue_mention_failure(result.get("error") or "")
+        ):
+            fallback_text = strip_plain_mention_prefix(
+                reply_text,
+                mention_info.get("group_nickname") or mention_info.get("display") or "",
+            )
+            fallback_result = run_wechat_controller(
+                [
+                    "paste",
+                    "--text-b64",
+                    b64_arg(fallback_text),
+                    "--send-delay",
+                    "0",
+                ],
+                timeout=35,
+            )
+            fallback_verify = (fallback_result.get("controller") or {}).get("input_verify") or {}
+            paste_attempts.append(
+                {
+                    "attempt": attempt + 1,
+                    "paste": fallback_result,
+                    "mention_fallback": {
+                        "mode": "plain_text_without_mention",
+                        "required": False,
+                        "blue_mention_error": result.get("error") or "",
+                    },
+                }
+            )
+            if fallback_result.get("ok"):
+                system_log_from_message(
+                    "wechat_send",
+                    "warning",
+                    "蓝色@失败，已降级为普通文本回复",
+                    None,
+                    error=str(result.get("error") or ""),
+                    details={
+                        "target_chat": target_name,
+                        "chat_username": chat_username,
+                        "mention": mention_info,
+                        "fallback_text_preview": fallback_text[:120],
+                    },
+                )
+                result = fallback_result
+                reply_text = fallback_text
+                input_verify = fallback_verify
+                draft_verify = verify_reply_draft_owner(reply_text, chat_username, timeout_seconds=0.8)
+                can_blue_mention = False
+            else:
+                result = fallback_result
         if not result.get("ok"):
             continue
         input_verify = (result.get("controller") or {}).get("input_verify") or {}
-        if mention_info.get("alias"):
+        if can_blue_mention:
             draft_verify = {
                 "ok": True,
                 "skipped": True,
                 "reason": "blue mention token already verified in input box",
+                "mention_alias_source": mention_info.get("mention_alias_source") or "",
             }
         else:
             draft_verify = verify_reply_draft_owner(reply_text, chat_username, timeout_seconds=0.8)
@@ -3476,35 +3805,104 @@ def paste_reply_to_wechat(
             needs_forced_reopen = False
             break
     if not result or not result.get("ok"):
-        return {
-            "ok": False,
-            "error": (result or {}).get("error") or "微信窗口粘贴失败",
-            "details": {
-                "target_chat": target_name,
-                "chat_username": chat_username,
-                "open_chat": verified.get("details", {}),
-                "paste": result or {},
-                "paste_attempts": paste_attempts,
-                "delays": delays,
-                "mention": mention_info,
-            },
+        details = {
+            "stage": "paste",
+            "target_chat": target_name,
+            "chat_username": chat_username,
+            "open_chat": verified.get("details", {}),
+            "paste": result or {},
+            "paste_attempts": paste_attempts,
+            "delays": delays,
+            "mention": mention_info,
         }
+        return wechat_send_failure(
+            "微信粘贴失败，已按要求不发送",
+            (result or {}).get("error") or "微信窗口粘贴失败",
+            chat_username=chat_username,
+            chat_display_name=target_name,
+            details=details,
+        )
     if not input_verify or not input_verify.get("ok") or needs_forced_reopen:
-        return {
-            "ok": False,
-            "error": (draft_verify or {}).get("error") if needs_forced_reopen else (input_verify or {}).get("error") or "微信输入框内容校验失败",
-            "details": {
+        clear_result = run_wechat_controller(["clear"], timeout=15)
+        details = {
+            "stage": "input_verify",
+            "target_chat": target_name,
+            "chat_username": chat_username,
+            "open_chat": verified.get("details", {}),
+            "paste": result,
+            "input_verify": input_verify or {},
+            "draft_verify": draft_verify or {},
+            "clear": clear_result,
+            "paste_attempts": paste_attempts,
+            "delays": delays,
+            "mention": mention_info,
+        }
+        return wechat_send_failure(
+            "微信输入框校验失败，已按要求不发送",
+            (draft_verify or {}).get("error") if needs_forced_reopen else (input_verify or {}).get("error") or "微信输入框内容校验失败",
+            chat_username=chat_username,
+            chat_display_name=target_name,
+            details=details,
+        )
+    if send and not can_blue_mention and (not draft_verify or not draft_verify.get("ok")):
+        open_verify = verify_opened_target_chat(verified.get("details", {}), chat_username)
+        draft_owners = {str(owner or "") for owner in ((draft_verify or {}).get("owners") or [])}
+        wrong_owner = bool(draft_owners and chat_username not in draft_owners)
+        if not open_verify.get("ok") or wrong_owner:
+            clear_result = run_wechat_controller(["clear"], timeout=15)
+            write_sender_state(
+                {
+                    "active_chat_username": "",
+                    "active_chat_display_name": "",
+                    "invalidated_at": now_iso(),
+                    "invalidate_reason": "draft owner verification failed before submit",
+                    "open_verify": open_verify,
+                    "draft_owners": list(draft_owners)[:5],
+                }
+            )
+            details = {
+                "stage": "draft_owner_verify",
                 "target_chat": target_name,
                 "chat_username": chat_username,
                 "open_chat": verified.get("details", {}),
+                "open_verify": open_verify,
                 "paste": result,
-                "input_verify": input_verify or {},
+                "input_verify": input_verify,
                 "draft_verify": draft_verify or {},
+                "clear": clear_result,
                 "paste_attempts": paste_attempts,
                 "delays": delays,
                 "mention": mention_info,
-            },
+            }
+            return wechat_send_failure(
+                "微信目标群草稿归属校验失败，已清空输入框并拒绝发送",
+                "草稿归属指向其他群，拒绝发送"
+                if wrong_owner
+                else (draft_verify or {}).get("error") or open_verify.get("reason") or "目标群草稿未确认，拒绝按回车以避免发错群",
+                chat_username=chat_username,
+                chat_display_name=target_name,
+                details=details,
+            )
+        draft_verify = {
+            **(draft_verify or {}),
+            "ok": True,
+            "fallback_ok": True,
+            "fallback_reason": "草稿表未记录内容，但本次微信搜索切群已确认目标群打开到最近会话第一位，且输入框内容校验通过。",
+            "open_verify": open_verify,
         }
+        system_log_event(
+            "wechat_send",
+            "warning",
+            "草稿表未更新，已使用切群验证兜底允许发送",
+            details={
+                "target_chat": target_name,
+                "chat_username": chat_username,
+                "open_verify": open_verify,
+                "draft_verify": draft_verify,
+            },
+            chat_username=chat_username,
+            chat_display_name=target_name,
+        )
     submit = {}
     if send:
         submit = run_wechat_controller(
@@ -3512,21 +3910,25 @@ def paste_reply_to_wechat(
             timeout=35,
         )
         if not submit.get("ok"):
-            return {
-                "ok": False,
-                "error": submit.get("error") or "微信窗口发送失败",
-                "details": {
-                    "target_chat": target_name,
-                    "chat_username": chat_username,
-                    "open_chat": verified.get("details", {}),
-                    "paste": result,
-                    "input_verify": input_verify,
-                    "draft_verify": draft_verify,
-                    "submit": submit,
-                    "paste_attempts": paste_attempts,
-                    "delays": delays,
-                },
+            details = {
+                "stage": "submit",
+                "target_chat": target_name,
+                "chat_username": chat_username,
+                "open_chat": verified.get("details", {}),
+                "paste": result,
+                "input_verify": input_verify,
+                "draft_verify": draft_verify,
+                "submit": submit,
+                "paste_attempts": paste_attempts,
+                "delays": delays,
             }
+            return wechat_send_failure(
+                "微信发送按键失败，已按要求不发送",
+                submit.get("error") or "微信窗口发送失败",
+                chat_username=chat_username,
+                chat_display_name=target_name,
+                details=details,
+            )
     write_sender_state(
         {
             "active_chat_username": chat_username,
@@ -3550,6 +3952,8 @@ def paste_reply_to_wechat(
             "paste_attempts": paste_attempts,
             "delays": delays,
             "mention": mention_info,
+            "mention_required": bool(mention_required),
+            "reply_text_sent": reply_text,
         },
     }
 
@@ -3807,10 +4211,10 @@ BUILTIN_SKILL_DEFINITIONS = {
     },
     "web-search": {
         "name": "web-search",
-        "description": "使用 Tavily 搜索网络资讯；有 Tavily 额度时优先联网搜索，没有额度或未配置时退回模型能力。",
+        "description": "使用 Tavily 搜索网络资讯；搜索或总结失败时只记录错误，不发送非实时兜底回复。",
         "permissions": ["network", "llm", "send_text"],
         "triggers": ["搜索", "查一下", "联网查", "最新", "新闻", "网络资讯"],
-        "config": {"auto_enabled": False, "tavily_enabled": True, "tavily_search_max_results": 5, "fallback_to_llm": True},
+        "config": {"auto_enabled": False, "tavily_enabled": True, "tavily_search_max_results": 5, "fallback_to_llm": False},
     },
     "image-understanding": {
         "name": "image-understanding",
@@ -4094,6 +4498,228 @@ def json_safe_payload(value, *, max_text: int = 2000):
     return str(value)
 
 
+SYSTEM_LOG_CATEGORY_LABELS = {
+    "auto_reply": "自动回复",
+    "llm": "模型",
+    "skill": "技能",
+    "wechat_send": "微信发送",
+    "login_guard": "登录守护",
+    "memory": "记忆",
+    "system": "系统",
+    "api": "接口",
+}
+
+SYSTEM_LOG_LEVEL_LABELS = {
+    "info": "信息",
+    "success": "成功",
+    "warning": "警告",
+    "error": "错误",
+    "debug": "调试",
+}
+
+
+def system_log_event(
+    category: str,
+    level: str,
+    message: str,
+    *,
+    error: str = "",
+    details: dict | None = None,
+    chat_username: str = "",
+    chat_display_name: str = "",
+    message_uid: str = "",
+    source_text: str = "",
+) -> dict:
+    category = str(category or "system").strip()[:40] or "system"
+    level = str(level or "info").strip()[:20] or "info"
+    created_at = now_iso()
+    safe_details = json_safe_payload(details or {}, max_text=900)
+    event = {
+        "event_id": hashlib.sha256(
+            f"{created_at}|{category}|{level}|{message}|{error}|{time.time_ns()}".encode("utf-8", errors="replace")
+        ).hexdigest()[:20],
+        "created_at": created_at,
+        "timestamp": created_at,
+        "epoch": int(time.time()),
+        "category": category,
+        "category_label": SYSTEM_LOG_CATEGORY_LABELS.get(category, category),
+        "level": level,
+        "level_label": SYSTEM_LOG_LEVEL_LABELS.get(level, level),
+        "message": clean_contact_text(message)[:360],
+        "error": clean_contact_text(error)[:800],
+        "chat_username": str(chat_username or "").strip()[:200],
+        "chat_display_name": clean_contact_text(chat_display_name)[:160],
+        "message_uid": str(message_uid or "").strip()[:120],
+        "source_text": clean_contact_text(source_text)[:360],
+        "details": safe_details,
+    }
+    try:
+        with SYSTEM_LOG_LOCK:
+            SYSTEM_LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+            with SYSTEM_LOG_FILE.open("a", encoding="utf-8") as f:
+                f.write(json.dumps(event, ensure_ascii=False) + "\n")
+    except OSError as exc:
+        print(f"system log write failed: {exc}", flush=True)
+    return event
+
+
+def system_log_from_message(
+    category: str,
+    level: str,
+    log_message: str,
+    message: dict | None = None,
+    *,
+    error: str = "",
+    details: dict | None = None,
+) -> dict:
+    row = message or {}
+    return system_log_event(
+        category,
+        level,
+        log_message,
+        error=error,
+        details=details,
+        chat_username=str(row.get("chat_username") or ""),
+        chat_display_name=str(row.get("chat_display_name") or ""),
+        message_uid=str(row.get("message_uid") or ""),
+        source_text=str(row.get("text") or ""),
+    )
+
+
+def system_log_matches_query(event: dict, query: str) -> bool:
+    query = clean_contact_text(query).lower()
+    if not query:
+        return True
+    haystack = " ".join(
+        [
+            str(event.get("message") or ""),
+            str(event.get("error") or ""),
+            str(event.get("category_label") or event.get("category") or ""),
+            str(event.get("level_label") or event.get("level") or ""),
+            str(event.get("chat_display_name") or ""),
+            str(event.get("chat_username") or ""),
+            str(event.get("message_uid") or ""),
+            str(event.get("source_text") or ""),
+            json.dumps(event.get("details") or {}, ensure_ascii=False),
+        ]
+    ).lower()
+    return query in haystack
+
+
+def read_system_log_events(limit: int = 120, category: str = "", level: str = "", query: str = "") -> list[dict]:
+    limit = clamp_int(limit, 120, 1, 500)
+    category = str(category or "").strip()
+    level = str(level or "").strip()
+    query = clean_contact_text(query)
+    if not SYSTEM_LOG_FILE.exists():
+        return []
+    try:
+        with SYSTEM_LOG_LOCK:
+            lines = SYSTEM_LOG_FILE.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return []
+    events = []
+    for line in reversed(lines[-5000:]):
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if category and event.get("category") != category:
+            continue
+        if level and event.get("level") != level:
+            continue
+        if query and not system_log_matches_query(event, query):
+            continue
+        events.append(event)
+        if len(events) >= limit:
+            break
+    return events
+
+
+def system_log_stats() -> dict:
+    if not SYSTEM_LOG_FILE.exists():
+        return {"total": 0, "by_category": [], "by_level": [], "error_counts": []}
+    category_counts: Counter[str] = Counter()
+    level_counts: Counter[str] = Counter()
+    error_counts: Counter[str] = Counter()
+    total = 0
+    try:
+        with SYSTEM_LOG_LOCK:
+            lines = SYSTEM_LOG_FILE.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        lines = []
+    for line in lines:
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        total += 1
+        category = str(event.get("category") or "system")
+        level = str(event.get("level") or "info")
+        category_counts[category] += 1
+        level_counts[level] += 1
+        error_key = clean_contact_text(event.get("error") or event.get("message") or "")[:120]
+        if level in {"error", "warning"} and error_key:
+            error_counts[f"{category}|{error_key}"] += 1
+    return {
+        "total": total,
+        "by_category": [
+            {"category": key, "label": SYSTEM_LOG_CATEGORY_LABELS.get(key, key), "count": count}
+            for key, count in category_counts.most_common()
+        ],
+        "by_level": [
+            {"level": key, "label": SYSTEM_LOG_LEVEL_LABELS.get(key, key), "count": count}
+            for key, count in level_counts.most_common()
+        ],
+        "error_counts": [
+            {
+                "category": key.split("|", 1)[0],
+                "message": key.split("|", 1)[1] if "|" in key else key,
+                "count": count,
+            }
+            for key, count in error_counts.most_common(30)
+        ],
+    }
+
+
+def system_logs_payload(limit: int = 120, category: str = "", level: str = "", query: str = "") -> dict:
+    events = read_system_log_events(limit, category, level, query)
+    return {
+        "ok": True,
+        "generated_at": now_iso(),
+        "events": events,
+        "stats": system_log_stats(),
+        "query": clean_contact_text(query),
+        "categories": [
+            {"category": key, "label": label}
+            for key, label in SYSTEM_LOG_CATEGORY_LABELS.items()
+        ],
+        "levels": [
+            {"level": key, "label": label}
+            for key, label in SYSTEM_LOG_LEVEL_LABELS.items()
+        ],
+    }
+
+
+def log_reply_execution_failure(
+    message: dict | None,
+    stage: str,
+    error: str,
+    *,
+    category: str = "auto_reply",
+    level: str = "error",
+    details: dict | None = None,
+) -> dict:
+    return system_log_from_message(
+        category,
+        level,
+        f"{stage}失败，已按要求不发送",
+        message or {},
+        error=str(error or "unknown error"),
+        details={"stage": stage, **(details or {})},
+    )
+
+
 def compact_skill_payload(value, *, max_text: int = 360, max_items: int = 8):
     safe = json_safe_payload(value, max_text=max_text)
     if isinstance(safe, dict):
@@ -4218,6 +4844,25 @@ def record_skill_run(
             """,
             row,
         )
+    system_log_event(
+        "skill",
+        "error" if status == "failed" or error else "success",
+        f"技能 {row['skill_id']} {'失败' if status == 'failed' or error else '完成'}",
+        error=row["error"],
+        details={
+            "run_id": row["run_id"],
+            "skill_id": row["skill_id"],
+            "status": status,
+            "elapsed_ms": row["elapsed_ms"],
+            "input": safe_input,
+            "output": safe_output if status == "failed" or error else {"ok": (output_payload or {}).get("ok")},
+            "artifacts": safe_artifacts,
+        },
+        chat_username=row["chat_username"],
+        chat_display_name=row["chat_display_name"],
+        message_uid=row["message_uid"],
+        source_text=str(input_payload.get("text") or message.get("text") or ""),
+    )
     return {**row, "input": safe_input, "output": safe_output, "artifacts": safe_artifacts}
 
 
@@ -4675,43 +5320,19 @@ def login_guard_notify(config: dict, text: str, title: str = "WeChatAgent 登录
     }
 
 
-def login_guard_test_notify(config: dict | None = None) -> dict:
-    config = config or read_config()
-    text = "\n".join(
-        [
-            "WeChatAgent 测试通知。",
-            f"发送时间：{now_iso()}",
-            "如果你在手机上看到这条消息，说明 Clawbot 通知链路正常。",
-        ]
-    )
-    result = login_guard_notify(config, text, "WeChatAgent 测试通知")
-    return {
-        "ok": bool(result.get("ok")),
-        "notify": result,
-        "message": "测试通知已发送" if result.get("ok") else str(result.get("error") or "测试通知发送失败"),
-        "state": public_login_guard_state(config),
-    }
-
-
-def login_guard_message(config: dict, state: dict, probe: dict, action: dict | None = None, ui: dict | None = None) -> str:
+def login_guard_message(config: dict, state: dict, probe: dict, action: dict | None = None) -> str:
     template = str(config.get("login_guard", {}).get("notify_template") or "").strip()
     if not template:
         template = DEFAULT_CONFIG["login_guard"]["notify_template"]
     lines = [template]
     if state.get("logout_detected_at"):
         lines.append(f"发现时间：{state.get('logout_detected_at')}")
-    ui = ui if isinstance(ui, dict) else {}
-    ui_state = str(ui.get("ui_state") or "").strip()
     if action and action.get("ok"):
         lines.append("已自动点击：我知道了 -> 登录。")
-    elif ui_state == "login_pending":
-        lines.append("已进入手机确认登录等待状态。")
     elif config.get("login_guard", {}).get("auto_click_relogin"):
         lines.append("自动点击登录未确认成功，请打开 3000 页面检查。")
-    if ui_state:
-        lines.append(f"微信窗口状态：{ui_state}")
     if probe.get("reason"):
-        lines.append(f"同步辅助信号：{probe.get('reason')}")
+        lines.append(f"检测信号：{probe.get('reason')}")
     lines.append("请在手机微信上确认登录。")
     return "\n".join(line for line in lines if line)
 
@@ -4724,22 +5345,6 @@ def should_repeat_login_notice(config: dict, state: dict, force_notify: bool = F
     if not last_notify_at:
         return True
     return (datetime.now(DISPLAY_TZ) - last_notify_at).total_seconds() >= repeat_seconds
-
-
-def login_guard_controller_ui(controller: dict) -> dict:
-    payload = controller.get("controller") if isinstance(controller.get("controller"), dict) else {}
-    ui_state = str(payload.get("ui_state") or "unknown")
-    login_required = bool(payload.get("login_required")) or ui_state == "login_required"
-    login_pending = ui_state == "login_pending"
-    available = bool(controller.get("ok") and payload.get("available"))
-    online = bool(available and ui_state == "chat" and not login_required and not login_pending)
-    return {
-        "available": available,
-        "ui_state": ui_state,
-        "login_required": login_required,
-        "login_pending": login_pending,
-        "online": online,
-    }
 
 
 def login_guard_once(config: dict | None = None, force_action: bool = False, force_notify: bool = False) -> dict:
@@ -4755,24 +5360,10 @@ def login_guard_once(config: dict | None = None, force_action: bool = False, for
     probe = login_guard_sync_probe(config)
     controller = run_wechat_controller(["status"], timeout=12)
     previous = login_guard_state()
-    ui = login_guard_controller_ui(controller)
-    online = bool(ui.get("online"))
-    details = {"probe": probe, "controller": controller, "ui": ui}
+    online = bool(probe.get("ok") and controller.get("ok"))
+    details = {"probe": probe, "controller": controller}
 
-    if ui.get("available") and ui.get("ui_state") == "unknown" and not force_action:
-        state = write_login_guard_state(
-            {
-                "ok": True,
-                "enabled": True,
-                "phase": "unknown",
-                "last_checked_at": checked_at,
-                "last_error": "微信窗口存在，但 UI 状态无法确认，暂不判断为恢复或掉线",
-                "details": details,
-            }
-        )
-        return {"ok": True, "state": public_login_guard_state(config), "online": False, "skipped": True, "reason": "ui_unknown"}
-
-    if probe.get("reason") == "no_sync_signal" and not force_action and not ui.get("login_required") and not ui.get("login_pending") and not online:
+    if probe.get("reason") == "no_sync_signal" and not force_action:
         state = write_login_guard_state(
             {
                 "ok": True,
@@ -4809,75 +5400,58 @@ def login_guard_once(config: dict | None = None, force_action: bool = False, for
             "notify_count": 0,
         }
         if previously_unresolved and guard.get("recovery_notify_enabled") and guard.get("notify_enabled"):
-            recovery_result = login_guard_notify(config, "微信 Agent 已恢复在线，微信窗口已回到可用聊天界面。", "WeChatAgent 已恢复")
+            recovery_result = login_guard_notify(config, "微信 Agent 已恢复在线，聊天同步信号恢复正常。", "WeChatAgent 已恢复")
             state_patch["last_notify_result"] = recovery_result
             state_patch["last_notify_at"] = checked_at
+            system_log_event(
+                "login_guard",
+                "success" if recovery_result.get("ok") else "warning",
+                "微信登录守护检测到恢复在线",
+                error="" if recovery_result.get("ok") else str(recovery_result.get("error") or "恢复通知失败"),
+                details={"recovery_notify": recovery_result, "probe": probe, "controller": controller},
+            )
         state = write_login_guard_state(state_patch)
         return {"ok": True, "state": public_login_guard_state(config), "online": True, "recovery_notify": recovery_result}
 
     phase = "suspected_logout"
     action_result = {}
     error = ""
-    should_click_login = bool(ui.get("login_required") or force_action)
-    if should_click_login and (guard.get("auto_click_relogin", True) or force_action):
+    if guard.get("auto_click_relogin", True) or force_action:
         with WECHAT_SEND_LOCK:
             action_result = run_wechat_controller(["login-guard-click"], timeout=18)
         details["action"] = action_result
         if action_result.get("ok"):
             phase = "waiting_mobile_confirm"
+            system_log_event(
+                "login_guard",
+                "warning",
+                "微信疑似掉线，已自动点击登录，等待手机确认",
+                details={"probe": probe, "action": action_result},
+            )
         else:
             phase = "error"
             error = action_result.get("error") or "自动点击登录失败"
-        action_payload = action_result.get("controller") if isinstance(action_result.get("controller"), dict) else {}
-        after_status = action_payload.get("after_status") if isinstance(action_payload.get("after_status"), dict) else {}
-        if action_result.get("ok") and after_status.get("ui_state") == "login_required":
-            phase = "suspected_logout"
-            error = "已尝试自动点击登录，但窗口仍停留在登录页"
-        elif action_result.get("ok") and after_status.get("ui_state") == "chat":
-            phase = "online"
-            error = ""
-    elif ui.get("login_pending"):
-        phase = "waiting_mobile_confirm"
-    elif not ui.get("available"):
-        phase = "error"
-        error = controller.get("error") or "未找到可用微信窗口"
+            system_log_event("login_guard", "error", "微信登录守护自动点击失败", error=error, details={"probe": probe, "action": action_result})
 
     logout_detected_at = previous.get("logout_detected_at") or checked_at
-    if phase == "online":
-        state_patch = {
-            "ok": True,
-            "enabled": True,
-            "phase": "online",
-            "last_checked_at": checked_at,
-            "last_online_at": checked_at,
-            "logout_detected_at": "",
-            "last_error": "",
-            "details": details,
-            "last_action_at": checked_at if action_result else previous.get("last_action_at", ""),
-            "last_notify_at": "",
-            "last_notify_result": {},
-            "notify_count": 0,
-        }
-        state = write_login_guard_state(state_patch)
-        return {"ok": True, "state": public_login_guard_state(config), "online": True, "action": action_result}
-
     notify_result = previous.get("last_notify_result") if isinstance(previous.get("last_notify_result"), dict) else {}
     notify_count = int(previous.get("notify_count") or 0)
     if guard.get("notify_enabled", True) and should_repeat_login_notice(config, previous, force_notify=force_notify):
-        message_ui = ui
-        action_payload = action_result.get("controller") if isinstance(action_result.get("controller"), dict) else {}
-        after_status = action_payload.get("after_status") if isinstance(action_payload.get("after_status"), dict) else {}
-        if after_status.get("ui_state"):
-            message_ui = login_guard_controller_ui({"ok": True, "controller": {"available": True, **after_status}})
         notify_text = login_guard_message(
             config,
             {"logout_detected_at": logout_detected_at},
             probe,
             action_result if isinstance(action_result, dict) else {},
-            message_ui,
         )
         notify_result = login_guard_notify(config, notify_text)
         notify_count += 1
+        system_log_event(
+            "login_guard",
+            "success" if notify_result.get("ok") else "error",
+            "微信登录守护通知已发送" if notify_result.get("ok") else "微信登录守护通知发送失败",
+            error="" if notify_result.get("ok") else str(notify_result.get("error") or "通知发送失败"),
+            details={"notify": notify_result, "phase": phase, "notify_count": notify_count},
+        )
         if not notify_result.get("ok") and phase != "error":
             phase = "notify_failed"
             error = str(notify_result.get("error") or "通知发送失败")
@@ -4922,20 +5496,6 @@ def login_guard_loop() -> None:
         time.sleep(min(10, max(2, sleep_seconds)))
 
 
-def docker_runtime_host_root() -> Path:
-    inspect = docker_container_inspect("wechat-agent-console")
-    data = inspect.get("data") if isinstance(inspect.get("data"), dict) else {}
-    mounts = data.get("Mounts") if isinstance(data.get("Mounts"), list) else []
-    for mount in mounts:
-        if not isinstance(mount, dict):
-            continue
-        destination = str(mount.get("Destination") or "").rstrip("/")
-        source = str(mount.get("Source") or "").strip()
-        if destination == "/app/runtime" and source:
-            return Path(source)
-    return ROOT / "runtime"
-
-
 def clawbot_runtime_dir() -> Path:
     path = ROOT / "runtime/clawbot"
     (path / "config").mkdir(parents=True, exist_ok=True)
@@ -4943,32 +5503,19 @@ def clawbot_runtime_dir() -> Path:
 
 
 def clawbot_host_config_path() -> Path:
-    host_runtime = docker_runtime_host_root()
-    host_path = host_runtime / "clawbot/config"
-    host_path.mkdir(parents=True, exist_ok=True)
-    (clawbot_runtime_dir() / "config").mkdir(parents=True, exist_ok=True)
-    return host_path
-
-
-def console_network_names() -> list[str]:
-    inspect = docker_container_inspect("wechat-agent-console")
-    data = inspect.get("data") if isinstance(inspect.get("data"), dict) else {}
-    network_settings = data.get("NetworkSettings") if isinstance(data.get("NetworkSettings"), dict) else {}
-    networks = network_settings.get("Networks") if isinstance(network_settings.get("Networks"), dict) else {}
-    return [str(name) for name in networks.keys() if str(name).strip()]
+    return clawbot_runtime_dir() / "config"
 
 
 def clawbot_auth_path() -> Path:
-    return clawbot_runtime_dir() / "config/auth.json"
+    return clawbot_host_config_path() / "auth.json"
 
 
 def clawbot_login_log_path() -> Path:
-    return clawbot_runtime_dir() / "config/wechatagent-login.log"
+    return clawbot_host_config_path() / "wechatagent-login.log"
 
 
 def docker_create_clawbot_container() -> dict:
     host_config = str(clawbot_host_config_path())
-    network_names = console_network_names()
     payload = {
         "Image": CLAWBOT_IMAGE,
         "ExposedPorts": {f"{CLAWBOT_PORT}/tcp": {}},
@@ -4978,8 +5525,6 @@ def docker_create_clawbot_container() -> dict:
             "RestartPolicy": {"Name": "unless-stopped"},
         },
     }
-    if network_names:
-        payload["NetworkingConfig"] = {"EndpointsConfig": {network_names[0]: {}}}
     status, data = docker_api_request(
         "POST",
         f"/containers/create?name={quote(CLAWBOT_CONTAINER, safe='')}",
@@ -4989,43 +5534,6 @@ def docker_create_clawbot_container() -> dict:
     if status == 409:
         return {"ok": True, "exists": True, "status": status, "data": data}
     return {"ok": 200 <= status < 300, "exists": 200 <= status < 300, "status": status, "data": data}
-
-
-def docker_network_connect(network: str, container: str, timeout: int = 20) -> dict:
-    status, data = docker_api_request(
-        "POST",
-        f"/networks/{quote(network, safe='')}/connect",
-        {"Container": container},
-        timeout=timeout,
-    )
-    return {"ok": status in {200, 201, 204, 304, 403}, "status": status, "data": data}
-
-
-def ensure_clawbot_networks() -> dict:
-    inspect = docker_container_inspect(CLAWBOT_CONTAINER)
-    data = inspect.get("data") if isinstance(inspect.get("data"), dict) else {}
-    network_settings = data.get("NetworkSettings") if isinstance(data.get("NetworkSettings"), dict) else {}
-    current = network_settings.get("Networks") if isinstance(network_settings.get("Networks"), dict) else {}
-    connected = {}
-    for network in console_network_names():
-        if network in current:
-            connected[network] = {"ok": True, "already": True}
-            continue
-        connected[network] = docker_network_connect(network, CLAWBOT_CONTAINER)
-    return connected
-
-
-def docker_pull_image(image: str, timeout: int = 180) -> dict:
-    name, tag = image, "latest"
-    if ":" in image.rsplit("/", 1)[-1]:
-        name, tag = image.rsplit(":", 1)
-    status, data = docker_api_request(
-        "POST",
-        f"/images/create?fromImage={quote(name, safe='')}&tag={quote(tag, safe='')}",
-        None,
-        timeout=timeout,
-    )
-    return {"ok": 200 <= status < 300, "status": status, "data": data}
 
 
 def docker_start_container(container: str, timeout: int = 20) -> dict:
@@ -5038,9 +5546,6 @@ def ensure_clawbot_container(start: bool = True) -> dict:
     created = {}
     if not inspect.get("exists"):
         created = docker_create_clawbot_container()
-        if not created.get("ok") and created.get("status") == 404:
-            created["pull"] = docker_pull_image(CLAWBOT_IMAGE)
-            created = docker_create_clawbot_container()
         inspect = docker_container_inspect(CLAWBOT_CONTAINER)
     started = {}
     data = inspect.get("data") if isinstance(inspect.get("data"), dict) else {}
@@ -5048,62 +5553,7 @@ def ensure_clawbot_container(start: bool = True) -> dict:
     if start and inspect.get("exists") and not state.get("Running"):
         started = docker_start_container(CLAWBOT_CONTAINER)
         inspect = docker_container_inspect(CLAWBOT_CONTAINER)
-    networks = ensure_clawbot_networks() if inspect.get("exists") else {}
-    return {"ok": bool(inspect.get("exists")), "inspect": inspect, "created": created, "started": started, "networks": networks}
-
-
-def clawbot_auth_candidates(data) -> list[dict]:
-    candidates: list[dict] = []
-
-    def add_candidate(value, key_hint: str = "") -> None:
-        if not isinstance(value, dict):
-            return
-        bot_id = str(
-            value.get("bot_id")
-            or value.get("id")
-            or value.get("ilink_bot_id")
-            or value.get("ilink_user_id")
-            or value.get("user_id")
-            or value.get("to_user_id")
-            or key_hint
-            or ""
-        ).strip()
-        token = str(
-            value.get("api_token")
-            or value.get("bot_token")
-            or value.get("ilink_bot_token")
-            or value.get("token")
-            or value.get("access_token")
-            or ""
-        ).strip()
-        if bot_id or token:
-            candidates.append({"bot_id": bot_id, "api_token": token, "token_tail": token[-6:] if token else ""})
-
-    if isinstance(data, dict):
-        raw_items = data.get("bots")
-        if isinstance(raw_items, list):
-            for item in raw_items:
-                add_candidate(item)
-        elif isinstance(raw_items, dict):
-            for key, value in raw_items.items():
-                add_candidate(value, str(key))
-        add_candidate(data)
-        for key, value in data.items():
-            if isinstance(value, dict):
-                add_candidate(value, str(key))
-    elif isinstance(data, list):
-        for item in data:
-            add_candidate(item)
-
-    deduped = []
-    seen = set()
-    for item in candidates:
-        marker = (item.get("bot_id") or "", item.get("api_token") or "")
-        if marker in seen:
-            continue
-        seen.add(marker)
-        deduped.append(item)
-    return deduped
+    return {"ok": bool(inspect.get("exists")), "inspect": inspect, "created": created, "started": started}
 
 
 def read_clawbot_auth() -> dict:
@@ -5114,11 +5564,24 @@ def read_clawbot_auth() -> dict:
         data = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
         return {"exists": True, "error": str(exc), "bots": []}
-    return {
-        "exists": True,
-        "bots": clawbot_auth_candidates(data),
-        "raw_keys": list(data.keys())[:20] if isinstance(data, dict) else [],
-    }
+    bots = []
+    raw_items = data.get("bots") if isinstance(data, dict) else None
+    if isinstance(raw_items, list):
+        for item in raw_items:
+            if not isinstance(item, dict):
+                continue
+            bot_id = str(item.get("bot_id") or item.get("id") or item.get("user_id") or item.get("to_user_id") or "").strip()
+            token = str(item.get("api_token") or item.get("token") or item.get("access_token") or "").strip()
+            if bot_id or token:
+                bots.append({"bot_id": bot_id, "api_token": token, "token_tail": token[-6:] if token else ""})
+    elif isinstance(data, dict):
+        for key, value in data.items():
+            if isinstance(value, dict):
+                bot_id = str(value.get("bot_id") or value.get("id") or key).strip()
+                token = str(value.get("api_token") or value.get("token") or "").strip()
+                if bot_id or token:
+                    bots.append({"bot_id": bot_id, "api_token": token, "token_tail": token[-6:] if token else ""})
+    return {"exists": True, "bots": bots, "raw_keys": list(data.keys())[:20] if isinstance(data, dict) else []}
 
 
 def clawbot_login_log() -> dict:
@@ -5145,11 +5608,7 @@ def clawbot_status() -> dict:
     log = clawbot_login_log()
     bots = auth.get("bots") or []
     public_bots = [
-        {
-            "bot_id": item.get("bot_id") or "",
-            "api_token_configured": bool(item.get("api_token")),
-            "token_tail": item.get("token_tail") or "",
-        }
+        {"bot_id": item.get("bot_id") or "", "api_token_configured": bool(item.get("api_token")), "token_tail": item.get("token_tail") or ""}
         for item in bots
     ]
     return {
@@ -5162,12 +5621,10 @@ def clawbot_status() -> dict:
         "port": CLAWBOT_PORT,
         "ports": ports,
         "auth_exists": bool(auth.get("exists")),
-        "auth_error": auth.get("error") or "",
         "bots": public_bots,
         "bot_count": len(public_bots),
         "login_log": log,
-        "message_url_hint": f"http://{CLAWBOT_CONTAINER}:{CLAWBOT_PORT}/bots/{{bot_id}}/messages",
-        "host_config_path": str(clawbot_host_config_path()),
+        "message_url_hint": f"http://host.docker.internal:{CLAWBOT_PORT}/bots/{{bot_id}}/messages",
     }
 
 
@@ -5182,13 +5639,12 @@ def clawbot_begin_login() -> dict:
         return {"ok": False, "error": "Clawbot 容器不可用", "details": ensure}
     run_container_command(
         CLAWBOT_CONTAINER,
-        "ps | awk '$1 != 1 && ($0 ~ /wechatagent-login/ || $0 ~ /\\/login/ || $0 ~ / bot$/) {print $1}' "
-        "| xargs -r kill >/dev/null 2>&1 || true; rm -f /app/config/wechatagent-login.log",
+        "pkill -f 'bot' >/dev/null 2>&1 || true; rm -f /app/config/wechatagent-login.log",
         timeout=8,
     )
     command = (
         "mkdir -p /app/config; "
-        "nohup sh -lc \"printf '/login\\n' | /app/weclawbot-api\" "
+        "nohup sh -lc \"printf '/login\\n' | bot\" "
         ">/app/config/wechatagent-login.log 2>&1 & echo $!"
     )
     started = run_container_command(CLAWBOT_CONTAINER, command, timeout=8)
@@ -5213,7 +5669,7 @@ def clawbot_apply_to_login_guard(bot_id: str = "") -> dict:
         {
             "notify_enabled": True,
             "notify_channel": "clawbot_http",
-            "notify_webhook_url": f"http://{CLAWBOT_CONTAINER}:{CLAWBOT_PORT}/bots/{selected['bot_id']}/messages",
+            "notify_webhook_url": f"http://host.docker.internal:{CLAWBOT_PORT}/bots/{selected['bot_id']}/messages",
             "notify_token": selected["api_token"],
             "notify_target": selected["bot_id"],
         }
@@ -5730,23 +6186,12 @@ Tavily 直接答案：{search.get('answer') or ''}
     result = request_llm(profile, prompt, build_agent_system_prompt(config))
     if result.get("ok") and str(result.get("message") or "").strip():
         return {"ok": True, "summary": str(result.get("message") or "").strip(), "llm": compact_llm_result(result)}
-    fallback = "我搜到了这些结果：\n" + "\n".join(
-        f"{index}. {item.get('title') or '无标题'} - {item.get('url') or ''}" for index, item in enumerate(results[:5], 1)
-    )
-    return {"ok": True, "summary": fallback, "fallback": True, "llm": compact_llm_result(result), "error": result.get("error")}
-
-
-def llm_web_search_fallback(query: str, config: dict, reason: str = "") -> dict:
-    prompt = f"""用户想搜索网络信息，但当前没有可用的 Tavily 搜索结果。
-请基于你已有知识尽量回答，并明确提醒：这不是实时联网搜索，可能不是最新信息。
-
-用户问题：{query}
-搜索失败原因：{reason or '未配置或额度不可用'}
-"""
-    result = request_llm(active_profile(config), prompt, build_agent_system_prompt(config))
-    if result.get("ok") and str(result.get("message") or "").strip():
-        return {"ok": True, "summary": str(result.get("message") or "").strip(), "llm": compact_llm_result(result), "fallback": True}
-    return {"ok": False, "error": result.get("error") or "模型兜底失败", "llm": compact_llm_result(result), "fallback": True}
+    return {
+        "ok": False,
+        "error": result.get("error") or "网络搜索总结模型失败",
+        "llm": compact_llm_result(result),
+        "search_results": results[:5],
+    }
 
 
 def image_skill_profile(config: dict, settings: dict) -> dict:
@@ -6604,9 +7049,6 @@ def run_web_search(payload: dict, *, send: bool = False) -> dict:
     if search.get("ok"):
         summary = summarize_web_search(query, search, config)
         output = {"ok": bool(summary.get("ok")), "query": query, "provider": "tavily", "search": search, **summary}
-    elif bool(settings.get("fallback_to_llm", True)):
-        summary = llm_web_search_fallback(query, config, str(search.get("error") or ""))
-        output = {"ok": bool(summary.get("ok")), "query": query, "provider": "llm_fallback", "search": search, **summary}
     else:
         output = {"ok": False, "query": query, "provider": "none", "search": search, "error": search.get("error") or "搜索失败"}
     record_skill_run(
@@ -6617,6 +7059,15 @@ def run_web_search(payload: dict, *, send: bool = False) -> dict:
         output.get("error") or "",
         int((time.time() - started) * 1000),
     )
+    if not output.get("ok"):
+        system_log_from_message(
+            "skill",
+            "error",
+            "网络搜索技能失败，已按要求不发送兜底内容",
+            message,
+            error=str(output.get("error") or "web search failed"),
+            details={"skill": "web-search", "query": query, "provider": output.get("provider"), "search": output.get("search")},
+        )
     return output
 
 
@@ -6843,9 +7294,14 @@ def summarize_article(article_payload: dict, trigger_text: str, config: dict) ->
     result = request_llm(profile, prompt, build_agent_system_prompt(config))
     if result.get("ok") and str(result.get("message") or "").strip():
         return {"ok": True, "summary": str(result.get("message") or "").strip(), "llm": compact_llm_result(result)}
-    article_text = str(article.get("text") or "")
-    fallback = f"我抓到这篇文章了：{article.get('title') or '未提取到标题'}。\n\n主要内容：{article_text[:500]}"
-    return {"ok": True, "summary": fallback, "llm": compact_llm_result(result), "fallback": True, "error": result.get("error")}
+    return {
+        "ok": False,
+        "error": result.get("error") or "文章总结模型失败",
+        "llm": compact_llm_result(result),
+        "article_title": article.get("title") or "",
+        "content_source": content_source,
+        "source_url": source_url,
+    }
 
 
 def run_official_account_reader(payload: dict, *, send: bool = False) -> dict:
@@ -7198,7 +7654,7 @@ def download_meme_image(image_url: str, keyword: str) -> dict:
 
 def run_meme_sender(payload: dict, *, send: bool = True) -> dict:
     started = time.time()
-    config = read_config()
+    config = payload.get("_config") if isinstance(payload.get("_config"), dict) else read_config()
     skill = skill_by_id("meme-sender") or {}
     if not skill.get("enabled") or "send_image" not in (skill.get("permissions") or []):
         return {"ok": False, "error": "斗图技能未启用或没有 send_image 权限"}
@@ -7289,19 +7745,11 @@ def maybe_execute_auto_skill(message: dict, config: dict, scoring: dict) -> dict
     image_requested_by_nearby = bool(image_request_message)
     mention_info = detect_bot_mention(text, config, str(message.get("chat_username") or ""))
     sender_identity = sender_identity_for_message(message)
-    reply_to_sender = bool(mention_info.get("mentions_bot"))
-    mention_payload = {}
-    if reply_to_sender:
-        mention_payload = resolve_reply_mention(
-            str(message.get("chat_username") or ""),
-            {
-                "member_username": sender_identity.get("member_username") or sender_identity.get("sender_key"),
-                "sender_key": sender_identity.get("sender_key"),
-                "sender_name": sender_identity.get("sender_name"),
-                "group_nickname": sender_identity.get("group_nickname") or sender_identity.get("sender_name"),
-                "alias": sender_identity.get("alias") or "",
-            },
-        )
+    mention_plan = reply_mention_plan(message, config, sender_identity, mention_info)
+    should_mention = bool(mention_plan.get("should_mention"))
+    mention_required = bool(mention_plan.get("required"))
+    mention_payload = mention_plan.get("mention") if isinstance(mention_plan.get("mention"), dict) else {}
+    mention_target = clean_contact_text(mention_plan.get("target") or "")
     url_in_text = extract_first_url(text)
     search_query = search_query_from_text(text, config, str(message.get("chat_username") or ""), int(message.get("create_time") or 0) or None)
     if is_web_search_request(text, config, str(message.get("chat_username") or ""), int(message.get("create_time") or 0) or None) and not url_in_text:
@@ -7319,8 +7767,7 @@ def maybe_execute_auto_skill(message: dict, config: dict, scoring: dict) -> dict
         )
         if result.get("ok") and result.get("summary"):
             reply_text = str(result.get("summary") or "").strip()
-            if reply_to_sender:
-                reply_text = ensure_reply_mentions_sender(reply_text, sender_display_for_reply(sender_identity, message))
+            reply_text = with_reply_mention(reply_text, mention_target, mention_required)
             outbox = create_reply_outbox(
                 {
                     "chat": message.get("chat_username"),
@@ -7330,8 +7777,9 @@ def maybe_execute_auto_skill(message: dict, config: dict, scoring: dict) -> dict
                     "reply_text": reply_text,
                     "scoring": scoring,
                     "trigger": "skill:web-search",
-                    "mention_target": sender_display_for_reply(sender_identity, message),
+                    "mention_target": mention_target,
                     "mention": mention_payload,
+                    "details": {"mention_required": mention_required, "mention_reason": mention_plan.get("reason") or ""},
                 },
                 "auto_send",
                 status="approved",
@@ -7346,11 +7794,12 @@ def maybe_execute_auto_skill(message: dict, config: dict, scoring: dict) -> dict
                     chat_username=outbox.get("chat_username") or "",
                     delays=reply_sender_delays(config),
                     mention=mention_payload,
+                    mention_required=mention_required,
                 )
             confirmation = {}
             confirmed = False
             if send_result.get("ok"):
-                confirmation = confirm_sent_message(reply_text, str(outbox.get("chat_username") or ""), int(message.get("create_time") or 0), timeout_seconds=8.0)
+                confirmation = confirm_sent_message(sent_reply_text(send_result, reply_text), str(outbox.get("chat_username") or ""), int(message.get("create_time") or 0), timeout_seconds=8.0)
                 confirmed = bool(confirmation.get("ok"))
             details = {
                 "skill": result,
@@ -7427,8 +7876,8 @@ def maybe_execute_auto_skill(message: dict, config: dict, scoring: dict) -> dict
         )
         if result.get("ok") and result.get("summary"):
             reply_text = str(result.get("summary") or "").strip()
-            if reply_to_sender:
-                reply_text = ensure_reply_mentions_sender(reply_text, sender_display_for_reply(sender_identity, message))
+            if should_mention:
+                reply_text = with_reply_mention(reply_text, mention_target, mention_required)
             outbox = create_reply_outbox(
                 {
                     "chat": message.get("chat_username"),
@@ -7441,8 +7890,9 @@ def maybe_execute_auto_skill(message: dict, config: dict, scoring: dict) -> dict
                     "skill_id": "image-understanding",
                     "trigger_message_uid": trigger_message_uid,
                     "target_message_uid": image_message_uid,
-                    "mention_target": sender_display_for_reply(sender_identity, message),
+                    "mention_target": mention_target,
                     "mention": mention_payload,
+                    "details": {"mention_required": mention_required, "mention_reason": mention_plan.get("reason") or ""},
                 },
                 "auto_send",
                 status="approved",
@@ -7457,11 +7907,12 @@ def maybe_execute_auto_skill(message: dict, config: dict, scoring: dict) -> dict
                     chat_username=outbox.get("chat_username") or "",
                     delays=reply_sender_delays(config),
                     mention=mention_payload,
+                    mention_required=mention_required,
                 )
             confirmation = {}
             confirmed = False
             if send_result.get("ok"):
-                confirmation = confirm_sent_message(reply_text, str(outbox.get("chat_username") or ""), int(message.get("create_time") or 0), timeout_seconds=8.0)
+                confirmation = confirm_sent_message(sent_reply_text(send_result, reply_text), str(outbox.get("chat_username") or ""), int(message.get("create_time") or 0), timeout_seconds=8.0)
                 confirmed = bool(confirmation.get("ok"))
             details = {
                 "skill": result,
@@ -7503,8 +7954,7 @@ def maybe_execute_auto_skill(message: dict, config: dict, scoring: dict) -> dict
             if not result.get("ok") or not result.get("summary"):
                 return {"handled": False, "ok": True, "skipped": True, "reason": "article_skill_no_summary", "skill": result}
             reply_text = str(result.get("summary") or "").strip()
-            if reply_to_sender:
-                reply_text = ensure_reply_mentions_sender(reply_text, sender_display_for_reply(sender_identity, message))
+            reply_text = with_reply_mention(reply_text, mention_target, mention_required)
             outbox = create_reply_outbox(
                 {
                     "chat": message.get("chat_username"),
@@ -7514,8 +7964,9 @@ def maybe_execute_auto_skill(message: dict, config: dict, scoring: dict) -> dict
                     "reply_text": reply_text,
                     "scoring": scoring,
                     "trigger": "skill:official-account-reader",
-                    "mention_target": sender_display_for_reply(sender_identity, message),
+                    "mention_target": mention_target,
                     "mention": mention_payload,
+                    "details": {"mention_required": mention_required, "mention_reason": mention_plan.get("reason") or ""},
                 },
                 "auto_send",
                 status="approved",
@@ -7530,11 +7981,12 @@ def maybe_execute_auto_skill(message: dict, config: dict, scoring: dict) -> dict
                         chat_username=outbox.get("chat_username") or "",
                         delays=reply_sender_delays(config),
                         mention=mention_payload,
+                        mention_required=mention_required,
                     )
             confirmation = {}
             confirmed = False
             if send_result.get("ok"):
-                confirmation = confirm_sent_message(reply_text, str(outbox.get("chat_username") or ""), int(message.get("create_time") or 0), timeout_seconds=8.0)
+                confirmation = confirm_sent_message(sent_reply_text(send_result, reply_text), str(outbox.get("chat_username") or ""), int(message.get("create_time") or 0), timeout_seconds=8.0)
                 confirmed = bool(confirmation.get("ok"))
             details = {"skill": result, "send": send_result, "confirmation": confirmation, "timing": {"send_elapsed_ms": int((time.time() - send_started) * 1000)}}
             updated = update_reply_outbox(
@@ -7584,6 +8036,7 @@ def maybe_execute_auto_skill(message: dict, config: dict, scoring: dict) -> dict
                 "chat_username": message.get("chat_username"),
                 "chat_display_name": message.get("chat_display_name"),
                 "message_uid": message.get("message_uid"),
+                "_config": config,
             },
             send=True,
         )
@@ -7642,6 +8095,7 @@ def maybe_execute_auto_skill(message: dict, config: dict, scoring: dict) -> dict
                 "chat_username": message.get("chat_username"),
                 "chat_display_name": message.get("chat_display_name"),
                 "message_uid": message.get("message_uid"),
+                "_config": config,
             },
             send=True,
         )
@@ -7704,7 +8158,14 @@ def resume_auto_outbox_send(message: dict, outbox: dict, config: dict, scoring: 
         )
         return {"ok": False, "sent": False, "outbox": updated, "error": "待发送回复内容为空"}
     details = outbox.get("details") if isinstance(outbox.get("details"), dict) else {}
+    if (
+        str(outbox.get("error") or "").find("微信蓝色@校验失败") >= 0
+        and not bool(details.get("mention_required"))
+    ):
+        auto_reply_skip(message, "skip_legacy_blue_mention_failed_outbox", scoring or {})
+        return {"ok": True, "sent": False, "skipped": True, "reason": "legacy_blue_mention_failed_outbox"}
     mention_payload = details.get("mention") if isinstance(details.get("mention"), dict) else {}
+    mention_required = bool(details.get("mention_required"))
     set_auto_reply_live(
         "sending",
         message,
@@ -7721,6 +8182,7 @@ def resume_auto_outbox_send(message: dict, outbox: dict, config: dict, scoring: 
             chat_username=outbox.get("chat_username") or "",
             delays=reply_sender_delays(config),
             mention=mention_payload,
+            mention_required=mention_required,
         )
     send_elapsed_ms = int((time.time() - send_started) * 1000)
     confirmation = {}
@@ -7734,7 +8196,7 @@ def resume_auto_outbox_send(message: dict, outbox: dict, config: dict, scoring: 
             details={"resume_outbox_id": outbox.get("outbox_id"), "send_elapsed_ms": send_elapsed_ms},
         )
         confirmation = confirm_sent_message(
-            reply_text,
+            sent_reply_text(send_result, reply_text),
             str(outbox.get("chat_username") or ""),
             int(message.get("create_time") or 0),
             timeout_seconds=8.0,
@@ -7840,6 +8302,8 @@ def add_auto_reply_event(kind: str, message: str, details: dict | None = None) -
         )
         state["recent_events"] = events[:40]
         write_json(AUTO_REPLY_STATE_FILE, state)
+    level = "error" if kind in {"error", "failed"} else "warning" if kind in {"skipped", "silent"} else "success" if kind in {"sent", "enabled"} else "info"
+    system_log_event("auto_reply", level, message, error=str((details or {}).get("error") or "")[:500], details={"kind": kind, **(details or {})})
 
 
 AUTO_REPLY_PHASE_TEXT = {
@@ -7890,6 +8354,23 @@ def set_auto_reply_live(
         "details": details or {},
     }
     write_auto_reply_state({"live": live, "last_action_at": now_iso()})
+    if phase in {"failed", "sent", "skipped", "silent"}:
+        level = "error" if phase == "failed" else "warning" if phase in {"skipped", "silent"} else "success"
+        system_log_from_message(
+            "auto_reply",
+            level,
+            AUTO_REPLY_PHASE_TEXT.get(phase, phase),
+            message,
+            error=error,
+            details={
+                "phase": phase,
+                "score": live.get("score"),
+                "threshold": live.get("threshold"),
+                "decision": live.get("decision"),
+                "reply_preview": reply_text[:120],
+                **(details or {}),
+            },
+        )
 
 
 def auto_reply_activation_state(config: dict) -> dict:
@@ -7933,7 +8414,7 @@ def auto_reply_public_state(config: dict | None = None) -> dict:
         "mode": sender.get("mode") or "draft_only",
         "poll_interval_seconds": sender.get("poll_interval_seconds", 5),
         "allowed_chats": sender.get("allowed_chats") or [],
-        "excluded_members_by_chat": sender.get("excluded_members_by_chat") or {},
+        "chat_reply_settings": config.get("chat_reply_settings") if isinstance(config.get("chat_reply_settings"), dict) else {},
         "sender": state.get("sender") if isinstance(state.get("sender"), dict) else {},
     }
 
@@ -7997,7 +8478,15 @@ def initialize_auto_reply_state() -> None:
 
 def allowed_auto_reply_chats(config: dict) -> set[str]:
     allowed = config.get("reply_sender", {}).get("allowed_chats") or []
-    return {str(item).strip() for item in allowed if str(item).strip()}
+    output = {str(item).strip() for item in allowed if str(item).strip()}
+    settings = config.get("chat_reply_settings") if isinstance(config.get("chat_reply_settings"), dict) else {}
+    for chat, setting in settings.items():
+        if not isinstance(setting, dict) or setting.get("enabled") is False:
+            continue
+        chat_id = str(chat or "").strip()
+        if chat_id:
+            output.add(chat_id)
+    return output
 
 
 def is_auto_reply_allowed_chat(row: dict, allowed: set[str]) -> bool:
@@ -8022,7 +8511,7 @@ def member_match_values_for_row(row: dict) -> set[str]:
     sender_key = clean_contact_text(row.get("sender_key"))
     sender_name = clean_contact_text(row.get("sender_hint") or row.get("sender_name"))
     if not sender_key:
-        sender_key, parsed_text = message_index_text(row)
+        sender_key, _ = message_index_text(row)
         sender_key = clean_contact_text(sender_key)
         if not sender_name:
             sender_name = clean_contact_text(sender_key)
@@ -9424,32 +9913,59 @@ def llm_report_summary(chat_username: str, chat_display: str, args: dict, stats_
     memory_text = compact_report_memory_text(memory_hints)
     result = field_llm_report_summary(profile, chat_display, source, memory_text)
     llm_summary = result.get("summary") or {}
-    one_line = llm_summary.get("one_line") or ""
-    insights = list(llm_summary.get("insights") or [])
-    if len(insights) < 4:
-        for item in local_report_insights_from_source(source):
-            if len(insights) >= 4:
-                break
-            clean = re.sub(r"^\s*\d+[.、)]\s*", "", item).strip()
-            if clean and all(clean not in existing for existing in insights):
-                insights.append(f"{len(insights) + 1}. {clean}")
-    topics = enrich_report_topics(llm_summary.get("topics") or [], source)
-    fallback_summary = local_report_summary_from_source(chat_display, source, memory_hints)
-    if not one_line:
-        one_line = fallback_summary.get("one_line") or normalize_report_line(local_report_insights_from_source(source)[0], 280)
-    parsed = normalize_llm_report_summary({"one_line": one_line, "insights": insights, "topics": topics})
     llm_ok = bool(result.get("ok"))
     if not llm_ok:
-        parsed = normalize_llm_report_summary({**fallback_summary, "topics": local_report_topics_from_source(source, 6)})
+        system_log_event(
+            "llm",
+            "error",
+            "群聊日报 LLM 总结失败，已按要求不使用本地模板兜底",
+            error=str(result.get("error") or "report llm failed"),
+            details={
+                "chat_username": chat_username,
+                "chat_display": chat_display,
+                "range": {"start_ts": source.get("start_ts"), "end_ts": source.get("end_ts"), "label": source.get("range_label")},
+                "llm": result.get("llm") or {},
+                "source_count": len(messages),
+            },
+            chat_username=chat_username,
+            chat_display_name=chat_display,
+        )
         return {
-            "ok": True,
-            "fallback": True,
-            "error": "LLM 日报总结失败，已使用本地记忆兜底",
-            "summary": parsed,
+            "ok": False,
+            "error": "LLM 日报总结失败，已按要求不发送兜底日报",
             "source": source,
             "memory_hints": memory_hints,
             "llm": result.get("llm") or {},
         }
+    one_line = llm_summary.get("one_line") or ""
+    insights = list(llm_summary.get("insights") or [])
+    topics = enrich_report_topics(llm_summary.get("topics") or [], source)
+    if not one_line or len(insights) < 3:
+        system_log_event(
+            "llm",
+            "error",
+            "群聊日报 LLM 内容不完整，已按要求不使用本地补齐",
+            error="report summary incomplete",
+            details={
+                "chat_username": chat_username,
+                "chat_display": chat_display,
+                "one_line_present": bool(one_line),
+                "insight_count": len(insights),
+                "topic_count": len(topics),
+                "range": {"start_ts": source.get("start_ts"), "end_ts": source.get("end_ts"), "label": source.get("range_label")},
+                "llm": result.get("llm") or {},
+            },
+            chat_username=chat_username,
+            chat_display_name=chat_display,
+        )
+        return {
+            "ok": False,
+            "error": "LLM 日报总结内容不完整，已按要求不发送本地补齐日报",
+            "source": source,
+            "memory_hints": memory_hints,
+            "llm": result.get("llm") or {},
+        }
+    parsed = normalize_llm_report_summary({"one_line": one_line, "insights": insights, "topics": topics})
     cache[cache_key] = {
         "summary": parsed,
         "updated_at": now_iso(),
@@ -9676,6 +10192,7 @@ def send_group_daily_report(
             "llm_report_ok": bool(llm_summary.get("ok")),
             "send_elapsed_ms": send_elapsed_ms,
             "confirmation_checks": confirmation.get("checks") if isinstance(confirmation, dict) else None,
+            "reply_text_sent": reply_text,
         },
     )
     add_auto_reply_event(
@@ -9698,11 +10215,15 @@ def send_group_daily_report(
 
 def auto_reply_execute_message(row: dict, config: dict) -> dict:
     message = normalize_auto_message(row)
+    base_config = config
+    chat_username = str(message.get("chat_username") or "")
+    reply_effective = effective_reply_config(base_config, chat_username)
+    config = effective_config_for_chat(base_config, chat_username)
     state = auto_reply_state()
     mark_auto_reply_watermark(state, message)
     text = message.get("text") or ""
     set_auto_reply_live("candidate", message)
-    excluded_info = auto_reply_excluded_member_info(config, message)
+    excluded_info = auto_reply_excluded_member_info(base_config, message)
     if excluded_info.get("excluded"):
         set_auto_reply_live("skipped", message, error="excluded_member", details={"reason": "excluded_member", **excluded_info})
         auto_reply_skip(message, "excluded_member")
@@ -9719,6 +10240,10 @@ def auto_reply_execute_message(row: dict, config: dict) -> dict:
         set_auto_reply_live("skipped", message, error="unsupported_message_type")
         auto_reply_skip(message, "unsupported_message_type")
         return {"ok": True, "skipped": True, "reason": "unsupported_message_type"}
+    if not reply_effective.get("enabled", True) and not detect_bot_mention(text, config, chat_username).get("mentions_bot"):
+        set_auto_reply_live("skipped", message, error="chat_auto_reply_disabled", details={"chat_reply": reply_effective})
+        auto_reply_skip(message, "chat_auto_reply_disabled")
+        return {"ok": True, "skipped": True, "reason": "chat_auto_reply_disabled"}
     existing_outbox = auto_outbox_for_message(str(message.get("message_uid") or ""))
     if existing_outbox:
         if is_completed_auto_outbox(existing_outbox):
@@ -9738,7 +10263,11 @@ def auto_reply_execute_message(row: dict, config: dict) -> dict:
     set_auto_reply_live("scoring", message)
     sender_identity = sender_identity_for_message(message)
     mention_info = detect_bot_mention(text, config, str(message.get("chat_username") or ""))
-    reply_to_sender = bool(mention_info.get("mentions_bot"))
+    mention_plan = reply_mention_plan(message, config, sender_identity, mention_info)
+    mention_required = bool(mention_plan.get("required"))
+    reply_to_sender = bool(mention_plan.get("should_mention"))
+    mention_target = clean_contact_text(mention_plan.get("target") or "")
+    mention_payload = mention_plan.get("mention") if isinstance(mention_plan.get("mention"), dict) else {}
     image_request_message = nearby_image_request_for_message(message) if str(message.get("type_label") or "") in IMAGE_UNDERSTANDING_MEDIA_TYPES else {}
     followup_image_request = {}
     if str(message.get("type_label") or "") == "text" and mention_info.get("mentions_bot"):
@@ -9776,13 +10305,21 @@ def auto_reply_execute_message(row: dict, config: dict) -> dict:
             "mentions_bot_explicit": bool(mention_info.get("mentions_bot_explicit")),
             "bot_alias": mention_info.get("bot_alias") or "",
             "reply_to_sender": reply_to_sender,
+            "reply_target_name": mention_target,
+            "reply_mention_reason": mention_plan.get("reason") or "",
+            "reply_mention_required": mention_required,
             "type_label": message.get("type_label") or "",
             "image_analysis_requested": bool(image_request_message),
             "image_request_message_uid": image_request_message.get("message_uid") or "",
         },
     )
-    mode_key = config.get("agent", {}).get("reply_mode", "normal")
-    scoring = evaluate_talk({"text": text, "mode": mode_key, "context": context})
+    mode_key = reply_effective.get("reply_mode") or config.get("agent", {}).get("reply_mode", "normal")
+    scoring = evaluate_talk({"text": text, "mode": mode_key, "context": context}, config=config)
+    scoring["chat_reply"] = {
+        key: value
+        for key, value in reply_effective.items()
+        if key in {"configured", "use_global", "enabled", "reply_mode", "threshold_override"}
+    }
     if scoring.get("decision") != "reply":
         set_auto_reply_live("silent", message, scoring=scoring, details={"reason": "score_below_threshold"})
         auto_reply_skip(message, "score_below_threshold", scoring)
@@ -9809,7 +10346,7 @@ def auto_reply_execute_message(row: dict, config: dict) -> dict:
             config=config,
         )
 
-    set_auto_reply_live("thinking", message, scoring=scoring, details={"mode": mode_key})
+    set_auto_reply_live("thinking", message, scoring=scoring, details={"mode": mode_key, "chat_reply": scoring.get("chat_reply")})
     preview_started = time.time()
     preview = preview_reply(
         {
@@ -9823,7 +10360,8 @@ def auto_reply_execute_message(row: dict, config: dict) -> dict:
                 "group_auto_reply_enabled": True,
                 "is_self_message": False,
             },
-        }
+        },
+        config=config,
     )
     preview_elapsed_ms = int((time.time() - preview_started) * 1000)
     reply_text = str(preview.get("reply") or "").strip()
@@ -9837,20 +10375,7 @@ def auto_reply_execute_message(row: dict, config: dict) -> dict:
         )
         auto_reply_skip(message, "preview_failed", scoring)
         return {"ok": False, "error": preview.get("error") or "回复生成失败", "preview": preview}
-    if reply_to_sender:
-        reply_text = ensure_reply_mentions_sender(reply_text, sender_display_for_reply(sender_identity, message))
-    mention_payload = {}
-    if reply_to_sender:
-        mention_payload = resolve_reply_mention(
-            str(message.get("chat_username") or ""),
-            {
-                "member_username": sender_identity.get("member_username") or sender_identity.get("sender_key"),
-                "sender_key": sender_identity.get("sender_key"),
-                "sender_name": sender_identity.get("sender_name"),
-                "group_nickname": sender_identity.get("group_nickname") or sender_identity.get("sender_name"),
-                "alias": sender_identity.get("alias") or "",
-            },
-        )
+    reply_text = with_reply_mention(reply_text, mention_target, mention_required)
     set_auto_reply_live(
         "ready",
         message,
@@ -9859,7 +10384,7 @@ def auto_reply_execute_message(row: dict, config: dict) -> dict:
         details={
             "preview_elapsed_ms": preview_elapsed_ms,
             "llm_elapsed_ms": ((preview.get("llm") or {}).get("elapsed_ms")),
-            "fallback": bool(preview.get("fallback")),
+            "retry": bool(preview.get("retry")),
         },
     )
 
@@ -9872,8 +10397,9 @@ def auto_reply_execute_message(row: dict, config: dict) -> dict:
             "reply_text": reply_text,
             "scoring": scoring,
             "trigger": "auto",
-            "mention_target": sender_display_for_reply(sender_identity, message),
+            "mention_target": mention_target,
             "mention": mention_payload,
+            "details": {"mention_required": mention_required, "mention_reason": mention_plan.get("reason") or ""},
         },
         "auto_send",
         status="approved",
@@ -9901,8 +10427,10 @@ def auto_reply_execute_message(row: dict, config: dict) -> dict:
             chat_username=outbox.get("chat_username") or "",
             delays=delays,
             mention=mention_payload,
+            mention_required=mention_required,
         )
     send_elapsed_ms = int((time.time() - send_started) * 1000)
+    delivered_reply_text = sent_reply_text(send_result, reply_text)
     confirmed = False
     confirmation = {}
     if send_result.get("ok"):
@@ -9910,7 +10438,7 @@ def auto_reply_execute_message(row: dict, config: dict) -> dict:
             "confirming",
             message,
             scoring=scoring,
-            reply_text=reply_text,
+            reply_text=delivered_reply_text,
             details={
                 "outbox_id": outbox.get("outbox_id"),
                 "preview_elapsed_ms": preview_elapsed_ms,
@@ -9919,7 +10447,7 @@ def auto_reply_execute_message(row: dict, config: dict) -> dict:
             },
         )
         confirmation = confirm_sent_message(
-            reply_text,
+            delivered_reply_text,
             str(outbox.get("chat_username") or ""),
             int(message.get("create_time") or 0),
             timeout_seconds=8.0,
@@ -9941,12 +10469,13 @@ def auto_reply_execute_message(row: dict, config: dict) -> dict:
         "scoring": scoring,
         "context": context,
         "preview": {
-            "fallback": preview.get("fallback"),
+            "retry": preview.get("retry"),
             "llm": preview.get("llm"),
             "error": preview.get("error"),
             "elapsed_ms": preview_elapsed_ms,
         },
         "send": send_result.get("details") if isinstance(send_result.get("details"), dict) else send_result,
+        "reply_text_sent": delivered_reply_text,
         "timing": {
             "preview_elapsed_ms": preview_elapsed_ms,
             "llm_elapsed_ms": ((preview.get("llm") or {}).get("elapsed_ms")),
@@ -10114,12 +10643,24 @@ def send_image_to_wechat(
     delays = dict(delays or reply_sender_delays())
     if not send:
         delays["send_delay_seconds"] = 0
-    verified = prepare_verified_wechat_chat(target_name, chat_username, delays=delays, allow_cached_active=True)
+    verified = prepare_verified_wechat_chat(target_name, chat_username, delays=delays, allow_cached_active=False)
     if not verified.get("ok"):
-        return verified
+        return wechat_send_failure(
+            "微信图片发送切群失败，已按要求不发送",
+            str(verified.get("error") or "prepare chat failed"),
+            chat_username=chat_username,
+            chat_display_name=target_name,
+            details={"stage": "image_prepare_verified_wechat_chat", "target_chat": target_name, "result": verified},
+        )
     copied = put_file_into_wechat_container(local_path, "")
     if not copied.get("ok"):
-        return {"ok": False, "error": copied.get("error") or "复制图片到微信容器失败", "details": {"copy": copied}}
+        return wechat_send_failure(
+            "微信图片复制失败，已按要求不发送",
+            copied.get("error") or "复制图片到微信容器失败",
+            chat_username=chat_username,
+            chat_display_name=target_name,
+            details={"stage": "copy_image_to_wechat_container", "copy": copied, "image_path": str(local_path)},
+        )
     remote_path = str(copied.get("remote_path") or "")
     controller_args = [
         "image",
@@ -10131,6 +10672,24 @@ def send_image_to_wechat(
     if send:
         controller_args.append("--send")
     result = run_wechat_controller(controller_args, timeout=45)
+    if not result.get("ok"):
+        return wechat_send_failure(
+            "微信图片发送失败，已按要求不发送文字兜底",
+            result.get("error") or "微信图片发送失败",
+            chat_username=chat_username,
+            chat_display_name=target_name,
+            details={
+                "stage": "send_image_to_wechat",
+                "target_chat": target_name,
+                "chat_username": chat_username,
+                "image_path": str(local_path),
+                "remote_path": remote_path,
+                "open_chat": verified.get("details", {}),
+                "copy": copied,
+                "send": result,
+                "delays": delays,
+            },
+        )
     return {
         "ok": bool(result.get("ok")),
         "sent": bool(send and result.get("ok")),
@@ -10200,6 +10759,13 @@ def execute_reply_to_wechat(payload: dict, send: bool) -> dict:
     try:
         outbox = create_reply_outbox(payload, "manual_send" if send else "draft_only")
     except ValueError as exc:
+        system_log_event(
+            "wechat_send",
+            "error",
+            "手动回复入队失败",
+            error=str(exc),
+            details={"stage": "create_reply_outbox", "send": send, "payload": json_safe_payload(payload, max_text=500)},
+        )
         return {"ok": False, "status": "rejected", "error": str(exc)}
     delays = reply_sender_delays()
     with WECHAT_SEND_LOCK:
@@ -10210,6 +10776,7 @@ def execute_reply_to_wechat(payload: dict, send: bool) -> dict:
             chat_username=outbox.get("chat_username") or "",
             delays=delays,
             mention=(outbox.get("details") or {}).get("mention") or payload.get("mention"),
+            mention_required=bool(((outbox.get("details") or {}) if isinstance(outbox.get("details"), dict) else {}).get("mention_required")),
         )
     status = "sent" if send and result.get("ok") else "drafted" if result.get("ok") else "failed"
     updated = update_reply_outbox(
@@ -10217,6 +10784,17 @@ def execute_reply_to_wechat(payload: dict, send: bool) -> dict:
         status,
         None if result.get("ok") else str(result.get("error") or "发送失败"),
         result.get("details") if isinstance(result.get("details"), dict) else result,
+    )
+    system_log_event(
+        "wechat_send",
+        "success" if result.get("ok") else "error",
+        "手动回复已发送" if send and result.get("ok") else "手动回复已粘贴" if result.get("ok") else "手动回复发送失败",
+        error="" if result.get("ok") else str(result.get("error") or "发送失败"),
+        details={"status": status, "outbox_id": outbox.get("outbox_id"), "send": send, "result": result},
+        chat_username=outbox.get("chat_username") or "",
+        chat_display_name=outbox.get("chat_display_name") or "",
+        message_uid=outbox.get("message_uid") or "",
+        source_text=outbox.get("source_text") or "",
     )
     return {
         "ok": bool(result.get("ok")),
@@ -10231,7 +10809,15 @@ def execute_reply_to_wechat(payload: dict, send: bool) -> dict:
 def list_models(profile: dict) -> dict:
     status, data, elapsed = llm_request(profile, None, endpoint="/models")
     if not (200 <= status < 300) or not isinstance(data, dict):
-        return {"ok": False, "status": status, "error": data, "elapsed_ms": elapsed, "models": []}
+        result = {"ok": False, "status": status, "error": data, "elapsed_ms": elapsed, "models": []}
+        system_log_event(
+            "llm",
+            "error",
+            "模型列表获取失败",
+            error=str(data or f"HTTP {status}"),
+            details={"profile_id": profile.get("id"), "model": profile.get("model"), "base_url": profile.get("base_url"), "elapsed_ms": elapsed},
+        )
+        return result
     models = []
     for item in data.get("data") or []:
         if isinstance(item, dict) and item.get("id"):
@@ -10269,6 +10855,14 @@ def test_image_skill_model(payload: dict) -> dict:
         "你是微信 Agent 图片理解模型的连通性测试助手。",
     )
     result["vision_note"] = "此按钮测试接口、Key 和模型名是否可用；真正图片能力请用下方上传图片测试。"
+    if not result.get("ok"):
+        system_log_event(
+            "llm",
+            "error",
+            "图片理解模型测试失败",
+            error=str(result.get("error") or "vision model test failed"),
+            details={"profile": {k: profile.get(k) for k in ("id", "name", "base_url", "model")}, "llm": compact_llm_result(result)},
+        )
     return result
 
 
@@ -10292,6 +10886,14 @@ def run_health_check(profile: dict, force: bool = False) -> dict:
     }
     with HEALTH_LOCK:
         HEALTH_CACHE[profile_id] = health
+    if not health.get("ok"):
+        system_log_event(
+            "llm",
+            "error",
+            "模型健康检查失败",
+            error=str(health.get("error") or "health check failed"),
+            details={"profile_id": profile_id, "model": profile.get("model"), "base_url": profile.get("base_url"), "elapsed_ms": health.get("elapsed_ms")},
+        )
     return health
 
 
@@ -10971,29 +11573,6 @@ def chat_member_identity_list(chat_username: str = "", limit: int = 200) -> dict
     return {"ok": True, "chat_username": chat_username, "members": rows}
 
 
-def chat_member_identity_map_rows(chat_username: str = "") -> list[dict]:
-    init_semantic_memory()
-    chat_username = str(chat_username or "").strip()
-    if not chat_username:
-        return []
-    try:
-        with db_connect(AI_DB, readonly=True) as conn:
-            return [
-                dict(row)
-                for row in conn.execute(
-                    """
-                    SELECT chat_username, member_username, alias, group_nickname,
-                           remark, nickname, avatar_url, head_img_md5, updated_at
-                    FROM chat_member_identity_map
-                    WHERE chat_username=?
-                    """,
-                    (chat_username,),
-                ).fetchall()
-            ]
-    except sqlite3.Error:
-        return []
-
-
 def contact_directory(chat_username: str = "") -> dict[str, dict]:
     all_contacts = load_contact_directory()
     member_usernames = load_chatroom_member_usernames(chat_username)
@@ -11011,20 +11590,6 @@ def contact_directory(chat_username: str = "") -> dict[str, dict]:
         contact = contacts.get(username, {"username": username})
         contact["group_alias"] = alias
         contact["display_name"] = group_display_name(username, contact) or preferred_display_name(username, contact, alias)
-        contacts[username] = contact
-    for row in chat_member_identity_map_rows(chat_username):
-        username = clean_contact_text(row.get("member_username"))
-        if not username:
-            continue
-        contact = contacts.get(username, {"username": username})
-        contact["alias"] = clean_contact_text(contact.get("alias") or row.get("alias"))
-        contact["group_alias"] = clean_contact_text(contact.get("group_alias") or row.get("group_nickname"))
-        contact["remark"] = clean_contact_text(contact.get("remark") or row.get("remark"))
-        contact["nick_name"] = clean_contact_text(contact.get("nick_name") or row.get("nickname"))
-        contact["small_head_url"] = str(contact.get("small_head_url") or row.get("avatar_url") or "")
-        contact["big_head_url"] = str(contact.get("big_head_url") or row.get("avatar_url") or "")
-        contact["head_img_md5"] = str(contact.get("head_img_md5") or row.get("head_img_md5") or "")
-        contact["display_name"] = group_display_name(username, contact) or preferred_display_name(username, contact, contact.get("group_alias", ""))
         contacts[username] = contact
     refresh_chat_member_identity_map(chat_username, contacts, member_usernames or set(aliases.keys()))
     return contacts
@@ -11178,6 +11743,190 @@ def sender_display_for_reply(sender_identity: dict, message: dict | None = None)
         if text and not looks_like_wechat_id(text):
             return text
     return clean_contact_text(sender_identity.get("group_nickname") or message.get("sender_hint") or "")
+
+
+MENTION_REQUEST_PATTERNS = (
+    r"(?:艾特|@|at|AT)\s*([^\s,，。.!！?？:：、]{1,32})",
+    r"(?:叫|喊|让|问问|回复|告诉|通知)\s*([^\s,，。.!！?？:：、]{1,32})",
+    r"给\s*([^\s,，。.!！?？:：、]{1,32})\s*(?:说|讲|回|解释|看看|分析|总结)",
+)
+MENTION_REQUEST_TRIGGERS = ("艾特", "@", "at", "AT", "叫", "喊", "让", "问问", "回复", "告诉", "通知")
+
+
+def mention_alias_variants(name: str) -> list[str]:
+    name = clean_contact_text(name)
+    if not name:
+        return []
+    variants = [name]
+    normalized = normalize_alias_match_text(name)
+    ascii_fold = (
+        normalized.replace("𝓓", "d")
+        .replace("𝓪", "a")
+        .replace("𝓵", "l")
+        .replace("𝓲", "i")
+        .replace("𝓦", "w")
+        .replace("𝓷", "n")
+        .replace("𝓰", "g")
+    ).lower()
+    if "dali" in ascii_fold:
+        variants.extend(["大力", "大力哥", "达利", "达利哥", "dali", "Dali"])
+    chinese = re.sub(r"[^\u4e00-\u9fff]", "", name)
+    if 1 <= len(chinese) <= 4:
+        variants.append(chinese)
+        for suffix in ("哥", "姐", "佬", "老师"):
+            if not chinese.endswith(suffix):
+                variants.append(f"{chinese}{suffix}")
+    if len(chinese) >= 2:
+        short = chinese[:2]
+        variants.append(short)
+        for suffix in ("哥", "姐", "佬", "老师"):
+            if not short.endswith(suffix):
+                variants.append(f"{short}{suffix}")
+    return unique_texts(variants)
+
+
+def mention_candidate_people(chat_username: str) -> list[dict]:
+    contacts = contact_directory(chat_username)
+    output = []
+    seen = set()
+    for username, contact in contacts.items():
+        if not username or username.endswith("@chatroom"):
+            continue
+        names = [
+            group_display_name(username, contact),
+            contact.get("group_alias"),
+            contact.get("remark"),
+            contact.get("nick_name"),
+            contact.get("alias"),
+            username,
+        ]
+        expanded_names = []
+        for name in names:
+            expanded_names.extend(mention_alias_variants(str(name or "")))
+        names = unique_texts(expanded_names)
+        identity = chat_member_identity(chat_username, member_username=username)
+        display = clean_contact_text(identity.get("group_nickname")) or group_display_name(username, contact) or username
+        alias = clean_contact_text(identity.get("alias")) or clean_contact_text(contact.get("alias"))
+        for name in names:
+            clean_name = clean_contact_text(name)
+            normalized = normalize_alias_match_text(clean_name)
+            if not clean_name or not normalized or (username, normalized) in seen:
+                continue
+            seen.add((username, normalized))
+            output.append(
+                {
+                    "name": clean_name,
+                    "normalized": normalized,
+                    "member_username": username,
+                    "display": display,
+                    "group_nickname": display,
+                    "alias": alias,
+                }
+            )
+    return sorted(output, key=lambda item: len(item.get("normalized") or ""), reverse=True)
+
+
+def match_mention_candidate_from_tail(tail: str, candidates: list[dict], bot_keys: set[str]) -> dict:
+    normalized_tail = normalize_alias_match_text(tail)
+    if not normalized_tail:
+        return {}
+    for candidate in candidates:
+        normalized = candidate.get("normalized") or ""
+        if not normalized or normalized in bot_keys:
+            continue
+        if normalized_tail.startswith(normalized):
+            return candidate
+    return {}
+
+
+def explicit_reply_mention_request(text: str, chat_username: str, config: dict | None = None) -> dict:
+    text = clean_contact_text(text)
+    chat_username = str(chat_username or "").strip()
+    if not text or not chat_username:
+        return {}
+    bot_keys = {normalize_alias_match_text(alias) for alias in bot_aliases(config or read_config(), chat_username)}
+    contacts = contact_directory(chat_username)
+    people = mention_candidate_people(chat_username)
+    explicit_people = []
+    for trigger in MENTION_REQUEST_TRIGGERS:
+        for match in re.finditer(re.escape(trigger), text, flags=re.I):
+            tail = text[match.end() : match.end() + 48].strip("@ \t\r\n:：,，。.!！?？、")
+            candidate = match_mention_candidate_from_tail(tail, people, bot_keys)
+            if candidate:
+                explicit_people.append(candidate)
+    for pattern in MENTION_REQUEST_PATTERNS:
+        for match in re.finditer(pattern, text, flags=re.I):
+            raw_tail = clean_contact_text(match.group(1)).strip("@ \t\r\n:：,，。.!！?？、")
+            candidate = match_mention_candidate_from_tail(raw_tail, people, bot_keys)
+            if candidate:
+                explicit_people.append(candidate)
+    for candidate in explicit_people:
+        raw = clean_contact_text(candidate.get("name") or candidate.get("display") or "")
+        member_username = clean_contact_text(candidate.get("member_username") or contact_username_for_display(raw, contacts, chat_username=chat_username))
+        identity = chat_member_identity(chat_username, member_username=member_username, alias=raw, group_nickname=raw)
+        if identity.get("member_username"):
+            member_username = clean_contact_text(identity.get("member_username"))
+        contact = contacts.get(member_username, {}) if member_username else {}
+        display = clean_contact_text(identity.get("group_nickname")) or clean_contact_text(candidate.get("display")) or group_display_name(member_username, contact) or raw
+        alias = clean_contact_text(identity.get("alias")) or clean_contact_text(candidate.get("alias")) or clean_contact_text(contact.get("alias"))
+        if normalize_alias_match_text(display) in bot_keys or normalize_alias_match_text(member_username) in bot_keys:
+            continue
+        return {
+            "requested": True,
+            "raw": raw,
+            "member_username": member_username,
+            "sender_key": member_username,
+            "sender_name": display,
+            "group_nickname": display,
+            "alias": alias,
+            "display": display,
+            "source": "explicit_request",
+        }
+    return {}
+
+
+def sender_mention_payload(chat_username: str, sender_identity: dict, message: dict | None = None) -> dict:
+    return resolve_reply_mention(
+        chat_username,
+        {
+            "member_username": sender_identity.get("member_username") or sender_identity.get("sender_key"),
+            "sender_key": sender_identity.get("sender_key"),
+            "sender_name": sender_identity.get("sender_name"),
+            "group_nickname": sender_identity.get("group_nickname") or sender_identity.get("sender_name"),
+            "alias": sender_identity.get("alias") or "",
+        },
+    )
+
+
+def reply_mention_plan(message: dict, config: dict, sender_identity: dict, mention_info: dict | None = None) -> dict:
+    mention_info = mention_info or detect_bot_mention(
+        message.get("text") or "",
+        config,
+        str(message.get("chat_username") or ""),
+    )
+    chat_username = str(message.get("chat_username") or "")
+    explicit = explicit_reply_mention_request(message.get("text") or "", chat_username, config)
+    if explicit:
+        payload = resolve_reply_mention(chat_username, explicit)
+        return {
+            "should_mention": True,
+            "target": payload.get("display") or payload.get("group_nickname") or explicit.get("display") or "",
+            "mention": payload,
+            "reason": "explicit_target",
+            "reply_to_sender": False,
+            "required": True,
+        }
+    if mention_info.get("mentions_bot"):
+        payload = sender_mention_payload(chat_username, sender_identity, message)
+        return {
+            "should_mention": True,
+            "target": payload.get("display") or sender_display_for_reply(sender_identity, message),
+            "mention": payload,
+            "reason": "sender_called_bot",
+            "reply_to_sender": True,
+            "required": False,
+        }
+    return {"should_mention": False, "target": "", "mention": {}, "reason": "", "reply_to_sender": False, "required": False}
 
 
 def avatar_url(username: str) -> str:
@@ -11992,1545 +12741,7 @@ def backfill_fact_graph_edges(limit: int = 120) -> int:
     return created
 
 
-PROFILE_TOPIC_KEYWORDS = {
-    "AI/模型": ("模型", "LLM", "gpt", "GPT", "DeepSeek", "token", "上下文", "API", "视觉", "识图", "大模型"),
-    "微信机器人": ("微信", "机器人", "自动回复", "接话", "艾特", "@", "粘贴", "发送", "群聊", "clawbot"),
-    "记忆系统": ("记忆", "画像", "事实", "知识图谱", "关系图", "入库", "抽取", "数据库", "向量"),
-    "UI/设计": ("UI", "页面", "总览", "动画", "排行榜", "特效", "遮挡", "布局", "模板", "好看"),
-    "部署/运维": ("docker", "Docker", "镜像", "部署", "GitHub", "DockerHub", "NAS", "端口", "服务器"),
-    "资源/PT": ("PT", "看片", "资源", "下载", "115", "站", "插件", "种子"),
-    "账号/安全": ("账号", "登录", "封号", "安全", "风控", "权限", "扫码", "密码"),
-}
-
-PROFILE_STYLE_KEYWORDS = {
-    "爱追问细节": ("为什么", "为啥", "咋", "怎么", "能不能", "是不是", "有没有"),
-    "目标很明确": ("必须", "马上", "立刻", "需要", "要求", "不要", "不能", "全部", "完整"),
-    "偏实测反馈": ("测试", "我试了", "刚刚", "发现", "结果", "如图", "截图", "没有反应"),
-    "喜欢高质感效果": ("炫酷", "好看", "漂亮", "特效", "高级", "美术", "装裱", "皇冠"),
-    "口语化玩梗": ("哈哈", "笑死", "离谱", "绷不住", "牛", "草", "绝了"),
-}
-
-PROFILE_TOPIC_PERSONAS = {
-    "AI/模型": "模型试吃员",
-    "微信机器人": "机器人饲养员",
-    "记忆系统": "记忆仓库管理员",
-    "UI/设计": "审美督工",
-    "部署/运维": "Docker炼丹师",
-    "资源/PT": "PT资源雷达",
-    "账号/安全": "风控雷达开满",
-}
-
-PROFILE_STYLE_PERSONAS = {
-    "爱追问细节": "细节追杀模式",
-    "目标很明确": "需求钉墙上",
-    "偏实测反馈": "实测派监督员",
-    "喜欢高质感效果": "炫酷质检官",
-    "口语化玩梗": "梗图雷达",
-}
-
-PROFILE_PREFERENCE_LABELS = {
-    "preference": "偏好小本本",
-    "avoid": "雷区警报器",
-}
-
-PROFILE_WEAK_PHRASES = {
-    "帮助",
-    "改吗",
-    "来了",
-    "看看",
-    "一下",
-    "这个",
-    "那个",
-    "可以",
-    "成功",
-    "失败",
-    "收到",
-    "图片",
-    "内容",
-    "发图",
-    "重新发",
-}
-
-PROFILE_TERM_STOPWORDS = {
-    "一个",
-    "这个",
-    "那个",
-    "什么",
-    "怎么",
-    "可以",
-    "不是",
-    "没有",
-    "就是",
-    "还是",
-    "应该",
-    "感觉",
-    "一下",
-    "现在",
-    "已经",
-    "直接",
-    "的话",
-    "我们",
-    "你们",
-    "他们",
-    "自己",
-    "这里",
-    "那里",
-    "今天",
-    "昨天",
-    "刚刚",
-    "哈哈",
-    "哈哈哈",
-    "引用",
-    "图片",
-    "消息",
-    "内容",
-    "回复",
-    "机器人",
-    "小风",
-    "小风二代",
-    "查询",
-    "分析",
-    "需要帮助",
-    "回答我",
-    "帮我",
-    "世界杯",
-    "赛程",
-    "引用",
-}
-
-PROFILE_COMMAND_WORDS = ("查询", "查下", "查一下", "分析", "总结", "生成", "发送", "给我", "帮我", "看下", "看看")
-PROFILE_TEST_COMMAND_WORDS = ("艾特", "@", "测试", "试试", "在不在")
-
-PROFILE_STYLE_MARKERS = (
-    "我觉得",
-    "我感觉",
-    "我看",
-    "感觉是",
-    "应该是",
-    "是不是",
-    "有没有",
-    "怎么说",
-    "不是",
-    "直接",
-    "确实",
-    "主要是",
-    "问题是",
-    "还好",
-    "没事",
-    "笑死",
-    "离谱",
-    "绷不住",
-    "牛逼",
-    "绝了",
-    "属于是",
-    "先别",
-    "那就",
-    "可以啊",
-)
-
-
-def playful_topic_label(topic: str) -> str:
-    return PROFILE_TOPIC_PERSONAS.get(topic, topic)
-
-
-def playful_style_label(style: str) -> str:
-    return PROFILE_STYLE_PERSONAS.get(style, style)
-
-
-def playful_activity_value(count: int) -> tuple[str, float]:
-    if count >= 500:
-        return "群里高频发动机，话题一冷他就能补一脚油，存在感直接拉满", 0.9
-    if count >= 200:
-        return "核心活跃位，长期在群里带节奏、提需求、把话题往前推", 0.86
-    if count >= 80:
-        return "稳定冒泡选手，关键话题经常出来搭把手，属于群里常驻声源", 0.76
-    if count >= 25:
-        return "固定出没成员，不一定每轮都冲锋，但一开口通常有明确方向", 0.66
-    return "低频潜水但有痕迹，画像还在攒素材，先别急着盖棺定论", 0.52
-
-
-def playful_topic_value(topic: str, support: int) -> str:
-    label = playful_topic_label(topic)
-    variants = [
-        f"一聊到「{label}」就来电，历史命中 {support} 次，属于这个频道的常驻监听员",
-        f"常驻「{label}」频道，历史命中 {support} 次，关键词一响基本能捕捉到",
-        f"对「{label}」很敏感，历史命中 {support} 次，像装了同款话题雷达",
-    ]
-    return variants[support % len(variants)]
-
-
-def playful_style_value(style: str, support: int) -> str:
-    label = playful_style_label(style)
-    if style == "爱追问细节":
-        return f"进入「{label}」时会一路问到底，历史命中 {support} 次，不把细节捋顺不收工"
-    if style == "目标很明确":
-        return f"「{label}」型表达，历史命中 {support} 次，需求通常直接拍桌面上"
-    if style == "偏实测反馈":
-        return f"偏「{label}」，历史命中 {support} 次，更相信自己测出来的现场结果"
-    if style == "喜欢高质感效果":
-        return f"自带「{label}」，历史命中 {support} 次，对好看、顺滑、完整度很挑"
-    if style == "口语化玩梗":
-        return f"偶尔开启「{label}」，历史命中 {support} 次，说话更像真实群友而不是说明书"
-    return f"呈现「{label}」风格，历史命中 {support} 次"
-
-
-def is_weak_profile_phrase(value: str) -> bool:
-    text = clean_contact_text(value)
-    compact = re.sub(r"\s+", "", text)
-    if not compact or len(compact) < 4:
-        return True
-    if compact in PROFILE_WEAK_PHRASES:
-        return True
-    if compact[0] in "的了吗呢吧啊呀":
-        return True
-    if len(compact) <= 8 and compact.endswith(("吗", "呢", "吧", "了", "啊", "呀")):
-        return True
-    if re.fullmatch(r"[\d./:_\\-\\s]+", compact):
-        return True
-    if compact.lower().startswith(("http", "www.")):
-        return True
-    return False
-
-
-def profile_clean_message_text(text: str) -> str:
-    text = replace_contact_identity_tokens(clean_contact_text(text), {})
-    text = re.sub(r"https?://\S+", "", text)
-    text = re.sub(r"@\S{1,24}", "", text)
-    text = re.sub(r"(小风二代|小风2号|小风小风|小风|微信Agent|机器人)[,，:：\s]*", "", text)
-    text = re.sub(r"\s+", " ", text).strip()
-    text = re.sub(r"^引用\s+[^:：]{1,24}[:：]\s*", "", text)
-    return text.strip(" \t\r\n，。！？!?；;：:")
-
-
-def profile_clause_candidates(text: str) -> list[str]:
-    text = profile_clean_message_text(text)
-    if not text:
-        return []
-    parts = re.split(r"[，。！？!?；;\n\r]+", text)
-    candidates = []
-    if 2 <= len(text) <= 28:
-        candidates.append(text)
-    for part in parts:
-        part = part.strip(" 「」『』[]【】()（）:：,，.。")
-        if any(word in part for word in (*PROFILE_COMMAND_WORDS, *PROFILE_TEST_COMMAND_WORDS, "需要帮助", "回答我")) and len(part) > 4:
-            continue
-        if 2 <= len(part) <= 24:
-            candidates.append(part)
-        if len(part) >= 8:
-            prefix = part[: min(12, len(part))]
-            if 4 <= len(prefix) <= 12:
-                candidates.append(prefix)
-    return [item for item in candidates if not is_weak_profile_phrase(item)]
-
-
-def profile_term_candidates(text: str) -> list[str]:
-    text = profile_clean_message_text(text)
-    if not text:
-        return []
-    terms: list[str] = []
-    for token in re.findall(r"[A-Za-z][A-Za-z0-9_.+-]{1,24}|[0-9]{2,}", text):
-        token = token.strip("._+-")
-        if len(token) >= 2 and token.lower() not in PROFILE_TERM_STOPWORDS:
-            terms.append(token)
-    for segment in re.findall(r"[\u4e00-\u9fff]{2,}", text):
-        if len(segment) <= 6:
-            terms.append(segment)
-            continue
-        for size in (2, 3, 4):
-            for index in range(0, max(0, len(segment) - size + 1)):
-                term = segment[index : index + size]
-                if term not in PROFILE_TERM_STOPWORDS and not is_weak_profile_phrase(term) and not re.search(r"(.)\1{2,}", term):
-                    terms.append(term)
-    return [item for item in terms if item and item not in PROFILE_TERM_STOPWORDS]
-
-
-def profile_style_marker_candidates(text: str) -> list[str]:
-    text = profile_clean_message_text(text)
-    return [marker for marker in PROFILE_STYLE_MARKERS if marker in text]
-
-
-def is_noisy_profile_term(text: str) -> bool:
-    value = clean_contact_text(text)
-    if not value:
-        return True
-    if value in PROFILE_TERM_STOPWORDS:
-        return True
-    if re.search(r"(.)\1{2,}", value):
-        return True
-    if re.search(r"我我|你你|他他|需帮|要帮|答我|我需|需要帮|帮忙", value):
-        return True
-    if len(value) <= 3 and value in {"查询", "分析", "总结", "回复", "帮助"}:
-        return True
-    if any(word in value for word in PROFILE_COMMAND_WORDS):
-        return True
-    if any(word in value for word in PROFILE_TEST_COMMAND_WORDS):
-        return True
-    if value.startswith("引用") or "引用 " in value:
-        return True
-    return False
-
-
-def top_profile_counter_items(
-    counter: Counter[str],
-    *,
-    min_count: int,
-    limit: int,
-    max_label_len: int = 18,
-    allow_short: bool = False,
-) -> list[tuple[str, int]]:
-    items = []
-    for value, count in counter.items():
-        text = clean_contact_text(value)
-        if count < min_count or not text:
-            continue
-        if allow_short:
-            if len(text) < 2 or text in PROFILE_WEAK_PHRASES or is_noisy_profile_term(text):
-                continue
-        elif is_weak_profile_phrase(text) or is_noisy_profile_term(text):
-            continue
-        if len(text) > max_label_len:
-            continue
-        score = count * (1 + min(len(text), 12) / 18)
-        items.append((text, count, score))
-    items.sort(key=lambda item: (item[2], item[1], len(item[0])), reverse=True)
-    return [(text, count) for text, count, _score in items[:limit]]
-
-
-def representative_profile_rows(rows: list[dict], limit: int = 3) -> list[dict]:
-    scored = []
-    for row in rows:
-        text = profile_clean_message_text(row.get("clean_text") or "")
-        if not text or len(text) < 10 or len(text) > 120:
-            continue
-        if text.lower().startswith(("http", "www.")) or text.count("/") >= 4:
-            continue
-        unique_chars = len(set(text))
-        if unique_chars < 6:
-            continue
-        score = min(len(text), 80) + unique_chars * 1.5
-        if any(marker in text for marker in PROFILE_STYLE_MARKERS):
-            score += 18
-        if any(ch in text for ch in "！？!?"):
-            score += 8
-        scored.append((score, row))
-    scored.sort(key=lambda item: (item[0], int(item[1].get("create_time") or 0)), reverse=True)
-    return [row for _score, row in scored[:limit]]
-
-
-def build_person_fingerprint_claims(
-    chat_username: str,
-    person_key: str,
-    display_name: str,
-    rows: list[dict],
-) -> list[dict]:
-    clause_counts: Counter[str] = Counter()
-    term_counts: Counter[str] = Counter()
-    marker_counts: Counter[str] = Counter()
-    clause_rows: dict[str, list[dict]] = defaultdict(list)
-    term_rows: dict[str, list[dict]] = defaultdict(list)
-    marker_rows: dict[str, list[dict]] = defaultdict(list)
-    for row in rows:
-        text = row.get("clean_text") or ""
-        for clause in set(profile_clause_candidates(text)):
-            clause_counts[clause] += 1
-            clause_rows[clause].append(row)
-        for term in set(profile_term_candidates(text)):
-            term_counts[term] += 1
-            term_rows[term].append(row)
-        for marker in set(profile_style_marker_candidates(text)):
-            marker_counts[marker] += 1
-            marker_rows[marker].append(row)
-    claims: list[dict] = []
-    top_markers = top_profile_counter_items(marker_counts, min_count=2, limit=3, max_label_len=10, allow_short=True)
-    top_clauses = top_profile_counter_items(clause_counts, min_count=2, limit=4, max_label_len=18)
-    catch_items = unique_texts([item[0] for item in top_markers + top_clauses])[:5]
-    if catch_items:
-        support = sum((marker_counts.get(item) or clause_counts.get(item) or 0) for item in catch_items)
-        evidence_rows = []
-        for item in catch_items:
-            evidence_rows.extend((marker_rows.get(item) or clause_rows.get(item) or [])[-4:])
-        quotes = [quote_payload(row, display_name, row.get("clean_text") or "") for row in evidence_rows[-6:]]
-        label = "口癖：" + " / ".join(catch_items[:3])
-        value = f"真实历史里反复冒出来的口癖是「{'、'.join(catch_items)}」，合计命中 {support} 次；聊他时优先按这个语气去贴脸。"
-        claims.append(profile_claim(chat_username, person_key, display_name, "catchphrase", label, value, min(0.92, 0.58 + support / 24), evidence_rows[-12:], quotes))
-    top_terms = top_profile_counter_items(term_counts, min_count=3, limit=8, max_label_len=12, allow_short=True)
-    if top_terms:
-        selected = [item[0] for item in top_terms[:6]]
-        support = sum(count for _term, count in top_terms[:6])
-        evidence_rows = []
-        for term in selected:
-            evidence_rows.extend(term_rows.get(term, [])[-3:])
-        quotes = [quote_payload(row, display_name, row.get("clean_text") or "") for row in evidence_rows[-6:]]
-        label = "专属高频词：" + " / ".join(selected[:3])
-        value = f"他自己的高频词更集中在「{'、'.join(selected)}」，累计命中 {support} 次，比通用话题标签更能代表聊天指纹。"
-        claims.append(profile_claim(chat_username, person_key, display_name, "signature", label, value, min(0.9, 0.56 + support / 36), evidence_rows[-12:], quotes))
-    for row in representative_profile_rows(rows, limit=2):
-        text = profile_clean_message_text(row.get("clean_text") or "")
-        if not text:
-            continue
-        label = f"代表发言：{text[:14]}"
-        value = f"这句很能代表他说话方式：「{text[:120]}」"
-        quotes = [quote_payload(row, display_name, row.get("clean_text") or "")]
-        claims.append(profile_claim(chat_username, person_key, display_name, "quote", label, value, 0.68, [row], quotes))
-    return claims
-
-
-def profile_rows_sample_for_llm(rows: list[dict], max_items: int = 80) -> list[dict]:
-    if not rows:
-        return []
-    selected: list[dict] = []
-    selected.extend(rows[-35:])
-    selected.extend(representative_profile_rows(rows, limit=18))
-    step = max(1, len(rows) // 24)
-    selected.extend(rows[::step][:24])
-    seen = set()
-    output = []
-    for row in selected:
-        uid = row.get("message_uid") or f"{row.get('create_time')}-{row.get('local_id')}"
-        if uid in seen:
-            continue
-        seen.add(uid)
-        text = profile_clean_message_text(row.get("clean_text") or "")
-        if not text:
-            continue
-        output.append(
-            {
-                "time": local_time_text(row.get("create_time")),
-                "text": text[:220],
-            }
-        )
-        if len(output) >= max_items:
-            break
-    return output
-
-
-PROFILE_LLM_TAG_BLACKLIST = {
-    "PT雷达兵",
-    "一句话验货员",
-    "实测催更官",
-    "低频冒泡雷达",
-    "机器人饲养员",
-    "群聊点火器",
-    "技术党",
-    "气氛组",
-    "吃瓜群众",
-    "群聊发动机",
-}
-
-
-def normalize_profile_tag(value: str) -> str:
-    text = clean_contact_text(value)
-    text = re.sub(r"^(AI标签|标签|关注点|兴趣|特点)[:：]\s*", "", text)
-    text = re.sub(r"[「」『』《》【】\\[\\]\"'`]+", "", text)
-    return clean_contact_text(text)[:24]
-
-
-def filter_llm_profile_tags(values: list[str], forbidden_tags: set[str] | None = None, limit: int = 8) -> list[str]:
-    forbidden = {normalize_profile_tag(item) for item in (forbidden_tags or set()) if normalize_profile_tag(item)}
-    forbidden.update(PROFILE_LLM_TAG_BLACKLIST)
-    tags: list[str] = []
-    for value in values or []:
-        tag = normalize_profile_tag(str(value))
-        if not tag or len(tag) < 2:
-            continue
-        if tag in forbidden:
-            continue
-        if re.fullmatch(r"[\d./:_ -]+", tag):
-            continue
-        if tag not in tags:
-            tags.append(tag)
-        if len(tags) >= limit:
-            break
-    return tags
-
-
-def build_llm_profile_prompt(
-    display_name: str,
-    rows: list[dict],
-    base_claims: list[dict],
-) -> str:
-    sample = profile_rows_sample_for_llm(rows, max_items=80)
-    claim_lines = []
-    for claim in base_claims[:14]:
-        claim_lines.append(
-            {
-                "type": claim.get("claim_type"),
-                "label": claim.get("label"),
-                "value": claim.get("value"),
-                "support": claim.get("support_count"),
-            }
-        )
-    blocked_tags = sorted(PROFILE_LLM_TAG_BLACKLIST)
-    return f"""
-你要为一个微信群成员单独生成人物画像。只能分析这个成员自己的历史发言，不能把其他成员混在一起总结。
-画像要贴脸但不冒犯，不要泛泛而谈，不要套模板。
-
-成员: {display_name}
-全历史可见发言数: {len(rows)}
-
-已有统计证据:
-{json.dumps(claim_lines, ensure_ascii=False, indent=2)}
-
-代表/抽样发言:
-{json.dumps(sample, ensure_ascii=False, indent=2)}
-
-以下是太通用、容易套到很多人的标签，禁止使用:
-{json.dumps(blocked_tags[:60], ensure_ascii=False, indent=2)}
-
-输出严格 JSON，不要 Markdown，不要解释。schema:
-{{
-  "summary": "一句贴脸核心画像，30-80字，调皮有梗但要基于证据",
-  "tags": ["5到8个专属标签，每个2到10字，必须来自此人的口癖/行为/高频关注点"],
-  "speech_style": "说话风格，30-80字",
-  "catchphrase_summary": "口癖/常用句式总结，必须引用统计或代表发言",
-  "interests": ["3到8个真实关注点"],
-  "reply_tips": ["机器人和此人互动时的3到5条建议"],
-  "evidence_notes": ["3到6条证据说明，每条带具体词/句/行为"]
-}}
-
-要求:
-- 每个标签都必须能在上面的个人证据里找到依据，优先使用这个人的真实口癖、常用词、典型动作或独特关注点。
-- 禁止使用“PT雷达兵”“一句话验货员”“实测催更官”“气氛组”这类群里很多人都能套上的通用标签。
-- 如果多人都可能适用某标签，就换成更细的个人标签：用他的具体词、具体梗、具体行为来命名。
-- 如果证据少，就明确“样本少”，不要硬编。
-- 只能使用给出的证据，不要编造身份、职业、隐私。
-- 提到成员只用群昵称。
-""".strip()
-
-
-def parse_llm_profile_payload(text: str) -> dict:
-    data = extract_json_object(text)
-    if not isinstance(data, dict):
-        return {}
-    output = {
-        "summary": clean_contact_text(data.get("summary"))[:180],
-        "speech_style": clean_contact_text(data.get("speech_style"))[:180],
-        "catchphrase_summary": clean_contact_text(data.get("catchphrase_summary"))[:220],
-        "tags": [],
-        "interests": [],
-        "reply_tips": [],
-        "evidence_notes": [],
-    }
-    for key in ("tags", "interests", "reply_tips", "evidence_notes"):
-        values = data.get(key) if isinstance(data.get(key), list) else []
-        cleaned = [clean_contact_text(str(item))[:120] for item in values if clean_contact_text(str(item))]
-        output[key] = filter_llm_profile_tags(cleaned, None, 8) if key == "tags" else cleaned[:8]
-    return output
-
-
-def build_llm_profile_claims(
-    chat_username: str,
-    person_key: str,
-    display_name: str,
-    rows: list[dict],
-    base_claims: list[dict],
-    llm_profile: dict,
-) -> list[dict]:
-    claims: list[dict] = []
-    evidence_rows = rows[-20:]
-    quotes = [quote_payload(row, display_name, row.get("clean_text") or "") for row in representative_profile_rows(rows, limit=5)]
-    summary = clean_contact_text(llm_profile.get("summary"))
-    if summary:
-        claims.append(profile_claim(chat_username, person_key, display_name, "llm_profile", "AI贴脸画像", summary, 0.92, evidence_rows, quotes))
-    speech_style = clean_contact_text(llm_profile.get("speech_style"))
-    if speech_style:
-        claims.append(profile_claim(chat_username, person_key, display_name, "llm_style", "AI语气判断", speech_style, 0.88, evidence_rows, quotes))
-    catchphrase_summary = clean_contact_text(llm_profile.get("catchphrase_summary"))
-    if catchphrase_summary:
-        claims.append(profile_claim(chat_username, person_key, display_name, "llm_catchphrase", "AI口癖总结", catchphrase_summary, 0.88, evidence_rows, quotes))
-    for tag in unique_texts(llm_profile.get("tags") or [])[:8]:
-        claims.append(profile_claim(chat_username, person_key, display_name, "llm_tag", f"AI标签：{tag}", tag, 0.9, evidence_rows, quotes))
-    for item in unique_texts(llm_profile.get("interests") or [])[:6]:
-        claims.append(profile_claim(chat_username, person_key, display_name, "llm_interest", f"关注点：{item[:18]}", item, 0.84, evidence_rows, quotes))
-    for item in unique_texts(llm_profile.get("reply_tips") or [])[:5]:
-        claims.append(profile_claim(chat_username, person_key, display_name, "llm_reply_tip", f"互动建议：{item[:18]}", item, 0.82, evidence_rows, quotes))
-    for item in unique_texts(llm_profile.get("evidence_notes") or [])[:6]:
-        claims.append(profile_claim(chat_username, person_key, display_name, "llm_evidence", f"AI证据：{item[:18]}", item, 0.82, evidence_rows, quotes))
-    return claims
-
-
-def build_llm_profile_for_person(
-    chat_username: str,
-    person_key: str,
-    display_name: str,
-    rows: list[dict],
-    base_claims: list[dict],
-    profile: dict,
-) -> tuple[list[dict], dict]:
-    if not rows or not profile.get("model"):
-        return [], {"ok": False, "error": "llm profile is not configured"}
-    llm_profile = {
-        **profile,
-        "max_tokens": max(clamp_int(profile.get("max_tokens"), 900, 256, 8192), 1200),
-        "temperature": min(clamp_float(profile.get("temperature"), 0.35, 0.0, 2.0), 0.55),
-        "timeout_seconds": max(clamp_int(profile.get("timeout_seconds"), 45, 5, 180), 45),
-    }
-    prompt = build_llm_profile_prompt(display_name, rows, base_claims)
-    result = request_llm(llm_profile, prompt, "你是微信群人物画像分析器。只输出严格 JSON。")
-    if not result.get("ok"):
-        return [], result
-    parsed = parse_llm_profile_payload(result.get("message") or "")
-    if not parsed or not parsed.get("summary"):
-        return [], {"ok": False, "error": "empty llm profile", "raw": result.get("message") or ""}
-    claims = build_llm_profile_claims(chat_username, person_key, display_name, rows, base_claims, parsed)
-    return claims, {"ok": True, "elapsed_ms": result.get("elapsed_ms"), "profile": parsed}
-
-
-def profile_rebuild_state() -> dict:
-    return read_json(
-        PROFILE_REBUILD_STATE_FILE,
-        {
-            "ok": True,
-            "running": False,
-            "last_started_at": "",
-            "last_finished_at": "",
-            "last_checked_at": "",
-            "last_error": "",
-            "last_run_id": None,
-            "last_counts": {},
-            "last_skip_reason": "",
-        },
-    )
-
-
-def write_profile_rebuild_state(payload: dict) -> None:
-    state = profile_rebuild_state()
-    state.update(payload)
-    write_json(PROFILE_REBUILD_STATE_FILE, state)
-
-
-def profile_progress_payload(
-    *,
-    phase: str,
-    total_chats: int = 0,
-    current_chat_index: int = 0,
-    current_chat: str = "",
-    current_chat_display_name: str = "",
-    current_person_key: str = "",
-    current_person_display_name: str = "",
-    people_done: int = 0,
-    people_total: int = 0,
-    claims: int = 0,
-    relations: int = 0,
-    messages: int = 0,
-    percent: float | None = None,
-) -> dict:
-    if percent is None:
-        completed_chats = max(0, int(current_chat_index or 0) - 1)
-        people_fraction = (people_done / max(people_total, 1)) if people_total else 0
-        percent = ((completed_chats + people_fraction) / max(total_chats, 1)) * 100
-    return {
-        "phase": phase,
-        "total_chats": max(0, int(total_chats or 0)),
-        "current_chat_index": max(0, int(current_chat_index or 0)),
-        "current_chat": current_chat,
-        "current_chat_display_name": current_chat_display_name,
-        "current_person_key": current_person_key,
-        "current_person_display_name": current_person_display_name,
-        "people_done": max(0, int(people_done or 0)),
-        "people_total": max(0, int(people_total or 0)),
-        "claims": max(0, int(claims or 0)),
-        "relations": max(0, int(relations or 0)),
-        "messages": max(0, int(messages or 0)),
-        "percent": round(max(0.0, min(100.0, float(percent or 0))), 1),
-        "updated_at": now_iso(),
-    }
-
-
-def write_profile_rebuild_progress(**kwargs) -> None:
-    write_profile_rebuild_state({"last_checked_at": now_iso(), "progress": profile_progress_payload(**kwargs)})
-
-
-def profile_rebuild_runs(limit: int = 10) -> dict:
-    init_semantic_memory()
-    limit = clamp_int(limit, 10, 1, 50)
-    with db_connect(AI_DB, readonly=True) as conn:
-        rows = [
-            dict(row)
-            for row in conn.execute(
-                """
-                SELECT run_id, started_at, finished_at, ok, chat_username,
-                       people_count, claims_count, relations_count, message_count,
-                       error, details_json
-                FROM ai_profile_rebuild_runs
-                ORDER BY run_id DESC
-                LIMIT ?
-                """,
-                (limit,),
-            ).fetchall()
-        ]
-    for row in rows:
-        row["details"] = parse_json_value(row.pop("details_json", None), {})
-    state = profile_rebuild_state()
-    latest = rows[0] if rows else {}
-    if latest and not latest.get("finished_at") and not latest.get("error"):
-        state["running"] = True
-        state["ok"] = True
-        state["last_run_id"] = latest.get("run_id")
-        state["last_skip_reason"] = ""
-    if PROFILE_REBUILD_LOCK.locked():
-        state["running"] = True
-        state["ok"] = True
-        state["last_skip_reason"] = ""
-    return {"ok": True, "state": state, "runs": rows}
-
-
-def profile_claim_rows_for_people(chat: str = "", person_keys: list[str] | None = None, limit: int = 240) -> list[dict]:
-    init_semantic_memory()
-    clauses = ["status!='disabled'"]
-    params: list = []
-    if chat:
-        clauses.append("chat_username=?")
-        params.append(chat)
-    person_keys = [clean_contact_text(item) for item in (person_keys or []) if clean_contact_text(item)]
-    if person_keys:
-        placeholders = ",".join("?" for _ in person_keys)
-        clauses.append(f"person_key IN ({placeholders})")
-        params.extend(person_keys)
-    params.append(clamp_int(limit, 240, 1, 2000))
-    try:
-        with db_connect(AI_DB, readonly=True) as conn:
-            rows = [
-                dict(row)
-                for row in conn.execute(
-                    f"""
-                    SELECT claim_id, chat_username, person_key, display_name, claim_type,
-                           label, value, confidence, support_count, first_seen_time,
-                           last_seen_time, source_message_uids_json, source_quotes_json,
-                           status, review_note, reviewed_at, updated_at
-                    FROM ai_person_profile_claims
-                    WHERE {' AND '.join(clauses)}
-                    ORDER BY confidence DESC, support_count DESC, last_seen_time DESC
-                    LIMIT ?
-                    """,
-                    tuple(params),
-                ).fetchall()
-            ]
-    except sqlite3.Error:
-        return []
-    for row in rows:
-        row["source_message_uids"] = parse_json_value(row.pop("source_message_uids_json", None), [])
-        row["source_quotes"] = parse_json_value(row.pop("source_quotes_json", None), [])
-        row["kind"] = "profile_claim"
-        row["item_id"] = row.get("claim_id")
-    priority = {
-        "llm_profile": 0,
-        "llm_tag": 1,
-        "llm_style": 2,
-        "llm_catchphrase": 3,
-        "llm_interest": 4,
-        "llm_reply_tip": 5,
-        "catchphrase": 6,
-        "signature": 7,
-        "quote": 8,
-        "style": 9,
-        "topic": 10,
-        "activity": 11,
-        "habit": 12,
-    }
-    rows.sort(
-        key=lambda row: (
-            priority.get(str(row.get("claim_type") or ""), 9),
-            -float(row.get("confidence") or 0),
-            -int(row.get("support_count") or 0),
-            -int(row.get("last_seen_time") or 0),
-        )
-    )
-    return rows
-
-
-def person_relation_rows(chat: str = "", person_keys: list[str] | None = None, limit: int = 180) -> list[dict]:
-    init_semantic_memory()
-    clauses = ["status!='disabled'"]
-    params: list = []
-    if chat:
-        clauses.append("chat_username=?")
-        params.append(chat)
-    person_keys = [clean_contact_text(item) for item in (person_keys or []) if clean_contact_text(item)]
-    if person_keys:
-        placeholders = ",".join("?" for _ in person_keys)
-        clauses.append(f"(source_person_key IN ({placeholders}) OR target_key IN ({placeholders}))")
-        params.extend(person_keys)
-        params.extend(person_keys)
-    params.append(clamp_int(limit, 180, 1, 1000))
-    try:
-        with db_connect(AI_DB, readonly=True) as conn:
-            rows = [
-                dict(row)
-                for row in conn.execute(
-                    f"""
-                    SELECT relation_id, chat_username, source_person_key, source_display_name,
-                           target_kind, target_key, target_display_name, relation,
-                           confidence, support_count, first_seen_time, last_seen_time,
-                           source_message_uids_json, source_quotes_json, status,
-                           review_note, reviewed_at, updated_at
-                    FROM ai_person_relations
-                    WHERE {' AND '.join(clauses)}
-                    ORDER BY confidence DESC, support_count DESC, last_seen_time DESC
-                    LIMIT ?
-                    """,
-                    tuple(params),
-                ).fetchall()
-            ]
-    except sqlite3.Error:
-        return []
-    for row in rows:
-        row["source_message_uids"] = parse_json_value(row.pop("source_message_uids_json", None), [])
-        row["source_quotes"] = parse_json_value(row.pop("source_quotes_json", None), [])
-        row["kind"] = "person_relation"
-        row["item_id"] = row.get("relation_id")
-    return rows
-
-
-def profile_claims_to_legacy_fields(claims: list[dict]) -> tuple[dict, dict, list[str], list[str]]:
-    preferences: dict[str, list[str]] = defaultdict(list)
-    traits: dict[str, list[str]] = defaultdict(list)
-    storyline: list[str] = []
-    evidence: list[str] = []
-    for claim in claims:
-        label = clean_contact_text(claim.get("label"))
-        value = clean_contact_text(claim.get("value"))
-        text = value or label
-        if not text:
-            continue
-        claim_type = str(claim.get("claim_type") or "")
-        if claim_type in {"preference", "topic", "habit"}:
-            preferences[label or claim_type].append(text)
-        elif claim_type in {"trait", "style", "activity"}:
-            traits[label or claim_type].append(text)
-        else:
-            storyline.append(f"{label}：{text}" if label and label != text else text)
-        for quote in claim.get("source_quotes") or []:
-            if isinstance(quote, dict):
-                snippet = clean_contact_text(quote.get("text"))
-                if snippet:
-                    evidence.append(snippet[:160])
-            elif quote:
-                evidence.append(clean_contact_text(str(quote))[:160])
-    preferences_out = {key: unique_texts(values)[:5] for key, values in preferences.items() if unique_texts(values)}
-    traits_out = {key: unique_texts(values)[:5] for key, values in traits.items() if unique_texts(values)}
-    return preferences_out, traits_out, unique_texts(storyline)[:6], unique_texts(evidence)[:8]
-
-
-def quote_payload(row: dict, sender_name: str, text: str) -> dict:
-    return {
-        "message_uid": row.get("message_uid") or "",
-        "time": int(row.get("create_time") or 0),
-        "sender": sender_name,
-        "text": clean_contact_text(text)[:220],
-    }
-
-
-def profile_claim(
-    chat_username: str,
-    person_key: str,
-    display_name: str,
-    claim_type: str,
-    label: str,
-    value: str,
-    confidence: float,
-    rows: list[dict],
-    quotes: list[dict],
-) -> dict:
-    source_uids = [row.get("message_uid") for row in rows if row.get("message_uid")]
-    times = [int(row.get("create_time") or 0) for row in rows if row.get("create_time")]
-    support_count = max(len(source_uids), len(quotes), 1)
-    return {
-        "claim_id": stable_id(chat_username, person_key, claim_type, label, value),
-        "chat_username": chat_username,
-        "person_key": person_key,
-        "display_name": display_name,
-        "claim_type": claim_type,
-        "label": label,
-        "value": value,
-        "confidence": clamp_float(confidence, 0.55, 0.0, 1.0),
-        "support_count": support_count,
-        "first_seen_time": min(times) if times else 0,
-        "last_seen_time": max(times) if times else 0,
-        "source_message_uids_json": json.dumps(source_uids[:24], ensure_ascii=False),
-        "source_quotes_json": json.dumps(quotes[:8], ensure_ascii=False),
-        "updated_at": utc_now_iso(),
-    }
-
-
-def upsert_profile_claims(conn: sqlite3.Connection, claims: list[dict]) -> int:
-    if not claims:
-        return 0
-    conn.executemany(
-        """
-        INSERT INTO ai_person_profile_claims (
-            claim_id, chat_username, person_key, display_name, claim_type, label,
-            value, confidence, support_count, first_seen_time, last_seen_time,
-            source_message_uids_json, source_quotes_json, status, updated_at
-        ) VALUES (
-            :claim_id, :chat_username, :person_key, :display_name, :claim_type, :label,
-            :value, :confidence, :support_count, :first_seen_time, :last_seen_time,
-            :source_message_uids_json, :source_quotes_json, 'active', :updated_at
-        )
-        ON CONFLICT(claim_id) DO UPDATE SET
-            display_name=excluded.display_name,
-            value=excluded.value,
-            confidence=max(ai_person_profile_claims.confidence, excluded.confidence),
-            support_count=excluded.support_count,
-            first_seen_time=excluded.first_seen_time,
-            last_seen_time=excluded.last_seen_time,
-            source_message_uids_json=excluded.source_message_uids_json,
-            source_quotes_json=excluded.source_quotes_json,
-            status='active',
-            updated_at=excluded.updated_at
-        """,
-        claims,
-    )
-    return len(claims)
-
-
-def upsert_person_relations(conn: sqlite3.Connection, relations: list[dict]) -> int:
-    if not relations:
-        return 0
-    conn.executemany(
-        """
-        INSERT INTO ai_person_relations (
-            relation_id, chat_username, source_person_key, source_display_name,
-            target_kind, target_key, target_display_name, relation, confidence,
-            support_count, first_seen_time, last_seen_time, source_message_uids_json,
-            source_quotes_json, status, updated_at
-        ) VALUES (
-            :relation_id, :chat_username, :source_person_key, :source_display_name,
-            :target_kind, :target_key, :target_display_name, :relation, :confidence,
-            :support_count, :first_seen_time, :last_seen_time, :source_message_uids_json,
-            :source_quotes_json, 'active', :updated_at
-        )
-        ON CONFLICT(relation_id) DO UPDATE SET
-            source_display_name=excluded.source_display_name,
-            target_display_name=excluded.target_display_name,
-            relation=excluded.relation,
-            confidence=max(ai_person_relations.confidence, excluded.confidence),
-            support_count=excluded.support_count,
-            first_seen_time=excluded.first_seen_time,
-            last_seen_time=excluded.last_seen_time,
-            source_message_uids_json=excluded.source_message_uids_json,
-            source_quotes_json=excluded.source_quotes_json,
-            status='active',
-            updated_at=excluded.updated_at
-        """,
-        relations,
-    )
-    return len(relations)
-
-
-def rebuild_profile_cache_for_chat(conn: sqlite3.Connection, chat_username: str, contacts: dict[str, dict]) -> int:
-    rows = [
-        dict(row)
-        for row in conn.execute(
-            """
-            SELECT person_key, display_name, COUNT(*) AS claim_count,
-                   SUM(support_count) AS support_count,
-                   MAX(confidence) AS max_confidence,
-                   MAX(last_seen_time) AS latest_time,
-                   MAX(updated_at) AS updated_at
-            FROM ai_person_profile_claims
-            WHERE chat_username=? AND status!='disabled'
-            GROUP BY person_key
-            """,
-            (chat_username,),
-        ).fetchall()
-    ]
-    refreshed = 0
-    for row in rows:
-        person_key = clean_contact_text(row.get("person_key"))
-        if not person_key:
-            continue
-        display_name = group_display_name(person_key, contacts.get(person_key, {})) or clean_contact_text(row.get("display_name")) or person_key
-        claims = [
-            dict(claim)
-            for claim in conn.execute(
-                """
-                SELECT claim_id, claim_type, label, value, confidence, support_count,
-                       first_seen_time, last_seen_time, source_quotes_json
-                FROM ai_person_profile_claims
-                WHERE chat_username=? AND person_key=? AND status!='disabled'
-                ORDER BY confidence DESC, support_count DESC, last_seen_time DESC
-                LIMIT 24
-                """,
-                (chat_username, person_key),
-            ).fetchall()
-        ]
-        for claim in claims:
-            claim["source_quotes"] = parse_json_value(claim.pop("source_quotes_json", None), [])
-        priority = {
-            "llm_profile": 0,
-            "llm_tag": 1,
-            "llm_style": 2,
-            "llm_catchphrase": 3,
-            "llm_interest": 4,
-            "llm_reply_tip": 5,
-            "catchphrase": 6,
-            "signature": 7,
-            "quote": 8,
-            "style": 9,
-            "topic": 10,
-            "activity": 11,
-            "habit": 12,
-        }
-        claims.sort(
-            key=lambda claim: (
-                priority.get(str(claim.get("claim_type") or ""), 9),
-                -float(claim.get("confidence") or 0),
-                -int(claim.get("support_count") or 0),
-                -int(claim.get("last_seen_time") or 0),
-            )
-        )
-        preferences, traits, storyline, evidence = profile_claims_to_legacy_fields(claims)
-        evidence_payload = {
-            "source": "full_history_profile_rebuild",
-            "storyline": storyline,
-            "recent_snippets": evidence,
-            "claims": [
-                {
-                    "claim_id": claim.get("claim_id"),
-                    "type": claim.get("claim_type"),
-                    "label": claim.get("label"),
-                    "value": claim.get("value"),
-                    "confidence": claim.get("confidence"),
-                    "support_count": claim.get("support_count"),
-                }
-                for claim in claims[:12]
-            ],
-            "message_count": int(row.get("support_count") or 0),
-            "latest_time": int(row.get("latest_time") or 0),
-        }
-        profile_id = stable_id(chat_username, person_key)
-        conn.execute(
-            """
-            INSERT INTO ai_people_profiles (
-                profile_id, chat_username, person_key, display_name,
-                preferences_json, traits_json, evidence_json, confidence, updated_at, status
-            )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'active')
-            ON CONFLICT(profile_id) DO UPDATE SET
-                display_name=excluded.display_name,
-                preferences_json=excluded.preferences_json,
-                traits_json=excluded.traits_json,
-                evidence_json=excluded.evidence_json,
-                confidence=excluded.confidence,
-                status='active',
-                updated_at=excluded.updated_at
-            """,
-            (
-                profile_id,
-                chat_username,
-                person_key,
-                display_name,
-                json.dumps(preferences, ensure_ascii=False),
-                json.dumps(traits, ensure_ascii=False),
-                json.dumps(evidence_payload, ensure_ascii=False),
-                clamp_float(row.get("max_confidence"), 0.55, 0.0, 1.0),
-                row.get("updated_at") or utc_now_iso(),
-            ),
-        )
-        refreshed += 1
-    return refreshed
-
-
-def chat_user_messages_for_profile(chat: str, max_people: int = 120, min_messages: int = 2) -> tuple[dict[str, list[dict]], int]:
-    if not MEMORY_DB.exists():
-        return {}, 0
-    clauses = ["chat_username=?", "COALESCE(origin_source, 0)!=1", "type_label IN ('text', 'link_or_file')"]
-    params: list = [chat]
-    rows: list[dict] = []
-    contacts = contact_directory(chat)
-    with db_connect(MEMORY_DB, readonly=True) as conn:
-        db_rows = conn.execute(
-            f"""
-            SELECT message_uid, chat_username, chat_display_name, type_label,
-                   create_time, local_id, source, message_content, compress_content,
-                   origin_source
-            FROM messages
-            WHERE {' AND '.join(clauses)}
-            ORDER BY create_time ASC, local_id ASC
-            """,
-            tuple(params),
-        ).fetchall()
-        rows = [dict(row) for row in db_rows]
-    grouped: dict[str, list[dict]] = defaultdict(list)
-    for row in rows:
-        sender_key, sender_name, text = message_sender_identity(row, contacts)
-        sender_key = clean_contact_text(sender_key)
-        text = clean_contact_text(replace_contact_identity_tokens(text, contacts))
-        if not sender_key or sender_key == "me" or is_self_message(row) or not text:
-            continue
-        row["sender_key"] = sender_key
-        row["sender_name"] = sender_name
-        row["clean_text"] = text
-        grouped[sender_key].append(row)
-    eligible = {
-        key: value
-        for key, value in grouped.items()
-        if len(value) >= min_messages
-    }
-    ordered = sorted(eligible.items(), key=lambda item: (len(item[1]), max(int(row.get("create_time") or 0) for row in item[1])), reverse=True)
-    return dict(ordered[:max_people]), len(rows)
-
-
-def build_profile_claims_for_person(chat_username: str, person_key: str, rows: list[dict], contacts: dict[str, dict]) -> list[dict]:
-    if not rows:
-        return []
-    display_name = group_display_name(person_key, contacts.get(person_key, {})) or rows[-1].get("sender_name") or person_key
-    texts = [clean_contact_text(row.get("clean_text")) for row in rows if clean_contact_text(row.get("clean_text"))]
-    joined = "\n".join(texts)
-    claims: list[dict] = []
-    topic_counts: Counter[str] = Counter()
-    style_counts: Counter[str] = Counter()
-    for text in texts:
-        for topic, keywords in PROFILE_TOPIC_KEYWORDS.items():
-            if any(keyword in text for keyword in keywords):
-                topic_counts[topic] += 1
-        for style, keywords in PROFILE_STYLE_KEYWORDS.items():
-            if any(keyword in text for keyword in keywords):
-                style_counts[style] += 1
-    count = len(rows)
-    latest_rows = rows[-8:]
-    latest_quotes = [quote_payload(row, display_name, row.get("clean_text") or "") for row in latest_rows if row.get("clean_text")]
-    activity, confidence = playful_activity_value(count)
-    claims.append(profile_claim(chat_username, person_key, display_name, "activity", "群聊发动机", activity, confidence, rows[-20:], latest_quotes))
-
-    for topic, support in topic_counts.most_common(5):
-        evidence_rows = [row for row in rows if any(keyword in (row.get("clean_text") or "") for keyword in PROFILE_TOPIC_KEYWORDS[topic])][-8:]
-        quotes = [quote_payload(row, display_name, row.get("clean_text") or "") for row in evidence_rows[-5:]]
-        label = playful_topic_label(topic)
-        value = playful_topic_value(topic, support)
-        claims.append(profile_claim(chat_username, person_key, display_name, "topic", label, value, min(0.9, 0.54 + support / 18), evidence_rows, quotes))
-
-    for style, support in style_counts.most_common(5):
-        evidence_rows = [row for row in rows if any(keyword in (row.get("clean_text") or "") for keyword in PROFILE_STYLE_KEYWORDS[style])][-8:]
-        quotes = [quote_payload(row, display_name, row.get("clean_text") or "") for row in evidence_rows[-5:]]
-        label = playful_style_label(style)
-        value = playful_style_value(style, support)
-        claims.append(profile_claim(chat_username, person_key, display_name, "style", label, value, min(0.88, 0.52 + support / 16), evidence_rows, quotes))
-
-    preference_patterns = [
-        ("偏好小本本", r"(?:喜欢|偏好|想要|希望|要|需要)([^。！？\n]{2,40})", "preference"),
-        ("雷区警报器", r"(?:不要|不能|不想|别|讨厌)([^。！？\n]{2,40})", "avoid"),
-    ]
-    for label, pattern, claim_type in preference_patterns:
-        matches = []
-        evidence_rows = []
-        for row in rows:
-            text = row.get("clean_text") or ""
-            match = re.search(pattern, text)
-            if match:
-                value = clean_contact_text(match.group(1))
-                if value and not is_placeholder_entity(value) and len(value) <= 42 and not is_weak_profile_phrase(value):
-                    matches.append(value)
-                    evidence_rows.append(row)
-        for value, support in Counter(matches).most_common(4):
-            related_rows = [row for row in evidence_rows if value in (row.get("clean_text") or "")][-6:]
-            quotes = [quote_payload(row, display_name, row.get("clean_text") or "") for row in related_rows[-4:]]
-            if claim_type == "avoid":
-                playful_value = f"看到「{value}」容易亮红灯，历史证据 {support} 次，回复时别往这个坑里跳"
-            else:
-                playful_value = f"偏好清单里有「{value}」，历史证据 {support} 次，接话时可以顺手照顾一下"
-            claims.append(profile_claim(chat_username, person_key, display_name, claim_type, label, playful_value, min(0.78, 0.5 + support / 8), related_rows, quotes))
-
-    recent_meaningful = [text for text in texts[-18:] if len(text) >= 8]
-    if recent_meaningful:
-        sample = "；".join(recent_meaningful[-3:])[:260]
-        claims.append(profile_claim(chat_username, person_key, display_name, "habit", "最近雷达扫到", f"最近主要盯着这些现场片段：{sample}", 0.58, rows[-12:], latest_quotes[-5:]))
-    claims.extend(build_person_fingerprint_claims(chat_username, person_key, display_name, rows))
-    return claims
-
-
-def relation_payload(
-    chat_username: str,
-    source_key: str,
-    source_name: str,
-    target_kind: str,
-    target_key: str,
-    target_name: str,
-    relation: str,
-    support_count: int,
-    rows: list[dict],
-    quotes: list[dict],
-) -> dict:
-    source_uids = [row.get("message_uid") for row in rows if row.get("message_uid")]
-    times = [int(row.get("create_time") or 0) for row in rows if row.get("create_time")]
-    return {
-        "relation_id": stable_id(chat_username, source_key, target_kind, target_key, relation),
-        "chat_username": chat_username,
-        "source_person_key": source_key,
-        "source_display_name": source_name,
-        "target_kind": target_kind,
-        "target_key": target_key,
-        "target_display_name": target_name,
-        "relation": relation,
-        "confidence": min(0.92, 0.48 + support_count / 18),
-        "support_count": support_count,
-        "first_seen_time": min(times) if times else 0,
-        "last_seen_time": max(times) if times else 0,
-        "source_message_uids_json": json.dumps(source_uids[:24], ensure_ascii=False),
-        "source_quotes_json": json.dumps(quotes[:8], ensure_ascii=False),
-        "updated_at": utc_now_iso(),
-    }
-
-
-def build_profile_relations_for_chat(chat_username: str, grouped: dict[str, list[dict]], contacts: dict[str, dict]) -> list[dict]:
-    all_rows = sorted([row for rows in grouped.values() for row in rows], key=lambda item: (int(item.get("create_time") or 0), int(item.get("local_id") or 0)))
-    if not all_rows:
-        return []
-    display = {key: group_display_name(key, contacts.get(key, {})) or (rows[-1].get("sender_name") if rows else key) or key for key, rows in grouped.items()}
-    pair_rows: dict[tuple[str, str], list[dict]] = defaultdict(list)
-    topic_rows: dict[tuple[str, str], list[dict]] = defaultdict(list)
-    previous = None
-    for row in all_rows:
-        sender = row.get("sender_key")
-        text = row.get("clean_text") or ""
-        if previous and previous.get("sender_key") != sender and int(row.get("create_time") or 0) - int(previous.get("create_time") or 0) <= 300:
-            a, b = sorted([str(previous.get("sender_key") or ""), str(sender or "")])
-            if a and b:
-                pair_rows[(a, b)].extend([previous, row])
-        for topic, keywords in PROFILE_TOPIC_KEYWORDS.items():
-            if any(keyword in text for keyword in keywords):
-                topic_rows[(str(sender or ""), topic)].append(row)
-        previous = row
-    relations: list[dict] = []
-    for (a, b), rows in sorted(pair_rows.items(), key=lambda item: len(item[1]), reverse=True)[:80]:
-        support = max(1, len(rows) // 2)
-        if support < 2:
-            continue
-        quotes = [
-            quote_payload(row, display.get(str(row.get("sender_key") or ""), "群友"), row.get("clean_text") or "")
-            for row in rows[-8:]
-        ]
-        relations.append(relation_payload(chat_username, a, display.get(a, a), "person", b, display.get(b, b), "连续互动", support, rows[-18:], quotes))
-        relations.append(relation_payload(chat_username, b, display.get(b, b), "person", a, display.get(a, a), "连续互动", support, rows[-18:], quotes))
-    for (person_key, topic), rows in sorted(topic_rows.items(), key=lambda item: len(item[1]), reverse=True)[:100]:
-        if not person_key or len(rows) < 2:
-            continue
-        quotes = [quote_payload(row, display.get(person_key, person_key), row.get("clean_text") or "") for row in rows[-5:]]
-        relations.append(relation_payload(chat_username, person_key, display.get(person_key, person_key), "topic", topic, topic, "常聊话题", len(rows), rows[-12:], quotes))
-    return relations
-
-
-def rebuild_person_profiles(payload: dict | None = None) -> dict:
-    init_semantic_memory()
-    payload = payload or {}
-    if not PROFILE_REBUILD_LOCK.acquire(blocking=False):
-        return {"ok": False, "error": "profile rebuild is already running"}
-    started = utc_now_iso()
-    chat = str(payload.get("chat") or payload.get("chat_username") or "").strip()
-    max_people = clamp_int(payload.get("max_people_per_chat"), DEFAULT_CONFIG["profile_rebuild"]["max_people_per_chat"], 5, 500)
-    min_messages = clamp_int(payload.get("min_messages_per_person"), DEFAULT_CONFIG["profile_rebuild"]["min_messages_per_person"], 1, 50)
-    config = read_config()
-    rebuild_settings = config.get("profile_rebuild") if isinstance(config.get("profile_rebuild"), dict) else {}
-    use_llm = bool(payload.get("use_llm", rebuild_settings.get("use_llm", True)))
-    llm_min_messages = clamp_int(payload.get("llm_min_messages"), rebuild_settings.get("llm_min_messages", 3), 1, 100)
-    llm_profile = active_profile(config)
-    force = bool(payload.get("force", True))
-    write_profile_rebuild_state(
-        {
-            "running": True,
-            "ok": True,
-            "last_started_at": now_iso(),
-            "last_checked_at": now_iso(),
-            "last_error": "",
-            "last_skip_reason": "",
-            "progress": profile_progress_payload(phase="starting", percent=1),
-        }
-    )
-    run_id = None
-    try:
-        with db_connect(AI_DB) as conn:
-            run_id = conn.execute(
-                "INSERT INTO ai_profile_rebuild_runs (started_at, chat_username, details_json) VALUES (?, ?, ?)",
-                (
-                    started,
-                    chat,
-                    json.dumps(
-                        {
-                            "max_people_per_chat": max_people,
-                            "min_messages_per_person": min_messages,
-                            "force": force,
-                            "use_llm": use_llm,
-                            "llm_min_messages": llm_min_messages,
-                            "llm_model": llm_profile.get("model") or "",
-                        },
-                        ensure_ascii=False,
-                    ),
-                ),
-            ).lastrowid
-        stats = chat_message_stats(chat)
-        chat_names = sorted(stats.keys(), key=lambda key: stats[key].get("message_count") or 0, reverse=True)
-        if chat:
-            chat_names = [chat] if chat in stats or chat else []
-        counts = {"people": 0, "claims": 0, "relations": 0, "messages": 0, "chats": 0}
-        details = {"chats": [], "llm": {"enabled": use_llm, "ok": 0, "failed": 0, "model": llm_profile.get("model") or ""}}
-        total_chats = len(chat_names)
-        write_profile_rebuild_progress(phase="scanning", total_chats=total_chats, percent=3)
-        for chat_index, chat_username in enumerate(chat_names, start=1):
-            chat_display = stats.get(chat_username, {}).get("chat_display_name") or chat_display_name_for(chat_username) or chat_username
-            base_percent = ((chat_index - 1) / max(total_chats, 1)) * 100
-            write_profile_rebuild_progress(
-                phase="scanning",
-                total_chats=total_chats,
-                current_chat_index=chat_index,
-                current_chat=chat_username,
-                current_chat_display_name=chat_display,
-                claims=counts["claims"],
-                relations=counts["relations"],
-                messages=counts["messages"],
-                percent=max(3, base_percent),
-            )
-            contacts = contact_directory(chat_username)
-            grouped, message_count = chat_user_messages_for_profile(chat_username, max_people=max_people, min_messages=min_messages)
-            people_total = len(grouped)
-            if not grouped:
-                details["chats"].append({"chat_username": chat_username, "people": 0, "claims": 0, "relations": 0, "messages": message_count})
-                counts["messages"] += message_count
-                write_profile_rebuild_progress(
-                    phase="skipped",
-                    total_chats=total_chats,
-                    current_chat_index=chat_index,
-                    current_chat=chat_username,
-                    current_chat_display_name=chat_display,
-                    people_done=0,
-                    people_total=0,
-                    claims=counts["claims"],
-                    relations=counts["relations"],
-                    messages=counts["messages"],
-                    percent=(chat_index / max(total_chats, 1)) * 100,
-                )
-                continue
-            all_claims: list[dict] = []
-            for person_index, (person_key, rows) in enumerate(grouped.items(), start=1):
-                display_name = group_display_name(person_key, contacts.get(person_key, {})) or (rows[-1].get("sender_name") if rows else "") or person_key
-                write_profile_rebuild_progress(
-                    phase="llm_building" if use_llm and len(rows) >= llm_min_messages else "building",
-                    total_chats=total_chats,
-                    current_chat_index=chat_index,
-                    current_chat=chat_username,
-                    current_chat_display_name=chat_display,
-                    current_person_key=person_key,
-                    current_person_display_name=display_name,
-                    people_done=max(0, person_index - 1),
-                    people_total=people_total,
-                    claims=counts["claims"] + len(all_claims),
-                    relations=counts["relations"],
-                    messages=counts["messages"] + message_count,
-                )
-                person_claims = build_profile_claims_for_person(chat_username, person_key, rows, contacts)
-                if use_llm and len(rows) >= llm_min_messages:
-                    llm_claims, llm_result = build_llm_profile_for_person(
-                        chat_username,
-                        person_key,
-                        display_name,
-                        rows,
-                        person_claims,
-                        llm_profile,
-                    )
-                    if llm_claims:
-                        details["llm"]["ok"] += 1
-                        person_claims.extend(llm_claims)
-                    else:
-                        details["llm"]["failed"] += 1
-                        details["llm"].setdefault("errors", []).append(
-                            {
-                                "chat_username": chat_username,
-                                "person_key": person_key,
-                                "display_name": display_name,
-                                "error": str(llm_result.get("error") or llm_result)[:240],
-                            }
-                        )
-                all_claims.extend(person_claims)
-                if person_index == 1 or person_index == people_total or person_index % 4 == 0:
-                    write_profile_rebuild_progress(
-                        phase="building",
-                        total_chats=total_chats,
-                        current_chat_index=chat_index,
-                        current_chat=chat_username,
-                        current_chat_display_name=chat_display,
-                        current_person_key=person_key,
-                        current_person_display_name=display_name,
-                        people_done=person_index,
-                        people_total=people_total,
-                        claims=counts["claims"] + len(all_claims),
-                        relations=counts["relations"],
-                        messages=counts["messages"] + message_count,
-                    )
-            relations = build_profile_relations_for_chat(chat_username, grouped, contacts)
-            write_profile_rebuild_progress(
-                phase="writing",
-                total_chats=total_chats,
-                current_chat_index=chat_index,
-                current_chat=chat_username,
-                current_chat_display_name=chat_display,
-                people_done=people_total,
-                people_total=people_total,
-                claims=counts["claims"] + len(all_claims),
-                relations=counts["relations"] + len(relations),
-                messages=counts["messages"] + message_count,
-            )
-            with db_connect(AI_DB) as conn:
-                person_keys = list(grouped.keys())
-                placeholders = ",".join("?" for _ in person_keys)
-                if placeholders:
-                    conn.execute(
-                        f"""
-                        UPDATE ai_person_profile_claims
-                        SET status='disabled', updated_at=?
-                        WHERE chat_username=? AND person_key IN ({placeholders})
-                        """,
-                        (utc_now_iso(), chat_username, *person_keys),
-                    )
-                    conn.execute(
-                        f"""
-                        UPDATE ai_person_relations
-                        SET status='disabled', updated_at=?
-                        WHERE chat_username=? AND (source_person_key IN ({placeholders}) OR target_key IN ({placeholders}))
-                        """,
-                        (utc_now_iso(), chat_username, *person_keys, *person_keys),
-                    )
-                claim_count = upsert_profile_claims(conn, all_claims)
-                relation_count = upsert_person_relations(conn, relations)
-                cache_people_count = rebuild_profile_cache_for_chat(conn, chat_username, contacts)
-                rebuilt_people_count = len(person_keys)
-            counts["people"] += rebuilt_people_count
-            counts["claims"] += claim_count
-            counts["relations"] += relation_count
-            counts["messages"] += message_count
-            counts["chats"] += 1
-            details["chats"].append(
-                {
-                    "chat_username": chat_username,
-                    "chat_display_name": chat_display,
-                    "people": rebuilt_people_count,
-                    "cache_people": cache_people_count,
-                    "claims": claim_count,
-                    "relations": relation_count,
-                    "messages": message_count,
-                }
-            )
-            write_profile_rebuild_progress(
-                phase="done_chat",
-                total_chats=total_chats,
-                current_chat_index=chat_index,
-                current_chat=chat_username,
-                current_chat_display_name=chat_display,
-                people_done=people_total,
-                people_total=people_total,
-                claims=counts["claims"],
-                relations=counts["relations"],
-                messages=counts["messages"],
-                percent=(chat_index / max(total_chats, 1)) * 100,
-            )
-        with db_connect(AI_DB) as conn:
-            conn.execute(
-                """
-                UPDATE ai_profile_rebuild_runs
-                SET finished_at=?, ok=1, people_count=?, claims_count=?,
-                    relations_count=?, message_count=?, details_json=?
-                WHERE run_id=?
-                """,
-                (
-                    utc_now_iso(),
-                    counts["people"],
-                    counts["claims"],
-                    counts["relations"],
-                    counts["messages"],
-                    json.dumps(details, ensure_ascii=False),
-                    run_id,
-                ),
-            )
-        write_profile_rebuild_state(
-            {
-                "running": False,
-                "ok": True,
-                "last_finished_at": now_iso(),
-                "last_checked_at": now_iso(),
-                "last_run_id": run_id,
-                "last_counts": counts,
-                "last_error": "",
-                "last_skip_reason": "",
-                "last_success_epoch": time.time(),
-                "progress": profile_progress_payload(
-                    phase="done",
-                    total_chats=total_chats,
-                    current_chat_index=total_chats,
-                    people_done=counts["people"],
-                    people_total=counts["people"],
-                    claims=counts["claims"],
-                    relations=counts["relations"],
-                    messages=counts["messages"],
-                    percent=100,
-                ),
-            }
-        )
-        return {"ok": True, "run_id": run_id, "counts": counts, "details": details}
-    except Exception as exc:
-        if run_id:
-            try:
-                with db_connect(AI_DB) as conn:
-                    conn.execute(
-                        "UPDATE ai_profile_rebuild_runs SET finished_at=?, ok=0, error=? WHERE run_id=?",
-                        (utc_now_iso(), str(exc), run_id),
-                    )
-            except sqlite3.Error:
-                pass
-        write_profile_rebuild_state(
-            {
-                "running": False,
-                "ok": False,
-                "last_checked_at": now_iso(),
-                "last_error": str(exc),
-                "progress": profile_progress_payload(phase="error", percent=0),
-            }
-        )
-        return {"ok": False, "error": str(exc), "run_id": run_id}
-    finally:
-        PROFILE_REBUILD_LOCK.release()
-
-
-def start_profile_rebuild_async(payload: dict | None = None) -> dict:
-    if PROFILE_REBUILD_LOCK.locked():
-        return {"ok": False, "error": "profile rebuild is already running", "profile_rebuild": profile_rebuild_runs(8)}
-    payload = dict(payload or {})
-    payload.pop("async", None)
-    write_profile_rebuild_state(
-        {
-            "running": True,
-            "ok": True,
-            "last_started_at": now_iso(),
-            "last_checked_at": now_iso(),
-            "last_error": "",
-            "last_skip_reason": "",
-            "progress": profile_progress_payload(phase="queued", percent=1),
-        }
-    )
-
-    def worker() -> None:
-        rebuild_person_profiles(payload)
-
-    thread = threading.Thread(target=worker, daemon=True, name="profile-rebuild-manual")
-    thread.start()
-    return {"ok": True, "started": True, "profile_rebuild": profile_rebuild_runs(8)}
-
-
 def refresh_local_people_profiles(chat: str = "", limit: int = 28) -> dict:
-    # Full-history profile rebuild owns precise profiles. The lightweight pass only
-    # seeds empty installs and must not overwrite evidence-backed cache rows.
-    try:
-        with db_connect(AI_DB, readonly=True) as conn:
-            row = conn.execute(
-                """
-                SELECT COUNT(*)
-                FROM ai_person_profile_claims
-                WHERE status!='disabled' AND (?='' OR chat_username=?)
-                """,
-                (chat, chat),
-            ).fetchone()
-            if int(row[0] or 0) > 0:
-                return {"people_profiles": 0, "source": "full_history_profiles_present", "updated_at": utc_now_iso()}
-    except sqlite3.Error:
-        pass
     people = infer_people_storylines(limit=limit, chat=chat, include_existing=False)
     now = utc_now_iso()
     refreshed = 0
@@ -13984,8 +13195,6 @@ def semantic_memory_preview(chat: str = "") -> dict:
             "people": active_count(conn, "ai_people_profiles"),
             "summaries": active_count(conn, "ai_group_summaries"),
             "edges": active_count(conn, "ai_graph_edges"),
-            "profile_claims": active_count(conn, "ai_person_profile_claims"),
-            "person_relations": active_count(conn, "ai_person_relations"),
         }
         facts = [
             dict(row)
@@ -14116,12 +13325,6 @@ def semantic_memory_preview(chat: str = "") -> dict:
         row["evidence"] = parse_json_value(row.pop("evidence_json", None), [])
         row["item_id"] = row.get("profile_id")
         row["kind"] = "person"
-        if isinstance(row["evidence"], dict):
-            row["storyline"] = row["evidence"].get("storyline") or []
-            row["recent_snippets"] = row["evidence"].get("recent_snippets") or []
-            row["profile_claim_refs"] = row["evidence"].get("claims") or []
-            row["message_count"] = row["evidence"].get("message_count") or row.get("message_count")
-            row["latest_time"] = row["evidence"].get("latest_time") or row.get("latest_time")
         enrich_person_identity(row, contacts)
     for row in edges:
         row["evidence"] = parse_json_value(row.pop("evidence_json", None), [])
@@ -14238,34 +13441,6 @@ def semantic_memory_preview(chat: str = "") -> dict:
         people.append(person)
         existing_people_keys.add((chat_key, person_key))
     people = dedupe_people_profiles(people, contacts)
-    person_keys = unique_texts([str(row.get("person_key") or row.get("username") or "") for row in people if row.get("person_key") or row.get("username")])
-    profile_claims = profile_claim_rows_for_people(chat, person_keys, limit=320)
-    person_relations = person_relation_rows(chat, person_keys, limit=240)
-    claims_by_person: dict[str, list[dict]] = defaultdict(list)
-    for claim in profile_claims:
-        claims_by_person[str(claim.get("person_key") or "")].append(claim)
-    relation_by_person: dict[str, list[dict]] = defaultdict(list)
-    for relation in person_relations:
-        relation_by_person[str(relation.get("source_person_key") or "")].append(relation)
-        if relation.get("target_kind") == "person":
-            relation_by_person[str(relation.get("target_key") or "")].append(relation)
-    for person in people:
-        key = str(person.get("person_key") or person.get("username") or "")
-        person["claims"] = claims_by_person.get(key, [])[:24]
-        person["relations"] = relation_by_person.get(key, [])[:18]
-        if person["claims"] and not person.get("storyline"):
-            person["storyline"] = [
-                f"{claim.get('label')}：{claim.get('value') or claim.get('label')}"
-                for claim in person["claims"][:5]
-                if claim.get("label") or claim.get("value")
-            ]
-        if person["claims"] and not person.get("recent_snippets"):
-            person["recent_snippets"] = [
-                quote.get("text")
-                for claim in person["claims"][:8]
-                for quote in (claim.get("source_quotes") or [])
-                if isinstance(quote, dict) and quote.get("text")
-            ][:8]
 
     nodes = {}
 
@@ -14369,20 +13544,7 @@ def semantic_memory_preview(chat: str = "") -> dict:
         "nodes": list(nodes.values()),
         "edges": graph_edges,
     }
-    relation_graph = build_relationship_graph_payload(chat, people, facts, profile_claims, person_relations, summaries)
-    return {
-        "facts": facts,
-        "summaries": summaries,
-        "people": people,
-        "edges": edges,
-        "profile_claims": profile_claims,
-        "person_relations": person_relations,
-        "relationship_graph": relation_graph,
-        "profile_rebuild": profile_rebuild_runs(8),
-        "totals": totals,
-        "graph": graph,
-        "scope": scope,
-    }
+    return {"facts": facts, "summaries": summaries, "people": people, "edges": edges, "totals": totals, "graph": graph, "scope": scope}
 
 
 def format_graph_value(value) -> str:
@@ -14453,143 +13615,12 @@ def merge_person_profile(target: dict, extra: dict) -> None:
     for field in ("message_count", "latest_time"):
         if numeric_value(extra.get(field)) > numeric_value(target.get(field)):
             target[field] = extra.get(field)
-    for field in ("storyline", "recent_snippets"):
+    for field in ("storyline", "recent_snippets", "evidence"):
         target[field] = unique_texts(list(target.get(field) or []) + list(extra.get(field) or []))
-    target_evidence = target.get("evidence")
-    extra_evidence = extra.get("evidence")
-    if isinstance(target_evidence, list) or isinstance(extra_evidence, list):
-        merged = []
-        if isinstance(target_evidence, list):
-            merged.extend(target_evidence)
-        elif target_evidence:
-            merged.append(target_evidence)
-        if isinstance(extra_evidence, list):
-            merged.extend(extra_evidence)
-        elif extra_evidence:
-            merged.append(extra_evidence)
-        target["evidence"] = unique_texts(merged)
-    elif not target_evidence and extra_evidence:
-        target["evidence"] = extra_evidence
     if not target.get("traits") and extra.get("traits"):
         target["traits"] = extra["traits"]
     if not target.get("preferences") and extra.get("preferences"):
         target["preferences"] = extra["preferences"]
-
-
-def build_relationship_graph_payload(
-    chat: str,
-    people: list[dict],
-    facts: list[dict],
-    profile_claims: list[dict],
-    person_relations: list[dict],
-    summaries: list[dict],
-) -> dict:
-    active_people = [person for person in people if person.get("status", "active") == "active"]
-    people_by_key = {
-        str(person.get("person_key") or person.get("username") or ""): person
-        for person in active_people
-        if person.get("person_key") or person.get("username")
-    }
-    focus_people = sorted(
-        active_people,
-        key=lambda item: (
-            numeric_value(item.get("message_count") or (item.get("derived") or {}).get("message_count") or 0),
-            numeric_value(item.get("confidence") or 0),
-        ),
-        reverse=True,
-    )[:36]
-    relation_index: dict[str, list[dict]] = defaultdict(list)
-    for relation in person_relations:
-        source = str(relation.get("source_person_key") or "")
-        target = str(relation.get("target_key") or "")
-        if source:
-            relation_index[source].append(relation)
-        if relation.get("target_kind") == "person" and target:
-            relation_index[target].append(relation)
-    claim_index: dict[str, list[dict]] = defaultdict(list)
-    for claim in profile_claims:
-        claim_index[str(claim.get("person_key") or "")].append(claim)
-
-    focus_nodes = []
-    for person in focus_people:
-        person_key = str(person.get("person_key") or person.get("username") or "")
-        display = person.get("display_name") or person.get("contact_display_name") or person_key
-        focus_nodes.append(
-            {
-                "id": f"person:{person_key}",
-                "person_key": person_key,
-                "label": display,
-                "avatar_url": person.get("avatar_url") or "",
-                "message_count": int(person.get("message_count") or (person.get("derived") or {}).get("message_count") or 0),
-                "confidence": clamp_float(person.get("confidence"), 0.0, 0.0, 1.0),
-                "rank_hint": person.get("rank_hint") or "",
-                "claim_count": len(claim_index.get(person_key, [])),
-                "relation_count": len(relation_index.get(person_key, [])),
-                "latest_time": int(person.get("latest_time") or 0),
-            }
-        )
-
-    topic_counts: Counter[str] = Counter()
-    for relation in person_relations:
-        if relation.get("target_kind") == "topic":
-            topic_counts[relation.get("target_display_name") or relation.get("target_key") or "话题"] += int(relation.get("support_count") or 1)
-    if not topic_counts:
-        for summary in summaries:
-            for topic in summary.get("topics") or []:
-                topic_counts[str(topic)] += 1
-    return {
-        "chat_username": chat,
-        "focus_nodes": focus_nodes,
-        "topics": [{"label": topic, "count": count} for topic, count in topic_counts.most_common(16)],
-        "stats": {
-            "people": len(active_people),
-            "claims": len(profile_claims),
-            "relations": len(person_relations),
-            "facts": len(facts),
-        },
-    }
-
-
-def relationship_graph_for_person(chat: str, person_key: str = "", limit: int = 80) -> dict:
-    preview = semantic_memory_preview(chat)
-    people = activeMemoryItems_py(preview.get("people") or [])
-    if not person_key and people:
-        people = sorted(
-            people,
-            key=lambda item: (
-                numeric_value(item.get("message_count") or (item.get("derived") or {}).get("message_count") or 0),
-                numeric_value(item.get("confidence") or 0),
-            ),
-            reverse=True,
-        )
-        person_key = str(people[0].get("person_key") or people[0].get("username") or "")
-    selected = next((person for person in people if str(person.get("person_key") or person.get("username") or "") == person_key), None)
-    claims = profile_claim_rows_for_people(chat, [person_key], limit=limit)
-    relations = person_relation_rows(chat, [person_key], limit=limit)
-    facts = preview.get("facts") or []
-    related_facts = []
-    if selected:
-        display = selected.get("display_name") or person_key
-        keys = [person_key, display]
-        related_facts = [
-            fact
-            for fact in facts
-            if any(key and key in f"{fact.get('subject')} {fact.get('predicate')} {fact.get('object')}" for key in keys)
-        ][:20]
-    return {
-        "ok": True,
-        "chat_username": chat,
-        "person_key": person_key,
-        "person": selected,
-        "claims": claims,
-        "relations": relations,
-        "facts": related_facts,
-        "summary": preview.get("relationship_graph") or {},
-    }
-
-
-def activeMemoryItems_py(items: list[dict]) -> list[dict]:
-    return [item for item in items or [] if item.get("status", "active") != "disabled"]
 
 
 def infer_people_storylines(limit: int = 18, chat: str = "", include_existing: bool = True) -> list[dict]:
@@ -14938,12 +13969,12 @@ def suite_status() -> dict:
     return STATUS_API.api_status()
 
 
-def evaluate_talk(payload: dict) -> dict:
-    config = read_config()
+def evaluate_talk(payload: dict, config: dict | None = None) -> dict:
+    config = config or read_config()
     mode_key = payload.get("mode") or config.get("agent", {}).get("reply_mode", "normal")
     mode = config.get("talk_modes", {}).get(mode_key) or config.get("talk_modes", {}).get("normal", {})
     text = str(payload.get("text") or "").strip()
-    context = dict(payload.get("context") or {})
+    context = payload.get("context") or {}
     score = 0
     hits = []
     suppressions = []
@@ -14955,25 +13986,6 @@ def evaluate_talk(payload: dict) -> dict:
     }
     if not mention_info["mentions_bot"]:
         mention_info = detect_bot_mention(text, config, str(context.get("chat_username") or ""))
-    if not context.get("sender_excluded"):
-        context["sender_excluded"] = bool(
-            auto_reply_excluded_member_info(
-                config,
-                {
-                    "chat_username": context.get("chat_username") or payload.get("chat") or "",
-                    "chat_display_name": context.get("chat_display_name") or payload.get("chat_display_name") or "",
-                    "sender_key": context.get("sender_key") or context.get("member_username") or context.get("sender_hint") or "",
-                    "sender_hint": (
-                        context.get("sender_name")
-                        or context.get("group_nickname")
-                        or context.get("sender_hint")
-                        or context.get("member_username")
-                        or ""
-                    ),
-                    "text": text,
-                },
-            ).get("excluded")
-        )
 
     def add(name: str, value: int | float, kind: str = "positive") -> None:
         nonlocal score
@@ -15006,8 +14018,6 @@ def evaluate_talk(payload: dict) -> dict:
 
     if context.get("is_self_message"):
         suppressions.append({"name": "机器人自己发的消息", "effect": "ignore"})
-    if context.get("sender_excluded"):
-        suppressions.append({"name": "发言人在接话排除名单", "effect": "ignore"})
     if not context.get("group_auto_reply_enabled", config.get("agent", {}).get("auto_reply_enabled")) and not mention_info.get("mentions_bot"):
         suppressions.append({"name": "群未开启自动回复", "effect": "ignore"})
     if context.get("safety_risk"):
@@ -15027,7 +14037,7 @@ def evaluate_talk(payload: dict) -> dict:
         add("图片理解明确任务", 55)
     elif context.get("image_analysis_requested"):
         add("图片消息匹配到近邻图片理解请求", 80)
-    elif any(word in text for word in ("总结", "查记录", "写文档", "识图", "视频", "表情包", "文件", "记得", "之前说", "画像", "口头禅", "口癖", "爱说什么", "最常说")):
+    elif any(word in text for word in ("总结", "查记录", "写文档", "识图", "视频", "表情包", "文件", "记得", "之前说")):
         add("涉及总结/查记录/写文档/识图/文件", 35)
     if asks_group:
         add("向群里征求意见", 22)
@@ -15090,22 +14100,17 @@ def infer_talk_context(message: dict | None, recent: list[dict], explicit: dict 
         contact = contact_directory(chat_username).get(sender_key, {})
         group_nickname = group_display_name(sender_key, contact) or group_nickname
         sender_name = group_nickname or sender_name
-    sender_excluded = bool(
-        auto_reply_excluded_member_info(
-            config,
-            {
-                "chat_username": chat_username,
-                "sender_key": sender_key,
-                "sender_hint": sender_name,
-                "chat_display_name": explicit.get("chat_display_name") or (message or {}).get("chat_display_name") or "",
-            },
-        ).get("excluded")
+    explicit_mention = explicit_reply_mention_request(text, chat_username, config)
+    reply_target_name = (
+        clean_contact_text(explicit.get("reply_target_name"))
+        or clean_contact_text(explicit_mention.get("group_nickname") or explicit_mention.get("display"))
+        or group_nickname
+        or sender_name
     )
     context = {
         "chat_username": chat_username,
         "group_auto_reply_enabled": config.get("agent", {}).get("auto_reply_enabled"),
-        "sender_excluded": sender_excluded,
-        "needs_memory": any(word in text for word in ("之前", "上次", "记得", "谁说过", "查记录", "总结", "上下文", "画像", "口头禅", "口癖", "爱说什么", "最常说")),
+        "needs_memory": any(word in text for word in ("之前", "上次", "记得", "谁说过", "查记录", "总结", "上下文")),
         "cold_room": False,
         "two_people_private_like": False,
         "spammy": False,
@@ -15114,6 +14119,10 @@ def infer_talk_context(message: dict | None, recent: list[dict], explicit: dict 
         "mentions_bot_explicit": bool(mention_info.get("mentions_bot_explicit")),
         "bot_alias": mention_info.get("bot_alias") or "",
         "reply_to_sender": bool(mention_info.get("mentions_bot")),
+        "reply_target_name": reply_target_name,
+        "reply_mention_reason": "explicit_target" if explicit_mention else ("sender_called_bot" if mention_info.get("mentions_bot") else ""),
+        "reply_mention_required": bool(explicit_mention),
+        "explicit_mention_target": explicit_mention,
         "sender_key": sender_key,
         "sender_name": sender_name,
         "group_nickname": group_nickname or sender_name,
@@ -15136,7 +14145,8 @@ def infer_talk_context(message: dict | None, recent: list[dict], explicit: dict 
     return context
 
 
-def debug_talk(payload: dict) -> dict:
+def debug_talk(payload: dict, config: dict | None = None) -> dict:
+    config = config or read_config()
     message = message_by_uid(str(payload.get("message_uid") or "")) if payload.get("message_uid") else None
     custom_text = str(payload.get("text") or "").strip()
     chat = str(payload.get("chat") or (message or {}).get("chat_username") or "").strip()
@@ -15167,9 +14177,8 @@ def debug_talk(payload: dict) -> dict:
     recent = recent_context(chat, before_time=message.get("create_time"), limit=clamp_int(payload.get("recent_limit"), 16, 4, 60))
     text = custom_text or message.get("text") or ""
     context = infer_talk_context({**message, "text": text}, recent, payload.get("context") if isinstance(payload.get("context"), dict) else {})
-    config = read_config()
     mode_key = payload.get("mode") or config.get("agent", {}).get("reply_mode", "normal")
-    result = evaluate_talk({"text": text, "mode": mode_key, "context": context})
+    result = evaluate_talk({"text": text, "mode": mode_key, "context": context}, config=config)
     return {
         "ok": True,
         "message": message,
@@ -15212,6 +14221,8 @@ def timeline_limit_for_query(query: str) -> int:
         return 120
     if any(word in query for word in ("详细", "完整", "全部")):
         return 120
+    if is_person_memory_task_text(query):
+        return 100
     return 45
 
 
@@ -15284,149 +14295,8 @@ def chat_memory_timeline(chat: str, query: str = "", before_time: int | None = N
     return output
 
 
-def person_history_task_requested(text: str) -> bool:
-    normalized = str(text or "")
-    return any(
-        word in normalized
-        for word in (
-            "人物画像",
-            "用户画像",
-            "画像",
-            "口头禅",
-            "口癖",
-            "爱说什么",
-            "常说什么",
-            "最常说",
-            "说的最多",
-            "说得最多",
-            "经典发言",
-            "代表发言",
-            "他是谁",
-            "她是谁",
-            "评价一下",
-            "分析一下",
-        )
-    )
-
-
-def possible_person_mentions_from_query(query: str, contacts: dict[str, dict]) -> list[str]:
-    text = clean_contact_text(query)
-    if not text:
-        return []
-    matches: list[tuple[int, int, str]] = []
-    for username, contact in contacts.items():
-        names = unique_texts(
-            [
-                group_display_name(username, contact),
-                clean_contact_text(contact.get("group_alias")),
-                clean_contact_text(contact.get("remark")),
-                clean_contact_text(contact.get("nick_name")),
-                clean_contact_text(contact.get("alias")),
-                username if not looks_like_wechat_id(username) else "",
-            ]
-        )
-        for name in names:
-            if not name:
-                continue
-            if len(name) < 2 and not re.search(rf"{re.escape(name)}(?:的|这个人|画像|口头禅|口癖|爱说|常说|最常说|说的最多|说得最多)", text):
-                continue
-            if name in text:
-                matches.append((text.rfind(name), len(name), username))
-    matches.sort(key=lambda item: (item[0], item[1]), reverse=True)
-    return unique_texts([username for _pos, _length, username in matches])[:4]
-
-
-def person_history_rows(chat: str, person_key: str, limit: int = 20000) -> list[dict]:
-    if not MEMORY_DB.exists() or not chat or not person_key:
-        return []
-    limit = clamp_int(limit, 20000, 50, 100000)
-    contacts = contact_directory(chat)
-    with db_connect(MEMORY_DB, readonly=True) as conn:
-        db_rows = conn.execute(
-            """
-            SELECT message_uid, chat_username, chat_display_name, type_label,
-                   create_time, local_id, source, message_content, compress_content,
-                   origin_source
-            FROM messages
-            WHERE chat_username=? AND COALESCE(origin_source, 0)!=1
-                  AND type_label IN ('text', 'link_or_file')
-            ORDER BY create_time ASC, local_id ASC
-            LIMIT ?
-            """,
-            (chat, limit),
-        ).fetchall()
-    rows: list[dict] = []
-    for row in db_rows:
-        data = dict(row)
-        sender_key, sender_name, text = message_sender_identity(data, contacts)
-        if sender_key != person_key or is_self_message(data):
-            continue
-        text = profile_clean_message_text(replace_contact_identity_tokens(text, contacts))
-        if not text:
-            continue
-        data["sender_key"] = sender_key
-        data["sender_name"] = sender_name
-        data["clean_text"] = text
-        rows.append(data)
-    return rows
-
-
-def build_person_history_insight(chat: str, query: str, before_time: int | None = None, sender_key: str = "") -> dict:
-    contacts = contact_directory(chat)
-    target_keys = possible_person_mentions_from_query(query, contacts)
-    if not target_keys and sender_key and any(word in query for word in ("我", "自己", "本人")):
-        target_keys = [sender_key]
-    if not target_keys:
-        return {}
-    person_key = target_keys[0]
-    display_name = group_display_name(person_key, contacts.get(person_key, {})) or person_key
-    rows = person_history_rows(chat, person_key)
-    if before_time:
-        rows = [row for row in rows if int(row.get("create_time") or 0) <= int(before_time)]
-    if not rows:
-        return {"target_key": person_key, "display_name": display_name, "message_count": 0}
-    clause_counts: Counter[str] = Counter()
-    term_counts: Counter[str] = Counter()
-    marker_counts: Counter[str] = Counter()
-    for row in rows:
-        text = row.get("clean_text") or ""
-        clause_counts.update(set(profile_clause_candidates(text)))
-        term_counts.update(set(profile_term_candidates(text)))
-        marker_counts.update(set(profile_style_marker_candidates(text)))
-    catchphrases = top_profile_counter_items(marker_counts, min_count=2, limit=6, max_label_len=14, allow_short=True)
-    if len(catchphrases) < 4:
-        extra = top_profile_counter_items(clause_counts, min_count=2, limit=8, max_label_len=18, allow_short=False)
-        catchphrases.extend([item for item in extra if item[0] not in {x[0] for x in catchphrases}])
-    terms = top_profile_counter_items(term_counts, min_count=3, limit=12, max_label_len=12, allow_short=True)
-    representatives = []
-    for row in representative_profile_rows(rows, limit=6):
-        representatives.append(
-            {
-                "time_text": local_time_text(row.get("create_time")),
-                "text": (row.get("clean_text") or "")[:180],
-            }
-        )
-    recent = [
-        {
-            "time_text": local_time_text(row.get("create_time")),
-            "text": (row.get("clean_text") or "")[:160],
-        }
-        for row in rows[-8:]
-    ]
-    return {
-        "target_key": person_key,
-        "display_name": display_name,
-        "message_count": len(rows),
-        "catchphrases": [{"text": text, "count": count} for text, count in catchphrases[:8]],
-        "terms": [{"text": text, "count": count} for text, count in terms[:10]],
-        "representative_quotes": representatives,
-        "recent_quotes": recent,
-    }
-
-
-def active_semantic_context(chat: str, query: str, limit: int = 10, person_keys: list[str] | None = None) -> dict:
+def active_semantic_context(chat: str, query: str, limit: int = 10) -> dict:
     init_semantic_memory()
-    person_keys = [clean_contact_text(item) for item in (person_keys or []) if clean_contact_text(item)]
     with db_connect(AI_DB, readonly=True) as conn:
         summaries = [
             dict(row)
@@ -15456,45 +14326,20 @@ def active_semantic_context(chat: str, query: str, limit: int = 10, person_keys:
                 (chat, chat, limit),
             )
         ]
-        people_params: list = [chat, chat]
-        people_focus_sql = ""
-        if person_keys:
-            placeholders = ",".join("?" for _ in person_keys)
-            people_focus_sql = f" AND person_key IN ({placeholders})"
-            people_params.extend(person_keys)
-        people_params.append(limit)
-        focused_people = [
+        people = [
             dict(row)
             for row in conn.execute(
-                f"""
+                """
                 SELECT profile_id, chat_username, person_key, display_name,
-                       preferences_json, traits_json, evidence_json, confidence, updated_at
+                       preferences_json, traits_json, confidence, updated_at
                 FROM ai_people_profiles
-                WHERE status='active' AND (?='' OR chat_username=?) {people_focus_sql}
+                WHERE status='active' AND (?='' OR chat_username=?)
                 ORDER BY confidence DESC, updated_at DESC
                 LIMIT ?
                 """,
-                tuple(people_params),
+                (chat, chat, limit),
             )
         ]
-        people = focused_people
-        if len(people) < limit:
-            seen_people = {row.get("profile_id") for row in people}
-            top_people = [
-                dict(row)
-                for row in conn.execute(
-                    """
-                    SELECT profile_id, chat_username, person_key, display_name,
-                           preferences_json, traits_json, evidence_json, confidence, updated_at
-                    FROM ai_people_profiles
-                    WHERE status='active' AND (?='' OR chat_username=?)
-                    ORDER BY confidence DESC, updated_at DESC
-                    LIMIT ?
-                    """,
-                    (chat, chat, limit),
-                )
-            ]
-            people.extend([row for row in top_people if row.get("profile_id") not in seen_people][: max(0, limit - len(people))])
         edges = [
             dict(row)
             for row in conn.execute(
@@ -15515,12 +14360,6 @@ def active_semantic_context(chat: str, query: str, limit: int = 10, person_keys:
     for row in people:
         row["preferences"] = parse_json_value(row.pop("preferences_json", None), {})
         row["traits"] = parse_json_value(row.pop("traits_json", None), {})
-        row["evidence"] = parse_json_value(row.pop("evidence_json", None), {})
-        if isinstance(row["evidence"], dict):
-            row["storyline"] = row["evidence"].get("storyline") or []
-            row["recent_snippets"] = row["evidence"].get("recent_snippets") or []
-            row["message_count"] = row["evidence"].get("message_count") or 0
-            row["latest_time"] = row["evidence"].get("latest_time") or 0
     vector_limit = max(limit, 14) if is_memory_task_text(query) else limit
     vector_memories = search_chunks(AI_DB, query, chat=chat, limit=vector_limit).get("results", []) if query else []
     contacts = contact_directory(chat)
@@ -15533,66 +14372,161 @@ def active_semantic_context(chat: str, query: str, limit: int = 10, person_keys:
             if sender:
                 source["sender_key"] = sender
                 source["sender_hint"] = group_display_name(sender, contacts.get(sender, {})) or source.get("sender_hint") or ""
-    person_history = build_person_history_insight(chat, query, sender_key=person_keys[0] if person_keys else "") if person_history_task_requested(query) else {}
-    if person_history and person_history.get("target_key"):
-        focus_key = clean_contact_text(person_history.get("target_key"))
-        if focus_key and focus_key not in person_keys:
-            person_keys.append(focus_key)
     return {
         "summaries": summaries,
         "facts": facts,
         "people": people,
         "edges": edges,
-        "profile_claims": profile_claim_rows_for_people(chat, person_keys, limit=24) if person_keys else [],
-        "person_relations": person_relation_rows(chat, person_keys, limit=24) if person_keys else [],
         "vector_memories": vector_memories,
-        "person_history": person_history,
     }
 
 
+def person_keys_from_query(chat_username: str, query: str, limit: int = 3) -> list[dict]:
+    chat_username = str(chat_username or "").strip()
+    query = clean_contact_text(query)
+    if not chat_username or not query:
+        return []
+    contacts = contact_directory(chat_username)
+    matched = []
+    seen = set()
+    for username, contact in contacts.items():
+        if not username or username.endswith("@chatroom"):
+            continue
+        identity = chat_member_identity(chat_username, member_username=username)
+        names = unique_texts(
+            [
+                group_display_name(username, contact),
+                clean_contact_text(identity.get("group_nickname")),
+                clean_contact_text(contact.get("group_alias")),
+                clean_contact_text(contact.get("remark")),
+                clean_contact_text(contact.get("nick_name")),
+                clean_contact_text(contact.get("alias")),
+            ]
+        )
+        score = 0
+        hits = []
+        for name in names:
+            if not name:
+                continue
+            if name in query:
+                score = max(score, len(name) * 3)
+                hits.append(name)
+            else:
+                normalized_name = normalize_alias_match_text(name)
+                normalized_query = normalize_alias_match_text(query)
+                if normalized_name and normalized_name in normalized_query:
+                    score = max(score, len(normalized_name) * 2)
+                    hits.append(name)
+        if score <= 0 or username in seen:
+            continue
+        seen.add(username)
+        matched.append(
+            {
+                "person_key": username,
+                "display_name": clean_contact_text(identity.get("group_nickname")) or group_display_name(username, contact) or username,
+                "score": score,
+                "matched_names": unique_texts(hits)[:4],
+            }
+        )
+    matched.sort(key=lambda item: item.get("score", 0), reverse=True)
+    return matched[: clamp_int(limit, 3, 1, 8)]
+
+
+def person_memory_hints_for_query(chat_username: str, query: str) -> list[dict]:
+    if not is_person_memory_task_text(query):
+        return []
+    hints = []
+    for person in person_keys_from_query(chat_username, query, limit=3):
+        stats = build_style_card_stats(chat_username, person.get("person_key") or "", person.get("display_name") or "")
+        if not stats.get("text_message_count"):
+            continue
+        hints.append(
+            {
+                "person_key": person.get("person_key"),
+                "display_name": stats.get("display_name") or person.get("display_name"),
+                "matched_names": person.get("matched_names") or [],
+                "message_count": stats.get("text_message_count") or stats.get("message_count"),
+                "catchphrases": stats.get("catchphrases", [])[:12],
+                "short_phrases": stats.get("short_phrases", [])[:10],
+                "markers": stats.get("markers", [])[:8],
+                "scene_counts": stats.get("scene_counts", [])[:6],
+                "representative_quotes": stats.get("representative_quotes", [])[:8],
+                "recent_quotes": stats.get("recent_quotes", [])[-6:],
+            }
+        )
+    return hints
+
+
 def build_memory_task_prompt(message: dict, recent: list[dict], memory: dict, timeline: list[dict], scoring: dict) -> str:
+    current_text = message.get("text") or ""
+    person_task = is_person_memory_task_text(current_text)
+    timeline_items = timeline[-36:] if person_task else timeline[-80:]
+    recent_items = recent[-8:] if person_task else recent[-16:]
+    memory_fact_limit = 4 if person_task else 10
+    vector_limit = 4 if person_task else 10
+    quote_limit = 4 if person_task else 5
     timeline_lines = []
-    for item in timeline[-80:]:
+    for item in timeline_items:
         speaker = item.get("sender_hint") or "群友"
         self_mark = "机器人" if item.get("is_self_message") else "群友"
-        timeline_lines.append(f"- {item.get('time_text')} {speaker}({self_mark}): {(item.get('text') or '')[:260]}")
+        timeline_lines.append(f"- {item.get('time_text')} {speaker}({self_mark}): {(item.get('text') or '')[:180 if person_task else 260]}")
 
     recent_lines = []
-    for item in recent[-16:]:
+    for item in recent_items:
         speaker = item.get("sender_hint") or "群友"
         self_mark = "机器人" if item.get("is_self_message") else "群友"
-        recent_lines.append(f"- {local_time_text(item.get('create_time'))} {speaker}({self_mark}): {(item.get('text') or '')[:220]}")
+        recent_lines.append(f"- {local_time_text(item.get('create_time'))} {speaker}({self_mark}): {(item.get('text') or '')[:160 if person_task else 220]}")
 
     memory_lines = []
-    for item in memory.get("summaries") or []:
-        memory_lines.append(f"- 群长期摘要: {item.get('summary')}")
-    for item in (memory.get("facts") or [])[:10]:
+    for item in (memory.get("summaries") or [])[: 1 if person_task else 4]:
+        memory_lines.append(f"- 群长期摘要: {(item.get('summary') or '')[:180 if person_task else 500]}")
+    for item in (memory.get("facts") or [])[:memory_fact_limit]:
         memory_lines.append(f"- 事实: {item.get('subject')} {item.get('predicate')} {item.get('object')}")
-    for item in (memory.get("vector_memories") or [])[:10]:
+    for item in (memory.get("vector_memories") or [])[:vector_limit]:
         source = item.get("source") or {}
         content = source.get("content") or item.get("text") or ""
-        memory_lines.append(f"- 检索片段 {item.get('time_text')}: {content[:240]}")
-    person_history = memory.get("person_history") or {}
-    if person_history:
-        name = person_history.get("display_name") or person_history.get("target_key") or "目标成员"
-        memory_lines.append(f"- 个人历史精确统计 {name}: 全历史可见发言 {person_history.get('message_count') or 0} 条")
-        if person_history.get("catchphrases"):
-            memory_lines.append(
-                "- 口头禅/口癖: "
-                + "；".join(f"{item.get('text')}({item.get('count')}次)" for item in person_history.get("catchphrases")[:8])
-            )
-        if person_history.get("terms"):
-            memory_lines.append(
-                "- 个人高频词: "
-                + "；".join(f"{item.get('text')}({item.get('count')}次)" for item in person_history.get("terms")[:10])
-            )
-        for quote in (person_history.get("representative_quotes") or [])[:6]:
-            memory_lines.append(f"- 代表发言 {quote.get('time_text')}: {quote.get('text')}")
+        memory_lines.append(f"- 检索片段 {item.get('time_text')}: {content[:180 if person_task else 240]}")
+    person_hints = person_memory_hints_for_query(message.get("chat_username") or "", current_text)
+    person_hint_lines = []
+    for hint in person_hints:
+        person_hint_lines.append(
+            f"- {hint.get('display_name')}：历史文本 {hint.get('message_count')} 条；"
+            f"口头禅 {json.dumps(hint.get('catchphrases') or [], ensure_ascii=False)}；"
+            f"短句 {json.dumps(hint.get('short_phrases') or [], ensure_ascii=False)}；"
+            f"语气标记 {json.dumps(hint.get('markers') or [], ensure_ascii=False)}"
+        )
+        for quote in (hint.get("representative_quotes") or [])[:quote_limit]:
+            person_hint_lines.append(f"  代表原话 {quote.get('time')}: {quote.get('text')}")
 
-    current_text = message.get("text") or ""
     mention_line = ""
-    if message.get("reply_to_sender") and message.get("reply_target_name"):
-        mention_line = f"- 如果自然，回复开头带 @{message.get('reply_target_name')}；但不要为了@牺牲摘要可读性。"
+    if message.get("reply_mention_required") and message.get("reply_target_name"):
+        mention_line = f"- 用户明确要求你 @ 这个人，回复开头带 @{message.get('reply_target_name')}。"
+    if person_task:
+        return f"""
+你正在微信群里回答一个“查某人历史发言/锐评口头禅”的请求。必须基于下面真实历史统计回答，不能说没上下文，不能让群友再补关键点。
+
+当前请求:
+{current_text}
+
+输出要求:
+- 直接给结论，口语化，像群友锐评。
+- 必须点出目标人物、样本量、相关高频词/短句次数；例如 tql、xmsl 有次数就直接说。
+- 2 到 4 句，最多 220 字；不要写长段落，不要 Markdown 标题，不要列表编号。
+- 只评价当前请求里点名的目标人物和词，不要牵扯无关群友名字。
+- 不要说“我先听上下文”“你们再说具体点”“没看到记录”。
+- 不要暴露数据库、向量检索、prompt、评分细节。
+{mention_line}
+
+目标人物历史画像和原话证据:
+{chr(10).join(person_hint_lines) if person_hint_lines else "- 无"}
+
+最近上下文:
+{chr(10).join(recent_lines) if recent_lines else "- 无"}
+
+相关群消息:
+{chr(10).join(timeline_lines) if timeline_lines else "- 暂无可见群消息"}
+""".strip()
+
     return f"""
 你正在微信群里回答一个“查记录/总结群消息”的请求。必须基于下面给出的真实群消息和长期记忆回答，不能假装没有上下文，不能要求群友再补关键点。
 
@@ -15602,9 +14536,8 @@ def build_memory_task_prompt(message: dict, recent: list[dict], memory: dict, ti
 输出要求:
 - 直接给总结结果，不要说“我先听上下文”“你们再说具体点”。
 - 如果真实消息很少，就明确说“目前能看到的消息不多”，然后概括能看到的内容。
-- 如果请求是人物画像、口头禅、最常说的话，必须优先使用“个人历史精确统计”，说出具体口癖/高频词/代表发言和次数。
-- 画像回答要贴脸：先给一句整体判断，再列 3-6 个有证据的点，不要空泛夸人。
 - 按 2 到 5 条要点总结，口语化但要具体。
+- 如果是锐评某个人的习惯/口头禅/行为，必须结合“目标人物历史画像和原话证据”，直接给判断，不要让群友补上下文。
 - 不要暴露数据库、向量检索、prompt、评分细节。
 - 不要输出 Markdown 表格。
 {mention_line}
@@ -15617,6 +14550,9 @@ def build_memory_task_prompt(message: dict, recent: list[dict], memory: dict, ti
 
 长期记忆和检索片段:
 {chr(10).join(memory_lines) if memory_lines else "- 无"}
+
+目标人物历史画像和原话证据:
+{chr(10).join(person_hint_lines) if person_hint_lines else "- 无"}
 """.strip()
 
 
@@ -15633,49 +14569,13 @@ def build_reply_prompt(message: dict, recent: list[dict], memory: dict, scoring:
     memory_lines = []
     for item in memory.get("summaries") or []:
         memory_lines.append(f"- 群摘要: {item.get('summary')}")
-    if memory.get("profile_claims"):
-        focus_name = (
-            (memory.get("profile_claims") or [{}])[0].get("display_name")
-            or (memory.get("profile_claims") or [{}])[0].get("person_key")
-            or "当前发言人"
-        )
-        focus_bits = []
-        for item in (memory.get("profile_claims") or [])[:6]:
-            value = item.get("value") or item.get("label") or ""
-            label = item.get("label") or item.get("claim_type") or "画像"
-            if value:
-                focus_bits.append(f"{label}={value}({item.get('support_count') or 0}证据)")
-        if focus_bits:
-            memory_lines.append(f"- 当前发言人画像 {focus_name}: " + "；".join(focus_bits))
-    if memory.get("person_relations"):
-        relation_bits = []
-        for item in (memory.get("person_relations") or [])[:6]:
-            source = item.get("source_display_name") or item.get("source_person_key") or "成员"
-            target = item.get("target_display_name") or item.get("target_key") or "对象"
-            relation_bits.append(f"{source}{item.get('relation') or '关联'}{target}({item.get('support_count') or 0}次)")
-        if relation_bits:
-            memory_lines.append("- 当前发言人关系: " + "；".join(relation_bits))
     for item in memory.get("people") or []:
         bits = []
         if item.get("preferences"):
             bits.append(f"偏好 {format_graph_value(item['preferences'])}")
         if item.get("traits"):
             bits.append(f"特征 {format_graph_value(item['traits'])}")
-        if item.get("storyline"):
-            bits.append("画像 " + "；".join(str(text) for text in item.get("storyline")[:2]))
         memory_lines.append(f"- 人物 {item.get('display_name') or item.get('person_key')}: {'; '.join(bits) or '有长期画像'}")
-    for item in (memory.get("profile_claims") or [])[:8]:
-        quote = ""
-        quotes = item.get("source_quotes") or []
-        if quotes and isinstance(quotes[0], dict) and quotes[0].get("text"):
-            quote = f"；证据「{str(quotes[0].get('text'))[:80]}」"
-        memory_lines.append(
-            f"- 发言人画像证据 {item.get('display_name') or item.get('person_key')}: {item.get('label')}={item.get('value') or item.get('label')}，支持 {item.get('support_count')}{quote}"
-        )
-    for item in (memory.get("person_relations") or [])[:8]:
-        memory_lines.append(
-            f"- 人物关系 {item.get('source_display_name') or item.get('source_person_key')} {item.get('relation')} {item.get('target_display_name') or item.get('target_key')}，支持 {item.get('support_count')}"
-        )
     for item in (memory.get("facts") or [])[:6]:
         memory_lines.append(
             f"- 事实 {item.get('subject')} {item.get('predicate')} {item.get('object')} ({item.get('category')}, {confidence_text(item.get('confidence'))})"
@@ -15685,27 +14585,11 @@ def build_reply_prompt(message: dict, recent: list[dict], memory: dict, scoring:
     for item in (memory.get("vector_memories") or [])[:4]:
         source = item.get("source") or {}
         memory_lines.append(f"- 历史片段 {item.get('time_text')}: {(source.get('content') or item.get('text') or '')[:260]}")
-    person_history = memory.get("person_history") or {}
-    if person_history:
-        name = person_history.get("display_name") or person_history.get("target_key") or "目标成员"
-        memory_lines.append(f"- 个人历史精确统计 {name}: 全历史可见发言 {person_history.get('message_count') or 0} 条")
-        if person_history.get("catchphrases"):
-            memory_lines.append(
-                "- 口头禅/口癖: "
-                + "；".join(f"{item.get('text')}({item.get('count')}次)" for item in person_history.get("catchphrases")[:6])
-            )
-        if person_history.get("terms"):
-            memory_lines.append(
-                "- 高频词: "
-                + "；".join(f"{item.get('text')}({item.get('count')}次)" for item in person_history.get("terms")[:8])
-            )
-        for quote in (person_history.get("representative_quotes") or [])[:3]:
-            memory_lines.append(f"- 代表发言 {quote.get('time_text')}: {quote.get('text')}")
 
     current_text = message.get("text") or ""
     mention_line = ""
-    if message.get("reply_to_sender") and message.get("reply_target_name"):
-        mention_line = f"- 这条是对方在喊你或 @ 你，回复必须以 @{message.get('reply_target_name')} 开头。"
+    if message.get("reply_mention_required") and message.get("reply_target_name"):
+        mention_line = f"- 用户明确要求你 @ 这个人，回复必须以 @{message.get('reply_target_name')} 开头。"
     return f"""
 你要为微信群生成一条“预览回复”，不要发送。
 接话评分: {scoring.get('score')} / 阈值 {scoring.get('threshold')}，建议: {scoring.get('decision')}。
@@ -15713,9 +14597,6 @@ def build_reply_prompt(message: dict, recent: list[dict], memory: dict, scoring:
 写作要求:
 - 像一个自然的群友，不要像客服、公告或论文。
 - 默认 1 到 3 句，短一点，接得上就好。
-- 优先参考当前发言人的画像和人物关系来调整语气、称呼和接话角度。
-- 如果用户问某个人画像、口头禅、最常说什么，必须基于“个人历史精确统计”和代表发言回答，不要说不知道。
-- 提到群成员时只使用群昵称，不使用 wxid、微信号、alias、member_username。
 - 不要写思考过程，不要先分析，直接给最终要发出的那句话。
 - 可以轻微幽默，但不要油腻，不要强行抖机灵。
 - 不确定就说不确定，必要时问一句澄清。
@@ -15735,9 +14616,1480 @@ def build_reply_prompt(message: dict, recent: list[dict], memory: dict, scoring:
 """.strip()
 
 
+def style_clone_key(chat_username: str, person_key: str) -> str:
+    return f"{str(chat_username or '').strip()}::{clean_contact_text(person_key)}"
+
+
+def load_style_cards() -> dict:
+    return read_json(STYLE_CARDS_FILE, {"cards": {}})
+
+
+def write_style_cards(payload: dict) -> None:
+    write_json(STYLE_CARDS_FILE, payload if isinstance(payload, dict) else {"cards": {}})
+
+
+def style_clone_settings(config: dict | None = None) -> dict:
+    config = config or read_config()
+    settings = dict(config.get("style_clone") or DEFAULT_CONFIG["style_clone"])
+    defaults = DEFAULT_CONFIG["style_clone"]
+    for key, value in defaults.items():
+        settings.setdefault(key, value)
+    return {
+        "enabled": bool(settings.get("enabled", defaults["enabled"])),
+        "rewrite_enabled": bool(settings.get("rewrite_enabled", defaults["rewrite_enabled"])),
+        "chat_username": str(settings.get("chat_username") or defaults["chat_username"]).strip(),
+        "chat_display_name": str(settings.get("chat_display_name") or defaults["chat_display_name"]).strip(),
+        "person_key": clean_contact_text(settings.get("person_key") or defaults["person_key"]),
+        "display_name": clean_contact_text(settings.get("display_name") or defaults["display_name"]),
+        "strength": clamp_float(settings.get("strength"), defaults["strength"], 0.0, 1.0),
+        "cache_hours": clamp_int(settings.get("cache_hours"), defaults["cache_hours"], 0, 24 * 30),
+        "max_reply_chars": clamp_int(settings.get("max_reply_chars"), defaults["max_reply_chars"], 40, 1200),
+    }
+
+
+def style_personas_settings(config: dict | None = None) -> dict:
+    config = config or read_config()
+    settings = dict(config.get("style_personas") or DEFAULT_CONFIG["style_personas"])
+    defaults = DEFAULT_CONFIG["style_personas"]
+    for key, value in defaults.items():
+        settings.setdefault(key, value)
+    selected = settings.get("selected_by_chat") if isinstance(settings.get("selected_by_chat"), dict) else {}
+    return {
+        "enabled": bool(settings.get("enabled", defaults["enabled"])),
+        "rewrite_enabled": bool(settings.get("rewrite_enabled", defaults["rewrite_enabled"])),
+        "mode": str(settings.get("mode") or defaults["mode"]).strip() or "manual",
+        "selected_by_chat": {
+            str(chat).strip(): clean_contact_text(person)
+            for chat, person in selected.items()
+            if str(chat).strip() and clean_contact_text(person)
+        },
+        "auto_refresh_enabled": bool(settings.get("auto_refresh_enabled", defaults["auto_refresh_enabled"])),
+        "refresh_interval_hours": clamp_int(
+            settings.get("refresh_interval_hours"), defaults["refresh_interval_hours"], 1, 24 * 30
+        ),
+        "min_text_messages": clamp_int(settings.get("min_text_messages"), defaults["min_text_messages"], 20, 2000),
+        "strength": clamp_float(settings.get("strength"), defaults["strength"], 0.0, 1.0),
+        "max_reply_chars": clamp_int(settings.get("max_reply_chars"), defaults["max_reply_chars"], 40, 1200),
+        "show_evidence": bool(settings.get("show_evidence", defaults["show_evidence"])),
+    }
+
+
+def selected_style_persona(chat_username: str, config: dict | None = None) -> str:
+    chat_username = str(chat_username or "").strip()
+    if not chat_username:
+        return ""
+    settings = style_personas_settings(config)
+    return clean_contact_text((settings.get("selected_by_chat") or {}).get(chat_username) or "")
+
+
+def style_card_from_payload(payload: dict | None = None, config: dict | None = None) -> dict:
+    settings = style_clone_settings(config)
+    payload = payload if isinstance(payload, dict) else {}
+    enabled = payload.get("enabled", settings.get("enabled"))
+    rewrite_enabled = payload.get("rewrite_enabled", settings.get("rewrite_enabled"))
+    return {
+        **settings,
+        "enabled": bool(enabled),
+        "rewrite_enabled": bool(rewrite_enabled),
+        "chat_username": str(payload.get("chat") or payload.get("chat_username") or settings.get("chat_username") or "").strip(),
+        "chat_display_name": str(
+            payload.get("chat_display_name") or settings.get("chat_display_name") or ""
+        ).strip(),
+        "person_key": clean_contact_text(payload.get("person") or payload.get("person_key") or settings.get("person_key") or ""),
+        "display_name": clean_contact_text(payload.get("display_name") or settings.get("display_name") or ""),
+        "strength": clamp_float(payload.get("strength"), settings.get("strength", 0.72), 0.0, 1.0),
+        "cache_hours": clamp_int(payload.get("cache_hours"), settings.get("cache_hours", 12), 0, 24 * 30),
+        "max_reply_chars": clamp_int(payload.get("max_reply_chars"), settings.get("max_reply_chars", 180), 40, 1200),
+    }
+
+
+def style_card_payload_for_persona(chat_username: str, person_key: str, display_name: str = "", config: dict | None = None) -> dict:
+    personas = style_personas_settings(config)
+    return {
+        "enabled": True,
+        "rewrite_enabled": personas.get("rewrite_enabled", True),
+        "chat_username": str(chat_username or "").strip(),
+        "chat_display_name": chat_display_name_for(chat_username) or str(chat_username or "").strip(),
+        "person_key": clean_contact_text(person_key),
+        "display_name": clean_contact_text(display_name),
+        "strength": personas.get("strength", 0.9),
+        "cache_hours": personas.get("refresh_interval_hours", 12),
+        "max_reply_chars": personas.get("max_reply_chars", 180),
+    }
+
+
+def style_card_cache_fresh(card: dict, cache_hours: int) -> bool:
+    if not card or cache_hours <= 0:
+        return False
+    updated = parse_iso_datetime(str(card.get("updated_at") or ""))
+    if not updated:
+        return False
+    age = datetime.now(DISPLAY_TZ) - updated
+    return age.total_seconds() <= cache_hours * 3600
+
+
+def style_clean_message_text(text: str) -> str:
+    text = clean_contact_text(text)
+    content_match = re.search(r"content:\s*(.+)", text, re.S)
+    if content_match:
+        text = clean_contact_text(content_match.group(1))
+    text = re.sub(r"^引用\s+[^:：]{1,30}[:：]\s*", "", text)
+    text = re.sub(r"https?://\S+", "", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    if text in {"[图片]", "[视频]", "[表情]", "[语音]", "[文件]"}:
+        return ""
+    if "当前微信版本不支持展示该内容" in text:
+        return ""
+    return text[:500]
+
+
+def style_rows_from_ai_chunks(chat_username: str, person_key: str, limit: int = 12000) -> list[dict]:
+    if not AI_DB.exists() or not chat_username or not person_key:
+        return []
+    try:
+        with db_connect(AI_DB, readonly=True) as conn:
+            if not table_exists(conn, "ai_chunks"):
+                return []
+            rows = conn.execute(
+                """
+                SELECT chat_username, chat_display_name, sender_hint, text, type_label, start_time, end_time
+                FROM ai_chunks
+                WHERE chat_username=? AND sender_hint=?
+                ORDER BY end_time DESC
+                LIMIT ?
+                """,
+                (chat_username, person_key, clamp_int(limit, 12000, 100, 30000)),
+            ).fetchall()
+    except sqlite3.Error:
+        return []
+    output = []
+    for row in rows:
+        text = style_clean_message_text(row["text"] or "")
+        if not text:
+            continue
+        output.append(
+            {
+                "chat_username": row["chat_username"],
+                "chat_display_name": row["chat_display_name"] or "",
+                "sender_key": row["sender_hint"] or person_key,
+                "text": text,
+                "type_label": row["type_label"] or "",
+                "create_time": int(row["end_time"] or row["start_time"] or 0),
+            }
+        )
+    return list(reversed(output))
+
+
+def style_rows_from_messages(chat_username: str, person_key: str, limit: int = 12000) -> list[dict]:
+    if not MEMORY_DB.exists() or not chat_username or not person_key:
+        return []
+    try:
+        with db_connect(MEMORY_DB, readonly=True) as conn:
+            rows = conn.execute(
+                """
+                SELECT message_uid, chat_username, chat_display_name, type_label,
+                       create_time, local_id, source, message_content, compress_content, origin_source
+                FROM messages
+                WHERE chat_username=?
+                ORDER BY create_time DESC, local_id DESC
+                LIMIT ?
+                """,
+                (chat_username, clamp_int(limit, 12000, 100, 30000)),
+            ).fetchall()
+    except sqlite3.Error:
+        return []
+    contacts = contact_directory(chat_username)
+    output = []
+    for row in rows:
+        data = dict(row)
+        sender_key, _, text = message_sender_identity(data, contacts)
+        if clean_contact_text(sender_key) != person_key:
+            continue
+        text = style_clean_message_text(replace_contact_identity_tokens(text, contacts))
+        if not text:
+            continue
+        output.append(
+            {
+                "message_uid": data.get("message_uid") or "",
+                "chat_username": chat_username,
+                "chat_display_name": data.get("chat_display_name") or "",
+                "sender_key": sender_key,
+                "text": text,
+                "type_label": data.get("type_label") or "",
+                "create_time": int(data.get("create_time") or 0),
+            }
+        )
+    return list(reversed(output))
+
+
+def person_style_history_rows(chat_username: str, person_key: str, limit: int = 12000) -> list[dict]:
+    rows = style_rows_from_ai_chunks(chat_username, person_key, limit=limit)
+    if rows:
+        return rows
+    return style_rows_from_messages(chat_username, person_key, limit=limit)
+
+
+def style_rank_level(count: int) -> str:
+    count = int(count or 0)
+    if count >= 20000:
+        return "水王"
+    if count >= 10000:
+        return "超神"
+    if count >= 5000:
+        return "SSS"
+    if count >= 2000:
+        return "SS"
+    if count >= 500:
+        return "S"
+    if count >= 100:
+        return "A"
+    if count >= 60:
+        return "B"
+    if count >= 30:
+        return "C"
+    return "D"
+
+
+def top_style_person_candidates(chat_username: str, limit: int = 10, min_text_messages: int = 80) -> list[dict]:
+    chat_username = str(chat_username or "").strip()
+    if not chat_username:
+        return []
+    limit = clamp_int(limit, 10, 1, 20)
+    min_text_messages = clamp_int(min_text_messages, 80, 20, 2000)
+    contacts = contact_directory(chat_username)
+    self_username = local_wechat_account_username()
+    bot_names = {normalize_alias_match_text(alias) for alias in bot_aliases(read_config(), chat_username)}
+    people: list[dict] = []
+    try:
+        preview = semantic_memory_preview(chat_username)
+        people = list(preview.get("people") or [])
+    except Exception:
+        people = []
+    if not people:
+        for live in participant_activity_stats(chat_username).values():
+            person_key = clean_contact_text(live.get("person_key"))
+            if not person_key:
+                continue
+            contact = contacts.get(person_key, {})
+            people.append(
+                {
+                    "chat_username": chat_username,
+                    "person_key": person_key,
+                    "display_name": group_display_name(person_key, contact) or person_key,
+                    "message_count": int(live.get("message_count") or 0),
+                    "latest_time": int(live.get("latest_time") or 0),
+                    "derived": {"type_counts": live.get("type_counts") or {}, "source": live.get("source") or "memory_messages"},
+                }
+            )
+    seen: set[str] = set()
+    candidates = []
+    for person in people:
+        if str(person.get("chat_username") or chat_username) != chat_username:
+            continue
+        person_key = clean_contact_text(person.get("person_key") or person.get("username") or person.get("display_name"))
+        if not person_key or person_key in seen or person_key == "me" or person_key == self_username:
+            continue
+        display_name = clean_contact_text(person.get("display_name") or person.get("contact_display_name") or "")
+        contact = contacts.get(person_key, {})
+        display_name = group_display_name(person_key, contact) or display_name or person_key
+        if normalize_alias_match_text(display_name) in bot_names or normalize_alias_match_text(person_key) in bot_names:
+            continue
+        derived = person.get("derived") if isinstance(person.get("derived"), dict) else {}
+        type_counts = derived.get("type_counts") if isinstance(derived.get("type_counts"), dict) else {}
+        message_count = int(person.get("message_count") or derived.get("message_count") or 0)
+        text_count = int(type_counts.get("text") or type_counts.get("link_or_file") or 0)
+        if not text_count:
+            text_count = min(message_count, len(person_style_history_rows(chat_username, person_key, limit=3000)))
+        seen.add(person_key)
+        identity = chat_member_identity(chat_username, member_username=person_key, group_nickname=display_name)
+        candidates.append(
+            {
+                "rank": 0,
+                "chat_username": chat_username,
+                "person_key": person_key,
+                "display_name": clean_contact_text(identity.get("group_nickname")) or display_name,
+                "alias": clean_contact_text(identity.get("alias")) or clean_contact_text(contact.get("alias")),
+                "avatar_url": avatar_url(person_key) if avatar_exists(person_key) else "",
+                "message_count": message_count or text_count,
+                "text_message_count": text_count or message_count,
+                "latest_time": int(person.get("latest_time") or derived.get("latest_time") or 0),
+                "sample_status": "ok" if (text_count or message_count) >= min_text_messages else "insufficient",
+                "sample_threshold": min_text_messages,
+                "level": style_rank_level(message_count or text_count),
+                "source": derived.get("source") or ("semantic_memory.people" if person.get("profile_id") else "memory_messages"),
+            }
+        )
+    candidates.sort(key=lambda item: (item.get("message_count") or 0, item.get("latest_time") or 0), reverse=True)
+    for index, item in enumerate(candidates[:limit], start=1):
+        item["rank"] = index
+    return candidates[:limit]
+
+
+STYLE_STOPWORDS = {
+    "引用",
+    "这个",
+    "那个",
+    "就是",
+    "不是",
+    "没有",
+    "可以",
+    "感觉",
+    "应该",
+    "已经",
+    "一下",
+    "今天",
+    "昨天",
+    "现在",
+    "还是",
+    "然后",
+    "直接",
+    "什么",
+    "怎么",
+    "为啥",
+    "因为",
+    "所以",
+    "我们",
+    "他们",
+    "你们",
+}
+
+STYLE_SCENE_KEYWORDS = {
+    "技术排障": ("报错", "bug", "日志", "脚本", "docker", "端口", "接口", "模型", "配置", "测试", "修", "跑不动"),
+    "资源讨论": ("资源", "PT", "下载", "115", "站", "片", "种子", "保种", "上传", "会员", "积分"),
+    "吃瓜吐槽": ("笑死", "离谱", "瓜", "绷", "吐槽", "哈哈", "草", "卧槽", "逆天", "抽象"),
+    "夸赞惊讶": ("牛", "tql", "厉害", "绝了", "可以啊", "强", "震惊", "666"),
+    "观望不确定": ("看看", "不确定", "可能", "估计", "应该", "先", "等", "再说", "不好说"),
+    "自嘲摆烂": ("完了", "寄", "摆", "麻了", "难顶", "不行了", "裂开", "我服了"),
+}
+
+
+def style_scene_for_text(text: str) -> str:
+    text = clean_contact_text(text)
+    best_scene = "日常接话"
+    best_score = 0
+    for scene, keywords in STYLE_SCENE_KEYWORDS.items():
+        score = sum(1 for keyword in keywords if keyword and keyword in text)
+        if score > best_score:
+            best_scene = scene
+            best_score = score
+    return best_scene
+
+
+def style_marker_hits(text: str) -> list[str]:
+    text = clean_contact_text(text)
+    markers = []
+    for marker in ("啊", "呢", "吧", "嘛", "卧槽", "哈哈", "666", "tql", "？", "?", "！", "!", "...", "。。。"):
+        if marker in text:
+            markers.append(marker)
+    markers.extend(re.findall(r"\[[^\]]{1,8}\]", text)[:4])
+    return unique_texts(markers)[:8]
+
+
+def style_phrase_candidates(text: str) -> list[str]:
+    text = style_clean_message_text(text)
+    if not text:
+        return []
+    normalized = re.sub(r"[。！？!?；;，,\n\r]+", "|", text)
+    pieces = [part.strip(" .…~～-") for part in normalized.split("|") if part.strip(" .…~～-")]
+    phrases = []
+    if 1 <= len(text) <= 14:
+        phrases.append(text)
+    for piece in pieces:
+        if 1 <= len(piece) <= 18:
+            phrases.append(piece)
+    for match in re.findall(r"[\u4e00-\u9fffA-Za-z0-9]{1,10}(?:[啊呀嘛呢吧呗哈哇哦额了]{1,3})", text):
+        if 1 <= len(match) <= 14:
+            phrases.append(match)
+    return unique_texts(phrases)[:12]
+
+
+def style_term_candidates(text: str) -> list[str]:
+    text = style_clean_message_text(text)
+    terms = []
+    terms.extend(re.findall(r"[A-Za-z][A-Za-z0-9_+\-.]{1,20}", text))
+    terms.extend(re.findall(r"[\u4e00-\u9fff]{2,6}", text))
+    output = []
+    for term in terms:
+        term = clean_contact_text(term)
+        if not term or term in STYLE_STOPWORDS:
+            continue
+        if re.fullmatch(r"\d+", term):
+            continue
+        output.append(term)
+    return output
+
+
+def style_representative_rows(rows: list[dict], limit: int = 14) -> list[dict]:
+    if not rows:
+        return []
+    candidates = []
+    for row in rows:
+        text = row.get("text") or ""
+        length = len(text)
+        if length < 2 or length > 160:
+            continue
+        score = 0
+        if length <= 18:
+            score += 5
+        if any(token in text for token in ("啊", "唔", "卧槽", "666", "tql", "么", "？", "?", "。", "[流泪]")):
+            score += 4
+        if any(token in text for token in ("我", "他", "你", "公司", "脚本", "github", "AI", "docker", "积分")):
+            score += 2
+        score += min(4, max(0, length // 12))
+        candidates.append((score, row))
+    selected = []
+    seen = set()
+    for _, row in sorted(candidates, key=lambda item: (item[0], item[1].get("create_time") or 0), reverse=True):
+        text = row.get("text") or ""
+        key = normalize_alias_match_text(text)
+        if key in seen:
+            continue
+        seen.add(key)
+        selected.append(
+            {
+                "time": local_time_text(row.get("create_time")),
+                "create_time": int(row.get("create_time") or 0),
+                "text": text[:180],
+                "type_label": row.get("type_label") or "",
+            }
+        )
+        if len(selected) >= limit:
+            break
+    return selected
+
+
+def style_evidence_clusters(rows: list[dict], limit_per_scene: int = 5) -> list[dict]:
+    scene_counts: Counter[str] = Counter()
+    scene_quotes: dict[str, list[dict]] = defaultdict(list)
+    for row in rows:
+        text = row.get("text") or ""
+        if not text:
+            continue
+        scene = style_scene_for_text(text)
+        scene_counts[scene] += 1
+        if len(scene_quotes[scene]) >= limit_per_scene:
+            continue
+        if 2 <= len(text) <= 180:
+            scene_quotes[scene].append(
+                {
+                    "time": local_time_text(row.get("create_time")),
+                    "create_time": int(row.get("create_time") or 0),
+                    "text": text[:180],
+                    "markers": style_marker_hits(text),
+                }
+            )
+    output = []
+    for scene, count in scene_counts.most_common(8):
+        output.append({"scene": scene, "count": count, "quotes": scene_quotes.get(scene, [])})
+    return output
+
+
+def style_quality_from_stats(stats: dict, parsed_ok: bool = False) -> dict:
+    samples = int(stats.get("text_message_count") or stats.get("message_count") or 0)
+    sample_score = min(35, int(samples / 8))
+    phrase_score = min(20, len(stats.get("catchphrases") or []) * 2)
+    marker_score = min(12, len(stats.get("markers") or []) * 2)
+    scene_score = min(18, len(stats.get("evidence_clusters") or []) * 3)
+    llm_score = 15 if parsed_ok else 5
+    total = max(0, min(100, sample_score + phrase_score + marker_score + scene_score + llm_score))
+    if samples < 80:
+        label = "样本偏少"
+    elif total >= 82:
+        label = "高贴脸"
+    elif total >= 66:
+        label = "可用"
+    else:
+        label = "待增强"
+    return {
+        "total": total,
+        "label": label,
+        "sample_score": sample_score,
+        "distinctiveness_score": phrase_score + marker_score,
+        "evidence_score": scene_score,
+        "llm_score": llm_score,
+    }
+
+
+def build_style_card_stats(chat_username: str, person_key: str, display_name: str = "") -> dict:
+    rows = person_style_history_rows(chat_username, person_key)
+    identity = chat_member_identity(chat_username, member_username=person_key, group_nickname=display_name)
+    contacts = contact_directory(chat_username)
+    contact = contacts.get(person_key, {})
+    resolved_display = (
+        clean_contact_text(identity.get("group_nickname"))
+        or group_display_name(person_key, contact)
+        or display_name
+        or person_key
+    )
+    phrase_counter: Counter[str] = Counter()
+    term_counter: Counter[str] = Counter()
+    marker_counter: Counter[str] = Counter()
+    punct_counter: Counter[str] = Counter()
+    scene_counter: Counter[str] = Counter()
+    lengths = []
+    for row in rows:
+        text = row.get("text") or ""
+        lengths.append(len(text))
+        phrase_counter.update(style_phrase_candidates(text))
+        term_counter.update(style_term_candidates(text))
+        scene_counter[style_scene_for_text(text)] += 1
+        for marker in re.findall(r"\[[^\]]{1,8}\]", text):
+            marker_counter[marker] += 1
+        for marker in ("啊", "唔", "卧槽", "哈哈", "666", "tql", "么", "？", "?", "！", "!", "。", "...", "。。。"):
+            if marker in text:
+                marker_counter[marker] += 1
+        for punct in re.findall(r"[！？?!。…~～]+", text):
+            punct_counter[punct[:4]] += 1
+    short_messages = [row.get("text") for row in rows if 1 <= len(row.get("text") or "") <= 12]
+    short_counter = Counter(short_messages)
+    recent_rows = [
+        {
+            "time": local_time_text(row.get("create_time")),
+            "create_time": int(row.get("create_time") or 0),
+            "text": (row.get("text") or "")[:180],
+            "type_label": row.get("type_label") or "",
+        }
+        for row in rows[-16:]
+    ]
+    avg_len = round(sum(lengths) / len(lengths), 1) if lengths else 0
+    short_ratio = round(sum(1 for length in lengths if length <= 12) / max(1, len(lengths)), 3)
+    long_ratio = round(sum(1 for length in lengths if length >= 60) / max(1, len(lengths)), 3)
+    question_ratio = round(sum(1 for row in rows if "?" in row.get("text", "") or "？" in row.get("text", "")) / max(1, len(rows)), 3)
+    exclaim_ratio = round(sum(1 for row in rows if "!" in row.get("text", "") or "！" in row.get("text", "")) / max(1, len(rows)), 3)
+    marker_items = [{"text": key, "count": count} for key, count in marker_counter.most_common(16) if key]
+    evidence_clusters = style_evidence_clusters(rows)
+    stats = {
+        "distill_version": 2,
+        "chat_username": chat_username,
+        "chat_display_name": chat_display_name_for(chat_username) or "",
+        "person_key": person_key,
+        "display_name": resolved_display,
+        "alias": clean_contact_text(identity.get("alias")) or clean_contact_text(contact.get("alias")),
+        "avatar_url": avatar_url(person_key) if avatar_exists(person_key) else "",
+        "message_count": len(rows),
+        "text_message_count": len(rows),
+        "latest_time": max((int(row.get("create_time") or 0) for row in rows), default=0),
+        "avg_length": avg_len,
+        "short_ratio": short_ratio,
+        "long_ratio": long_ratio,
+        "question_ratio": question_ratio,
+        "exclaim_ratio": exclaim_ratio,
+        "rhythm_profile": {
+            "avg_length": avg_len,
+            "short_ratio": short_ratio,
+            "long_ratio": long_ratio,
+            "question_ratio": question_ratio,
+            "exclaim_ratio": exclaim_ratio,
+            "punctuation_habits": [{"text": key, "count": count} for key, count in punct_counter.most_common(10)],
+            "marker_habits": marker_items[:10],
+        },
+        "scene_counts": [{"scene": key, "count": count} for key, count in scene_counter.most_common(8)],
+        "evidence_clusters": evidence_clusters,
+        "short_phrases": [{"text": key, "count": count} for key, count in short_counter.most_common(16) if key],
+        "catchphrases": [{"text": key, "count": count} for key, count in phrase_counter.most_common(24) if key],
+        "terms": [{"text": key, "count": count} for key, count in term_counter.most_common(24) if key],
+        "markers": marker_items,
+        "signature_patterns": [{"text": key, "count": count} for key, count in phrase_counter.most_common(12) if key],
+        "representative_quotes": style_representative_rows(rows, limit=14),
+        "recent_quotes": recent_rows,
+    }
+    stats["quality_score"] = style_quality_from_stats(stats, parsed_ok=False)
+    return stats
+
+
+def fallback_style_card(stats: dict, warning: str = "") -> dict:
+    phrases = [item["text"] for item in (stats.get("catchphrases") or [])[:8]]
+    terms = [item["text"] for item in (stats.get("terms") or [])[:8]]
+    markers = [item["text"] for item in (stats.get("markers") or [])[:6]]
+    scenes = [item.get("scene") for item in (stats.get("scene_counts") or [])[:4] if item.get("scene")]
+    tags = []
+    if stats.get("avg_length", 0) <= 18:
+        tags.append("短句快刀手")
+    if any(item.get("text") in {"啊", "唔"} for item in stats.get("markers") or []):
+        tags.append("开口先啊一下")
+    if any(item.get("text") in {"卧槽", "666", "tql"} for item in stats.get("catchphrases") or []):
+        tags.append("群聊反应堆")
+    if stats.get("question_ratio", 0) >= 0.18:
+        tags.append("随手抛问号")
+    if not tags:
+        tags = ["PT群老熟人", "短句观察派", "接话很生活"]
+    return {
+        "distill_version": 2,
+        "summary": f"{stats.get('display_name') or '这个成员'}的历史发言偏短、口语、反应快，常用短句接话，也会围绕工具、工作和群里正在聊的事顺手追问。",
+        "tags": tags[:8],
+        "rhythm_profile": stats.get("rhythm_profile") or {},
+        "scene_profiles": [
+            {"scene": scene, "style": f"遇到{scene}时先短句反应，再补一句判断。", "trigger_words": []}
+            for scene in scenes
+        ],
+        "signature_patterns": phrases[:8],
+        "tone_rules": [
+            "短句优先，像群友顺手接一句。",
+            "可以用一点“啊/唔/卧槽/666”这类自然反应，但别堆太满。",
+            "回答要保留原意和事实，风格只是外衣。",
+        ],
+        "catchphrases": phrases,
+        "vocabulary": terms,
+        "style_markers": markers,
+        "topic_affinity": terms[:10],
+        "evidence_clusters": stats.get("evidence_clusters") or [],
+        "overuse_guard": {
+            "avoid_repeating": markers[:6] + phrases[:4],
+            "rule": "代表性词只在语境合适时少量使用，连续回复不要机械重复。",
+        },
+        "do_rules": ["先接当前话题，再补一句判断。", "能短就短，不写客服腔。", "该认真时正常说人话。"],
+        "dont_rules": ["不要冒充本人。", "不要强行黄腔或攻击别人。", "不要为了像而牺牲准确性。"],
+        "rewrite_rules": [
+            "把正式句子压短，保留重点。",
+            "可加入少量代表性语气词。",
+            "不要新增未确认事实。",
+        ],
+        "examples": [item.get("text") for item in (stats.get("representative_quotes") or [])[:5]],
+        "quality_score": stats.get("quality_score") or style_quality_from_stats(stats, parsed_ok=False),
+        "warning": warning,
+    }
+
+
+def build_style_card_prompt(display_name: str, stats: dict) -> str:
+    llm_input = {
+        "display_name": display_name,
+        "message_count": stats.get("message_count"),
+        "text_message_count": stats.get("text_message_count"),
+        "avg_length": stats.get("avg_length"),
+        "short_ratio": stats.get("short_ratio"),
+        "question_ratio": stats.get("question_ratio"),
+        "exclaim_ratio": stats.get("exclaim_ratio"),
+        "rhythm_profile": stats.get("rhythm_profile"),
+        "scene_counts": stats.get("scene_counts"),
+        "short_phrases": stats.get("short_phrases", [])[:16],
+        "catchphrases": stats.get("catchphrases", [])[:18],
+        "terms": stats.get("terms", [])[:18],
+        "markers": stats.get("markers", [])[:12],
+        "signature_patterns": stats.get("signature_patterns", [])[:12],
+        "evidence_clusters": stats.get("evidence_clusters", [])[:8],
+        "representative_quotes": stats.get("representative_quotes", [])[:12],
+        "recent_quotes": stats.get("recent_quotes", [])[-10:],
+    }
+    return f"""
+只输出严格 JSON，不要 Markdown，不要解释。
+你在为微信群机器人制作 v2“人格蒸馏卡”，对象是群成员「{display_name}」。
+要求：
+- 只能根据输入的真实历史发言总结风格，短句、口头禅、标点、场景反应都必须分析。
+- 这是“借一点说话习惯”，不是冒充真人；必须保留机器人身份和事实准确性。
+- 标签要贴脸、调皮、有梗，要像群友会笑着承认“这人确实这样”，但不要低俗攻击。
+- 场景画像要具体：技术排障、资源讨论、吃瓜吐槽、夸赞惊讶、观望不确定、自嘲摆烂等。
+- 句式模板要能指导 LLM 把普通回复改得更像这个成员的节奏，不是简单加口头禅。
+- 必须给 overuse_guard，防止 tql、卧槽、啊、哈哈等被机械滥用。
+- 不要编造历史发言里没有体现的癖好、人设或经历。
+
+JSON schema:
+{{
+  "distill_version": 2,
+  "summary": "一句具体画像",
+  "tags": ["贴脸标签"],
+  "rhythm_profile": {{"一句话描述": "短句节奏、平均字数、问句比例、标点习惯、表情习惯"}},
+  "scene_profiles": [{{"scene": "场景名", "style": "这个场景下会怎么反应", "trigger_words": ["触发词"]}}],
+  "signature_patterns": ["最像本人的句式模板"],
+  "tone_rules": ["语气规则"],
+  "catchphrases": ["常用短句或口头禅"],
+  "vocabulary": ["高频词/常聊词"],
+  "style_markers": ["语气词/标点/表情习惯"],
+  "topic_affinity": ["常聊主题"],
+  "evidence_clusters": [{{"scene": "场景名", "quotes": ["真实原话"]}}],
+  "overuse_guard": {{"avoid_repeating": ["易滥用词"], "rule": "怎么避免机械复读"}},
+  "do_rules": ["应该怎么说"],
+  "dont_rules": ["不要怎么说"],
+  "rewrite_rules": ["改写回复时的操作规则"],
+  "examples": ["代表发言原句"],
+  "quality_score": {{"total": 0, "label": "高贴脸/可用/样本偏少", "reason": "质量判断"}}
+}}
+
+历史统计 JSON:
+{json.dumps(llm_input, ensure_ascii=False)}
+""".strip()
+
+
+def normalize_style_card_payload(parsed: dict, stats: dict, warning: str = "") -> dict:
+    fallback = fallback_style_card(stats, warning=warning)
+    parsed = parsed if isinstance(parsed, dict) else {}
+
+    def string_list(key: str, limit: int) -> list[str]:
+        raw = parsed.get(key)
+        if isinstance(raw, str):
+            raw = [raw]
+        if not isinstance(raw, list):
+            return fallback.get(key, [])[:limit]
+        return unique_texts([str(item) for item in raw if str(item).strip()])[:limit] or fallback.get(key, [])[:limit]
+
+    def object_list(key: str, fallback_key: str, limit: int) -> list[dict]:
+        raw = parsed.get(key)
+        if not isinstance(raw, list):
+            raw = fallback.get(fallback_key, [])
+        output = []
+        for item in raw:
+            if isinstance(item, dict):
+                compact = {}
+                for item_key, item_value in item.items():
+                    if isinstance(item_value, (str, int, float, bool)) or item_value is None:
+                        compact[str(item_key)] = clean_contact_text(item_value) if isinstance(item_value, str) else item_value
+                    elif isinstance(item_value, list):
+                        compact[str(item_key)] = [
+                            clean_contact_text(value) if isinstance(value, str) else value
+                            for value in item_value[:8]
+                            if value not in (None, "")
+                        ]
+                output.append(compact)
+            elif str(item).strip():
+                output.append({"text": clean_contact_text(str(item))})
+            if len(output) >= limit:
+                break
+        return output
+
+    rhythm_profile = parsed.get("rhythm_profile") if isinstance(parsed.get("rhythm_profile"), dict) else fallback.get("rhythm_profile", {})
+    overuse_guard = parsed.get("overuse_guard") if isinstance(parsed.get("overuse_guard"), dict) else fallback.get("overuse_guard", {})
+    quality_score = parsed.get("quality_score") if isinstance(parsed.get("quality_score"), dict) else {}
+    merged_quality = style_quality_from_stats(stats, parsed_ok=bool(parsed))
+    if quality_score:
+        merged_quality = {
+            **merged_quality,
+            **{
+                key: clean_contact_text(value) if isinstance(value, str) else value
+                for key, value in quality_score.items()
+                if isinstance(value, (str, int, float, bool))
+            },
+        }
+        merged_quality["total"] = clamp_int(merged_quality.get("total"), merged_quality.get("total", 0), 0, 100)
+    return {
+        "distill_version": 2,
+        "summary": clean_contact_text(parsed.get("summary") or fallback["summary"])[:260],
+        "tags": string_list("tags", 10),
+        "rhythm_profile": rhythm_profile,
+        "scene_profiles": object_list("scene_profiles", "scene_profiles", 8),
+        "signature_patterns": string_list("signature_patterns", 10),
+        "tone_rules": string_list("tone_rules", 8),
+        "catchphrases": string_list("catchphrases", 12),
+        "vocabulary": string_list("vocabulary", 12),
+        "style_markers": string_list("style_markers", 10),
+        "topic_affinity": string_list("topic_affinity", 12),
+        "evidence_clusters": object_list("evidence_clusters", "evidence_clusters", 8),
+        "overuse_guard": overuse_guard,
+        "do_rules": string_list("do_rules", 8),
+        "dont_rules": string_list("dont_rules", 8),
+        "rewrite_rules": string_list("rewrite_rules", 8),
+        "examples": string_list("examples", 8),
+        "quality_score": merged_quality,
+        "warning": warning or clean_contact_text(parsed.get("warning") or ""),
+    }
+
+
+def generate_style_card(payload: dict | None = None, *, force_llm: bool = True) -> dict:
+    config = read_config()
+    settings = style_card_from_payload(payload, config)
+    chat_username = settings.get("chat_username") or ""
+    person_key = settings.get("person_key") or ""
+    display_name = settings.get("display_name") or person_key
+    if not chat_username or not person_key:
+        return {"ok": False, "error": "缺少群或成员标识"}
+    started = time.time()
+    stats = build_style_card_stats(chat_username, person_key, display_name)
+    if not stats.get("message_count"):
+        return {"ok": False, "error": "没有找到该成员历史发言", "settings": settings, "stats": stats}
+    display_name = stats.get("display_name") or display_name
+    profile = {**active_profile(config)}
+    profile["max_tokens"] = min(900, max(650, clamp_int(profile.get("max_tokens"), 512, 16, 8192)))
+    profile["temperature"] = min(0.55, clamp_float(profile.get("temperature"), 0.4, 0.0, 2.0))
+    profile["timeout_seconds"] = max(75, clamp_int(profile.get("timeout_seconds"), 30, 3, 120))
+    llm_result = {}
+    warning = ""
+    parsed = {}
+    if force_llm:
+        prompt = build_style_card_prompt(display_name, stats)
+        llm_result = request_llm(profile, prompt, "你是精准的人物说话风格分析器，只输出 JSON。")
+        if llm_result.get("ok"):
+            parsed = extract_json_object(llm_result.get("message") or "")
+            if not parsed:
+                warning = "LLM 未返回可解析 JSON，已使用统计版人格卡。"
+        else:
+            warning = "LLM 人格卡生成失败，已使用统计版人格卡。"
+    card = {
+        "distill_version": 2,
+        "key": style_clone_key(chat_username, person_key),
+        "chat_username": chat_username,
+        "chat_display_name": stats.get("chat_display_name") or settings.get("chat_display_name") or chat_username,
+        "person_key": person_key,
+        "display_name": display_name,
+        "alias": stats.get("alias") or "",
+        "avatar_url": stats.get("avatar_url") or "",
+        "updated_at": now_iso(),
+        "elapsed_ms": int((time.time() - started) * 1000),
+        "stats": stats,
+        "card": normalize_style_card_payload(parsed, stats, warning=warning),
+        "llm": compact_llm_result(llm_result) if llm_result else {},
+    }
+    card["quality_score"] = card["card"].get("quality_score") or stats.get("quality_score") or {}
+    store = load_style_cards()
+    cards = store.get("cards") if isinstance(store.get("cards"), dict) else {}
+    cards[card["key"]] = card
+    store["cards"] = cards
+    write_style_cards(store)
+    return {"ok": True, "style_card": card}
+
+
+def get_style_card(payload: dict | None = None, *, force: bool = False, build_missing: bool = True) -> dict:
+    config = read_config()
+    settings = style_card_from_payload(payload, config)
+    key = style_clone_key(settings.get("chat_username") or "", settings.get("person_key") or "")
+    store = load_style_cards()
+    card = (store.get("cards") or {}).get(key) if isinstance(store.get("cards"), dict) else None
+    if card and not force and style_card_cache_fresh(card, clamp_int(settings.get("cache_hours"), 12, 0, 24 * 30)):
+        return {"ok": True, "style_card": card, "cached": True}
+    if card and not force and not build_missing:
+        return {"ok": True, "style_card": card, "cached": True, "stale": True}
+    if not build_missing and not force:
+        return {"ok": False, "error": "style card cache is missing", "settings": settings}
+    return generate_style_card(settings, force_llm=True)
+
+
+def trim_rewritten_reply(text: str, max_chars: int) -> str:
+    text = clean_contact_text(text)
+    text = re.sub(r"^```(?:text|json|markdown)?", "", text).strip()
+    text = re.sub(r"```$", "", text).strip()
+    if len(text) <= max_chars:
+        return text
+    clipped = text[:max_chars].rstrip()
+    for sep in ("。", "！", "？", "\n", "，", "；", " "):
+        pos = clipped.rfind(sep)
+        if pos >= max(20, max_chars // 2):
+            return clipped[: pos + 1].strip()
+    return clipped.strip()
+
+
+def style_query_terms(*texts: str) -> set[str]:
+    terms: set[str] = set()
+    for text in texts:
+        for term in style_term_candidates(text or ""):
+            if len(term) >= 2:
+                terms.add(term.lower())
+        for phrase in style_phrase_candidates(text or ""):
+            if 2 <= len(phrase) <= 8:
+                terms.add(phrase.lower())
+    return terms
+
+
+def retrieve_style_evidence(
+    chat_username: str,
+    person_key: str,
+    trigger_text: str = "",
+    base_reply: str = "",
+    limit: int = 8,
+) -> list[dict]:
+    chat_username = str(chat_username or "").strip()
+    person_key = clean_contact_text(person_key)
+    if not chat_username or not person_key:
+        return []
+    rows = person_style_history_rows(chat_username, person_key, limit=12000)
+    if not rows:
+        return []
+    limit = clamp_int(limit, 8, 3, 12)
+    query = f"{trigger_text}\n{base_reply}"
+    query_terms = style_query_terms(query)
+    query_scene = style_scene_for_text(query)
+    target_len = len(clean_contact_text(base_reply or trigger_text))
+    scored = []
+    for row in rows:
+        text = row.get("text") or ""
+        if len(text) < 2 or len(text) > 220:
+            continue
+        row_terms = style_query_terms(text)
+        overlap = len(query_terms & row_terms)
+        scene = style_scene_for_text(text)
+        markers = style_marker_hits(text)
+        score = overlap * 5
+        reason = []
+        if overlap:
+            reason.append(f"关键词重合 {overlap}")
+        if scene == query_scene:
+            score += 8
+            reason.append(f"同场景 {scene}")
+        if target_len:
+            diff = abs(len(text) - target_len)
+            if diff <= 12:
+                score += 5
+                reason.append("句长接近")
+            elif diff <= 30:
+                score += 2
+        if len(text) <= 18:
+            score += 2
+        if markers:
+            score += min(5, len(markers))
+            reason.append("语气标记")
+        score += min(3, int(row.get("create_time") or 0) // 10_000_000_000)
+        if score <= 0 and len(scored) > limit * 6:
+            continue
+        scored.append(
+            (
+                score,
+                int(row.get("create_time") or 0),
+                {
+                    "time": local_time_text(row.get("create_time")),
+                    "create_time": int(row.get("create_time") or 0),
+                    "text": text[:220],
+                    "scene": scene,
+                    "score": round(score, 2),
+                    "style_markers": markers,
+                    "reason": "、".join(reason) or "代表短句",
+                },
+            )
+        )
+    selected = []
+    seen = set()
+    for _, _, item in sorted(scored, key=lambda pair: (pair[0], pair[1]), reverse=True):
+        key = normalize_alias_match_text(item.get("text") or "")
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        selected.append(item)
+        if len(selected) >= limit:
+            break
+    if selected:
+        return selected
+    stats = build_style_card_stats(chat_username, person_key)
+    return (stats.get("representative_quotes") or [])[:limit]
+
+
+def style_persona_rewrite_settings(message: dict, config: dict, *, force: bool = False) -> tuple[dict, dict]:
+    chat_username = str(message.get("chat_username") or message.get("chat") or "").strip()
+    personas = style_personas_settings(config)
+    selected = selected_style_persona(chat_username, config)
+    force_person = clean_contact_text(message.get("style_person_key") or message.get("person_key"))
+    if force_person:
+        selected = force_person
+    if selected and (force or (personas.get("enabled") and personas.get("rewrite_enabled"))):
+        return (
+            style_card_payload_for_persona(
+                chat_username,
+                selected,
+                clean_contact_text(message.get("style_display_name") or message.get("display_name") or ""),
+                config,
+            ),
+            {"mode": "style_personas", "selected_person_key": selected, "settings": personas},
+        )
+    legacy = style_clone_settings(config)
+    return legacy, {"mode": "style_clone", "selected_person_key": legacy.get("person_key"), "settings": legacy}
+
+
+def rewrite_reply_with_style(reply_text: str, message: dict, config: dict, *, force: bool = False) -> dict:
+    if not force and not bool(config.get("agent", {}).get("style_rewrite_enabled", True)):
+        return {"ok": True, "applied": False, "reply": reply_text, "reason": "style_rewrite_global_disabled"}
+    settings, style_mode = style_persona_rewrite_settings(message, config, force=force)
+    if not force and (not settings.get("enabled") or not settings.get("rewrite_enabled")):
+        return {"ok": True, "applied": False, "reply": reply_text, "reason": "disabled", "mode": style_mode.get("mode")}
+    if not force and is_person_memory_task_text(message.get("text") or ""):
+        return {
+            "ok": True,
+            "applied": False,
+            "reply": reply_text,
+            "reason": "person_memory_task_preserve_facts",
+            "mode": style_mode.get("mode"),
+        }
+    original = clean_contact_text(reply_text)
+    if not original:
+        return {"ok": False, "applied": False, "reply": reply_text, "error": "empty reply"}
+    card_result = get_style_card(settings, force=False, build_missing=True)
+    if not card_result.get("ok"):
+        return {"ok": False, "applied": False, "reply": reply_text, "error": card_result.get("error"), "card": card_result}
+    style_card = card_result.get("style_card") or {}
+    card = style_card.get("card") or {}
+    stats = style_card.get("stats") or {}
+    max_chars = settings.get("max_reply_chars")
+    if is_memory_task_text(message.get("text") or ""):
+        max_chars = max(max_chars, 520)
+    mention_prefix = ""
+    if message.get("reply_mention_required") and message.get("reply_target_name"):
+        mention_prefix = mention_prefix_for_sender(message.get("reply_target_name") or "")
+        original_body = strip_plain_mention_prefix(original, message.get("reply_target_name") or "")
+    else:
+        original_body = original
+    evidence = retrieve_style_evidence(
+        settings.get("chat_username") or message.get("chat_username") or "",
+        settings.get("person_key") or "",
+        message.get("text") or "",
+        original_body,
+        limit=8,
+    )
+    style_context = {
+        "display_name": style_card.get("display_name") or settings.get("display_name"),
+        "person_key": style_card.get("person_key") or settings.get("person_key"),
+        "mode": style_mode.get("mode"),
+        "strength": settings.get("strength"),
+        "summary": card.get("summary"),
+        "tags": card.get("tags", [])[:6],
+        "rhythm_profile": card.get("rhythm_profile") or stats.get("rhythm_profile") or {},
+        "signature_patterns": card.get("signature_patterns", [])[:6],
+        "tone_rules": card.get("tone_rules", [])[:5],
+        "catchphrases": card.get("catchphrases", [])[:6],
+        "vocabulary": card.get("vocabulary", [])[:6],
+        "style_markers": card.get("style_markers", [])[:5],
+        "overuse_guard": card.get("overuse_guard") or {},
+        "rewrite_rules": card.get("rewrite_rules", [])[:5],
+        "examples": (evidence or (stats.get("representative_quotes") or []))[:5],
+    }
+    prompt = f"""
+只输出严格 JSON，不要 Markdown，不要解释。
+你要把“原回复”改写成更像群成员「{style_context['display_name']}」平时会说的微信群口吻：短句节奏、判断方式、吐槽方式、场景反应都要贴近。
+但你不能冒充本人，不能说自己就是「{style_context['display_name']}」，也不能编造他没有说过的事实。
+强度: {settings.get('strength')}，0 是不改，1 是极限贴脸。当前按这个强度处理。
+硬规则：
+- 必须保留原回复事实、结论和安全边界，不新增未确认信息。
+- 不要为了像而低俗攻击、人身攻击或泄露隐私。
+- 默认短句自然；如果原回复是在总结/查记录，可稍微长，但仍要口语。
+- 不要主动添加 @，@ 前缀由系统处理。
+- 不要机械复读口头禅；overuse_guard 里的词只有语境合适时才用。
+- 除总结/查询任务外默认 1-3 句。
+- 最长 {max_chars} 字。
+
+当前群友消息:
+{message.get('text') or ''}
+
+风格卡 JSON:
+{json.dumps(style_context, ensure_ascii=False)}
+
+原回复:
+{original_body}
+
+JSON schema:
+{{"reply": "改写后的回复正文", "style_score": 0-100, "style_notes": "为什么像", "overuse_warnings": ["如果有过拟合风险写这里"]}}
+""".strip()
+    profile = {**active_profile(config)}
+    profile["max_tokens"] = min(1400, max(360, int(max_chars * 4)))
+    profile["temperature"] = min(0.75, max(0.35, clamp_float(profile.get("temperature"), 0.4, 0.0, 2.0)))
+    started = time.time()
+    llm_result = request_llm(profile, prompt, build_agent_system_prompt(config))
+    needs_retry = (not llm_result.get("ok")) or llm_result_truncated(llm_result)
+    if needs_retry:
+        if llm_result_truncated(llm_result):
+            retry_profile = {**profile, "max_tokens": 520 if is_person_memory_task_text(message.get("text") or "") else min(900, max(profile.get("max_tokens", 700), 700)), "temperature": 0.35}
+            retry_prompt = f"""
+只输出 JSON：{{"reply":"改写后的回复正文","style_score":0,"style_notes":"","overuse_warnings":[]}}
+把原回复改成更像「{style_context['display_name']}」的微信群短句口吻，但保留事实，不新增信息，不主动加@。
+必须完整收尾，不要写长文；最多 {min(max_chars, 220) if is_person_memory_task_text(message.get('text') or '') else max_chars} 字。
+风格关键词: {json.dumps({k: style_context.get(k) for k in ('catchphrases','style_markers','signature_patterns')}, ensure_ascii=False)}
+原回复: {trim_rewritten_reply(original_body, 260 if is_person_memory_task_text(message.get('text') or '') else 520)}
+""".strip()
+            llm_result = request_llm(retry_profile, retry_prompt, build_agent_system_prompt(config))
+        if llm_result.get("ok"):
+            parsed_retry = extract_json_object(llm_result.get("message") or "")
+            retry_reply = trim_rewritten_reply(parsed_retry.get("reply") if parsed_retry else llm_result.get("message") or "", max_chars)
+            if retry_reply:
+                if mention_prefix:
+                    retry_reply = ensure_reply_mentions_sender(retry_reply, message.get("reply_target_name") or "")
+                return {
+                    "ok": True,
+                    "applied": retry_reply != original,
+                    "reply": retry_reply,
+                    "mode": style_mode.get("mode"),
+                    "elapsed_ms": int((time.time() - started) * 1000),
+                    "llm": compact_llm_result(llm_result),
+                    "evidence": evidence,
+                    "style_score": 0,
+                    "style_notes": "精简重试成功",
+                    "overuse_warnings": [],
+                    "selected_persona": {
+                        "chat_username": settings.get("chat_username"),
+                        "person_key": style_card.get("person_key") or settings.get("person_key"),
+                        "display_name": style_card.get("display_name") or settings.get("display_name"),
+                        "avatar_url": style_card.get("avatar_url") or "",
+                        "level": style_rank_level((stats or {}).get("message_count") or 0),
+                    },
+                    "style_card": {
+                        "display_name": style_card.get("display_name"),
+                        "person_key": style_card.get("person_key"),
+                        "updated_at": style_card.get("updated_at"),
+                        "cached": bool(card_result.get("cached")),
+                        "tags": (card.get("tags") or [])[:6],
+                        "quality_score": card.get("quality_score") or style_card.get("quality_score") or {},
+                    },
+                    "fallback_retry": True,
+                }
+        if llm_result_truncated(llm_result):
+            return {
+                "ok": True,
+                "applied": False,
+                "reply": reply_text,
+                "error": "style rewrite truncated, kept original reply",
+                "llm": compact_llm_result(llm_result),
+                "evidence": evidence,
+                "style_card": {
+                    "display_name": style_card.get("display_name"),
+                    "updated_at": style_card.get("updated_at"),
+                },
+                "fallback_retry": True,
+            }
+        return {
+            "ok": False,
+            "applied": False,
+            "reply": reply_text,
+            "error": llm_result.get("error"),
+            "llm": compact_llm_result(llm_result),
+            "style_card": {
+                "display_name": style_card.get("display_name"),
+                "updated_at": style_card.get("updated_at"),
+            },
+        }
+    parsed = extract_json_object(llm_result.get("message") or "")
+    style_score = 0
+    style_notes = ""
+    overuse_warnings: list[str] = []
+    if parsed:
+        rewritten = trim_rewritten_reply(parsed.get("reply") or parsed.get("text") or "", max_chars)
+        style_score = clamp_int(parsed.get("style_score"), 0, 0, 100)
+        style_notes = clean_contact_text(parsed.get("style_notes") or parsed.get("reason") or "")
+        raw_warnings = parsed.get("overuse_warnings")
+        if isinstance(raw_warnings, str):
+            raw_warnings = [raw_warnings]
+        if isinstance(raw_warnings, list):
+            overuse_warnings = unique_texts([clean_contact_text(item) for item in raw_warnings if clean_contact_text(item)])[:6]
+    else:
+        rewritten = trim_rewritten_reply(llm_result.get("message") or "", max_chars)
+    if not rewritten:
+        return {"ok": False, "applied": False, "reply": reply_text, "error": "empty rewritten reply"}
+    if mention_prefix:
+        rewritten = ensure_reply_mentions_sender(rewritten, message.get("reply_target_name") or "")
+    return {
+        "ok": True,
+        "applied": rewritten != original,
+        "reply": rewritten,
+        "mode": style_mode.get("mode"),
+        "elapsed_ms": int((time.time() - started) * 1000),
+        "llm": compact_llm_result(llm_result),
+        "evidence": evidence,
+        "style_score": style_score,
+        "style_notes": style_notes,
+        "overuse_warnings": overuse_warnings,
+        "selected_persona": {
+            "chat_username": settings.get("chat_username"),
+            "person_key": style_card.get("person_key") or settings.get("person_key"),
+            "display_name": style_card.get("display_name") or settings.get("display_name"),
+            "avatar_url": style_card.get("avatar_url") or "",
+            "level": style_rank_level((stats or {}).get("message_count") or 0),
+        },
+        "style_card": {
+            "display_name": style_card.get("display_name"),
+            "person_key": style_card.get("person_key"),
+            "updated_at": style_card.get("updated_at"),
+            "cached": bool(card_result.get("cached")),
+            "tags": (card.get("tags") or [])[:6],
+            "quality_score": card.get("quality_score") or style_card.get("quality_score") or {},
+        },
+    }
+
+
+def style_card_api_payload(query: dict) -> dict:
+    payload = {
+        "chat": str(query.get("chat", [""])[0] or "").strip(),
+        "person": str(query.get("person", [""])[0] or "").strip(),
+        "display_name": str(query.get("display_name", [""])[0] or "").strip(),
+    }
+    force = str(query.get("force", [""])[0] or "").lower() in {"1", "true", "yes"}
+    result = get_style_card(payload, force=force, build_missing=force)
+    if not result.get("ok") and not force:
+        settings = style_card_from_payload(payload, read_config())
+        stats = build_style_card_stats(
+            settings.get("chat_username") or "",
+            settings.get("person_key") or "",
+            settings.get("display_name") or "",
+        )
+        if stats.get("message_count"):
+            card = {
+                "key": style_clone_key(settings.get("chat_username") or "", settings.get("person_key") or ""),
+                "chat_username": settings.get("chat_username") or "",
+                "chat_display_name": stats.get("chat_display_name") or settings.get("chat_display_name") or "",
+                "person_key": settings.get("person_key") or "",
+                "display_name": stats.get("display_name") or settings.get("display_name") or "",
+                "alias": stats.get("alias") or "",
+                "avatar_url": stats.get("avatar_url") or "",
+                "updated_at": "",
+                "elapsed_ms": 0,
+                "stats": stats,
+                "card": fallback_style_card(stats, warning="尚未重建 LLM 人格卡，当前展示统计预览。"),
+                "llm": {},
+                "preview_only": True,
+            }
+            result = {"ok": True, "style_card": card, "cached": False, "preview_only": True}
+    config = read_config()
+    return {**result, "settings": style_clone_settings(config)}
+
+
+def rebuild_style_card_api(payload: dict) -> dict:
+    return generate_style_card(payload, force_llm=True)
+
+
+def style_personas_build_state(chat_username: str = "") -> dict:
+    chat_username = str(chat_username or "").strip()
+    with STYLE_PERSONA_LOCK:
+        if chat_username:
+            return dict(STYLE_PERSONA_BUILD_STATE.get(chat_username) or {})
+        return {key: dict(value) for key, value in STYLE_PERSONA_BUILD_STATE.items()}
+
+
+def style_personas_cards_for_candidates(candidates: list[dict]) -> dict[str, dict]:
+    store = load_style_cards()
+    cards = store.get("cards") if isinstance(store.get("cards"), dict) else {}
+    output = {}
+    for person in candidates:
+        key = style_clone_key(person.get("chat_username") or "", person.get("person_key") or "")
+        card = cards.get(key)
+        if card:
+            output[person.get("person_key") or key] = card
+    return output
+
+
+def style_personas_api_payload(query: dict) -> dict:
+    config = read_config()
+    settings = style_personas_settings(config)
+    chat_username = str(query.get("chat", [""])[0] or query.get("chat_username", [""])[0] or "").strip()
+    if not chat_username:
+        chat_username = settings.get("selected_by_chat") and next(iter(settings.get("selected_by_chat").keys()), "")
+    if not chat_username:
+        chat_username = style_clone_settings(config).get("chat_username") or ""
+    candidates = top_style_person_candidates(
+        chat_username,
+        limit=10,
+        min_text_messages=settings.get("min_text_messages", 80),
+    )
+    selected = selected_style_persona(chat_username, config)
+    cards = style_personas_cards_for_candidates(candidates)
+    enriched = []
+    for person in candidates:
+        card = cards.get(person.get("person_key"))
+        quality = (card or {}).get("quality_score") or ((card or {}).get("card") or {}).get("quality_score") or {}
+        enriched.append(
+            {
+                **person,
+                "selected": bool(selected and person.get("person_key") == selected),
+                "has_card": bool(card),
+                "card_updated_at": (card or {}).get("updated_at") or "",
+                "quality_score": quality,
+            }
+        )
+    return {
+        "ok": True,
+        "chat_username": chat_username,
+        "chat_display_name": chat_display_name_for(chat_username) or chat_username,
+        "settings": settings,
+        "selected_person_key": selected,
+        "top10": enriched,
+        "cards": cards,
+        "build_state": style_personas_build_state(chat_username),
+    }
+
+
+def rebuild_style_personas_api(payload: dict) -> dict:
+    config = read_config()
+    settings = style_personas_settings(config)
+    chat_username = str(payload.get("chat_username") or payload.get("chat") or "").strip()
+    if not chat_username:
+        return {"ok": False, "error": "缺少群 chat_username"}
+    force = bool(payload.get("force", True))
+    candidates = top_style_person_candidates(
+        chat_username,
+        limit=10,
+        min_text_messages=settings.get("min_text_messages", 80),
+    )
+    if not candidates:
+        return {"ok": False, "error": "当前群没有可蒸馏的 Top10 成员", "chat_username": chat_username}
+    started = time.time()
+    results = []
+    failures = []
+    with STYLE_PERSONA_LOCK:
+        STYLE_PERSONA_BUILD_STATE[chat_username] = {
+            "running": True,
+            "started_at": now_iso(),
+            "updated_at": now_iso(),
+            "total": len(candidates),
+            "done": 0,
+            "current": "",
+            "success": 0,
+            "failed": 0,
+        }
+    for index, person in enumerate(candidates, start=1):
+        with STYLE_PERSONA_LOCK:
+            STYLE_PERSONA_BUILD_STATE[chat_username].update(
+                {
+                    "running": True,
+                    "updated_at": now_iso(),
+                    "done": index - 1,
+                    "current": person.get("display_name") or person.get("person_key") or "",
+                }
+            )
+        if person.get("sample_status") != "ok":
+            failure = {
+                "person_key": person.get("person_key"),
+                "display_name": person.get("display_name"),
+                "error": f"样本不足：{person.get('text_message_count', 0)} / {person.get('sample_threshold', 80)}",
+                "sample_status": person.get("sample_status"),
+            }
+            failures.append(failure)
+            results.append({"ok": False, **failure})
+            with STYLE_PERSONA_LOCK:
+                STYLE_PERSONA_BUILD_STATE[chat_username]["failed"] += 1
+                STYLE_PERSONA_BUILD_STATE[chat_username]["done"] = index
+            continue
+        payload_for_card = style_card_payload_for_persona(
+            chat_username,
+            person.get("person_key") or "",
+            person.get("display_name") or "",
+            config,
+        )
+        if not force:
+            cached = get_style_card(payload_for_card, force=False, build_missing=False)
+            if cached.get("ok") and cached.get("style_card") and not cached.get("stale"):
+                result = cached
+            else:
+                result = generate_style_card(payload_for_card, force_llm=True)
+        else:
+            result = generate_style_card(payload_for_card, force_llm=True)
+        if result.get("ok"):
+            card = result.get("style_card") or {}
+            results.append(
+                {
+                    "ok": True,
+                    "person_key": person.get("person_key"),
+                    "display_name": person.get("display_name"),
+                    "quality_score": card.get("quality_score") or (card.get("card") or {}).get("quality_score") or {},
+                    "updated_at": card.get("updated_at"),
+                    "elapsed_ms": card.get("elapsed_ms"),
+                }
+            )
+            with STYLE_PERSONA_LOCK:
+                STYLE_PERSONA_BUILD_STATE[chat_username]["success"] += 1
+        else:
+            failure = {
+                "person_key": person.get("person_key"),
+                "display_name": person.get("display_name"),
+                "error": result.get("error") or "构建失败",
+            }
+            failures.append(failure)
+            results.append({"ok": False, **failure})
+            with STYLE_PERSONA_LOCK:
+                STYLE_PERSONA_BUILD_STATE[chat_username]["failed"] += 1
+        with STYLE_PERSONA_LOCK:
+            STYLE_PERSONA_BUILD_STATE[chat_username].update({"done": index, "updated_at": now_iso()})
+    with STYLE_PERSONA_LOCK:
+        STYLE_PERSONA_BUILD_STATE[chat_username].update(
+            {
+                "running": False,
+                "finished_at": now_iso(),
+                "updated_at": now_iso(),
+                "current": "",
+                "elapsed_ms": int((time.time() - started) * 1000),
+            }
+        )
+    return {
+        "ok": True,
+        "chat_username": chat_username,
+        "chat_display_name": chat_display_name_for(chat_username) or chat_username,
+        "results": results,
+        "failures": failures,
+        "build_state": style_personas_build_state(chat_username),
+    }
+
+
+def select_style_persona_api(payload: dict) -> dict:
+    chat_username = str(payload.get("chat_username") or payload.get("chat") or "").strip()
+    person_key = clean_contact_text(payload.get("person_key") or payload.get("person") or "")
+    if not chat_username:
+        return {"ok": False, "error": "缺少群 chat_username"}
+    config = read_config()
+    personas = style_personas_settings(config)
+    selected = dict(personas.get("selected_by_chat") or {})
+    if person_key:
+        selected[chat_username] = person_key
+    else:
+        selected.pop(chat_username, None)
+    config["style_personas"] = {
+        **personas,
+        "enabled": bool(payload.get("enabled", True)),
+        "selected_by_chat": selected,
+    }
+    candidate = next((item for item in top_style_person_candidates(chat_username, limit=10) if item.get("person_key") == person_key), None)
+    if candidate:
+        config["style_clone"] = {
+            **style_clone_settings(config),
+            "chat_username": chat_username,
+            "chat_display_name": chat_display_name_for(chat_username) or chat_username,
+            "person_key": person_key,
+            "display_name": candidate.get("display_name") or person_key,
+            "strength": personas.get("strength", 0.9),
+            "max_reply_chars": personas.get("max_reply_chars", 180),
+            "cache_hours": personas.get("refresh_interval_hours", 12),
+        }
+    normalized = normalize_config(config)
+    write_json(CONFIG_FILE, normalized)
+    return style_personas_api_payload({"chat": [chat_username]})
+
+
+def style_personas_evidence_api(payload: dict) -> dict:
+    config = read_config()
+    chat_username = str(payload.get("chat_username") or payload.get("chat") or "").strip()
+    person_key = clean_contact_text(payload.get("person_key") or payload.get("person") or selected_style_persona(chat_username, config))
+    trigger_text = str(payload.get("message") or payload.get("source_text") or "")[:1000]
+    base_reply = str(payload.get("reply") or payload.get("text") or "")[:1000]
+    evidence = retrieve_style_evidence(chat_username, person_key, trigger_text, base_reply, limit=clamp_int(payload.get("limit"), 8, 3, 12))
+    return {
+        "ok": True,
+        "chat_username": chat_username,
+        "person_key": person_key,
+        "evidence": evidence,
+    }
+
+
+def test_style_rewrite_api(payload: dict) -> dict:
+    config = read_config()
+    text = str(payload.get("text") or payload.get("reply") or "").strip()
+    if not text:
+        text = "这个我看可以先跑两天看看，别急着下结论。"
+    message = {
+        "text": str(payload.get("message") or payload.get("source_text") or "群友让你接一句话")[:1000],
+        "reply_to_sender": False,
+        "reply_target_name": "",
+    }
+    if payload.get("force_enabled"):
+        config["style_clone"] = {
+            **style_card_from_payload(payload, config),
+            "enabled": True,
+            "rewrite_enabled": True,
+        }
+    result = rewrite_reply_with_style(text, message, config, force=True)
+    return {"ok": bool(result.get("ok")), "original": text, "rewrite": result.get("reply"), "style_clone": result}
+
+
+def test_style_persona_rewrite_api(payload: dict) -> dict:
+    config = read_config()
+    chat_username = str(payload.get("chat_username") or payload.get("chat") or "").strip()
+    person_key = clean_contact_text(payload.get("person_key") or payload.get("person") or selected_style_persona(chat_username, config))
+    text = str(payload.get("text") or payload.get("reply") or "").strip()
+    if not text:
+        text = "这个我看可以先跑两天看看，别急着下结论。"
+    message = {
+        "chat_username": chat_username,
+        "text": str(payload.get("message") or payload.get("source_text") or "群友让你接一句话")[:1000],
+        "reply_to_sender": False,
+        "reply_target_name": "",
+        "style_person_key": person_key,
+    }
+    result = rewrite_reply_with_style(text, message, config, force=True)
+    return {
+        "ok": bool(result.get("ok")),
+        "original": text,
+        "rewrite": result.get("reply"),
+        "style_persona": result,
+    }
+
+
 def build_minimal_reply_prompt(message: dict, scoring: dict, timeline: list[dict] | None = None) -> str:
     mention_line = ""
-    if message.get("reply_to_sender") and message.get("reply_target_name"):
+    if message.get("reply_mention_required") and message.get("reply_target_name"):
         mention_line = f"必须以 @{message.get('reply_target_name')} 开头。"
     if is_memory_task_text(message.get("text") or ""):
         lines = []
@@ -15762,77 +16114,125 @@ def build_minimal_reply_prompt(message: dict, scoring: dict, timeline: list[dict
 """.strip()
 
 
-def local_memory_summary_reply(message: dict, timeline: list[dict]) -> str:
-    user_items = [item for item in timeline if not item.get("is_self_message") and item.get("text")]
-    if not user_items:
-        return "我这边目前能看到的群友消息不多，暂时没法整理出完整总结。"
-    recent = user_items[-12:]
-    topics = []
-    for item in recent:
-        text = item.get("text") or ""
-        if len(text) > 70:
-            text = text[:70] + "..."
-        topics.append(f"{item.get('time_text') or ''} {item.get('sender_hint') or '群友'}说：{text}")
-    prefix = ""
-    if message.get("reply_to_sender") and message.get("reply_target_name"):
-        prefix = mention_prefix_for_sender(message.get("reply_target_name") or "")
-    return f"{prefix}我看了下最近群消息，主要是：" + "；".join(topics[-6:])
-
-
-def local_person_history_reply(message: dict, memory: dict) -> str:
-    insight = memory.get("person_history") or {}
-    if not insight:
-        return ""
-    name = insight.get("display_name") or insight.get("target_key") or "这个人"
-    count = int(insight.get("message_count") or 0)
-    prefix = ""
-    if message.get("reply_to_sender") and message.get("reply_target_name"):
-        prefix = mention_prefix_for_sender(message.get("reply_target_name") or "")
-    if count <= 0:
-        return f"{prefix}我这边没翻到 {name} 的有效历史发言，暂时不敢乱画像。"
-    catchphrases = insight.get("catchphrases") or []
-    terms = insight.get("terms") or []
-    quotes = insight.get("representative_quotes") or []
-    bits = [f"{name} 这人有 {count} 条可见历史发言。"]
-    if catchphrases:
-        bits.append("口癖比较明显的是：" + "、".join(f"{item.get('text')}（{item.get('count')}次）" for item in catchphrases[:5]) + "。")
-    if terms:
-        bits.append("高频词集中在：" + "、".join(f"{item.get('text')}（{item.get('count')}次）" for item in terms[:6]) + "。")
-    if quotes:
-        quote_text = "；".join(f"「{item.get('text')}」" for item in quotes[:3] if item.get("text"))
-        if quote_text:
-            bits.append("代表发言有：" + quote_text + "。")
-    if len(bits) == 1:
-        bits.append("他的有效发言不算少，但没有特别稳定的口头禅，更适合看代表发言来判断。")
-    return prefix + "".join(bits)
-
-
-def local_fallback_reply(message: dict, scoring: dict, timeline: list[dict] | None = None, memory: dict | None = None) -> str:
+def build_compact_memory_retry_prompt(message: dict, timeline: list[dict] | None = None) -> str:
     text = message.get("text") or ""
-    if person_history_task_requested(text):
-        person_reply = local_person_history_reply(message, memory or {})
-        if person_reply:
-            return person_reply
-    if is_memory_task_text(text):
-        return local_memory_summary_reply(message, timeline or [])
-    if scoring.get("decision") != "reply":
-        return "这条我先不接，等他们把话题说具体点再说。"
-    if any(word in text for word in ("怎么", "咋", "稳", "方案", "建议", "推荐", "有人知道")):
-        return "这个得看具体场景，先把目标和限制说清楚点，我帮你一起捋一下。"
-    if any(word in text for word in ("哈哈", "笑死", "离谱", "牛", "绝了")):
-        return "这段确实有点意思，先别急着下结论。"
-    return "我先听一下上下文，你们把关键点再说具体点。"
+    mention_line = ""
+    if message.get("reply_mention_required") and message.get("reply_target_name"):
+        mention_line = f"- 如果需要 @，只在开头写 @{message.get('reply_target_name')} 一次。"
+    if is_person_memory_task_text(text):
+        hint_lines = []
+        for hint in person_memory_hints_for_query(message.get("chat_username") or "", text)[:2]:
+            phrases = [
+                f"{item.get('text')}={item.get('count')}次"
+                for item in (hint.get("catchphrases") or [])[:8]
+                if item.get("text")
+            ]
+            quotes = [
+                item.get("text")
+                for item in (hint.get("representative_quotes") or [])[:3]
+                if item.get("text")
+            ]
+            hint_lines.append(
+                f"- {hint.get('display_name')}：历史文本 {hint.get('message_count')} 条；"
+                f"高频短句 {'、'.join(phrases) or '无'}；代表原话 {'；'.join(quotes) or '无'}"
+            )
+        return f"""
+只输出一条微信群回复，不要 Markdown，不要解释。
+这是“锐评某人历史发言/口头禅”的问题，必须基于下面统计给结论。
+要求：2 到 4 句，180 字以内，口语化，不能说没上下文，不能让别人补关键点。
+{mention_line}
+
+问题: {text}
+人物统计:
+{chr(10).join(hint_lines) if hint_lines else "- 无"}
+""".strip()
+
+    lines = []
+    for item in (timeline or [])[-12:]:
+        if item.get("is_self_message") or not item.get("text"):
+            continue
+        lines.append(f"- {item.get('sender_hint') or '群友'}: {(item.get('text') or '')[:120]}")
+    return f"""
+只输出一条微信群回复，不要 Markdown，不要解释。
+用户要你总结/查群消息。必须基于下面真实消息总结，不能说没有上下文，不能要求别人再补关键点。
+要求：3 句以内，220 字以内。
+{mention_line}
+
+请求: {text}
+真实消息:
+{chr(10).join(lines) if lines else "- 暂无可见群友消息"}
+""".strip()
 
 
-def preview_reply(payload: dict) -> dict:
-    debug = debug_talk(payload)
-    config = read_config()
+def local_memory_summary_reply(message: dict, timeline: list[dict]) -> str:
+    system_log_from_message(
+        "auto_reply",
+        "warning",
+        "本地记忆兜底回复已禁用，未生成回复",
+        message,
+        details={"timeline_count": len(timeline or [])},
+    )
+    return ""
+
+
+def local_fallback_reply(message: dict, scoring: dict, timeline: list[dict] | None = None) -> str:
+    system_log_from_message(
+        "auto_reply",
+        "warning",
+        "本地普通兜底回复已禁用，未生成回复",
+        message,
+        details={"scoring": scoring, "timeline_count": len(timeline or [])},
+    )
+    return ""
+
+
+def memory_task_evidence_status(message: dict, query: str, memory: dict, timeline: list[dict]) -> dict:
+    if not is_memory_task_text(query):
+        return {"ok": True, "reason": "not_memory_task"}
+    timeline_count = len([item for item in timeline or [] if item.get("text") and not item.get("is_self_message")])
+    vector_count = len([item for item in (memory.get("vector_memories") or []) if item.get("text") or (item.get("source") or {}).get("content")])
+    fact_count = len(memory.get("facts") or [])
+    summary_count = len(memory.get("summaries") or [])
+    person_hints = person_memory_hints_for_query(message.get("chat_username") or "", query)
+    person_evidence_count = sum(
+        len(hint.get("representative_quotes") or [])
+        + len(hint.get("recent_quotes") or [])
+        + len(hint.get("catchphrases") or [])
+        + len(hint.get("short_phrases") or [])
+        for hint in person_hints
+    )
+    status = {
+        "ok": True,
+        "reason": "",
+        "timeline_count": timeline_count,
+        "vector_count": vector_count,
+        "fact_count": fact_count,
+        "summary_count": summary_count,
+        "person_hint_count": len(person_hints),
+        "person_evidence_count": person_evidence_count,
+    }
+    if is_person_memory_task_text(query):
+        if not person_hints:
+            return {**status, "ok": False, "reason": "person_not_found"}
+        if person_evidence_count <= 0:
+            return {**status, "ok": False, "reason": "person_evidence_empty"}
+        return status
+    if timeline_count + vector_count + fact_count + summary_count <= 0:
+        return {**status, "ok": False, "reason": "memory_evidence_empty"}
+    return status
+
+
+def preview_reply(payload: dict, config: dict | None = None) -> dict:
+    config = config or read_config()
+    debug = debug_talk(payload, config=config)
     profile = {**active_profile(config)}
     message = {
         **debug["message"],
         "reply_to_sender": bool(debug.get("context", {}).get("reply_to_sender")),
+        "reply_mention_required": bool(debug.get("context", {}).get("reply_mention_required")),
         "reply_target_name": (
-            debug.get("context", {}).get("group_nickname")
+            debug.get("context", {}).get("reply_target_name")
+            or debug.get("context", {}).get("group_nickname")
             or debug.get("context", {}).get("sender_name")
             or debug["message"].get("sender_hint")
             or ""
@@ -15850,44 +16250,103 @@ def preview_reply(payload: dict) -> dict:
         if is_memory_task_text(query)
         else []
     )
-    sender_key = clean_contact_text(debug.get("context", {}).get("sender_key") or message.get("sender_key") or "")
-    memory = active_semantic_context(debug.get("chat") or "", query, limit=8, person_keys=[sender_key] if sender_key else [])
+    memory = active_semantic_context(debug.get("chat") or "", query, limit=8)
+    evidence_status = memory_task_evidence_status(message, query, memory, timeline)
+    if not evidence_status.get("ok"):
+        error = f"真实记忆证据不足: {evidence_status.get('reason') or 'unknown'}"
+        log_reply_execution_failure(
+            message,
+            "记忆任务证据检查",
+            error,
+            category="memory",
+            details={
+                "query": query[:300],
+                "evidence": evidence_status,
+                "chat": debug.get("chat") or "",
+            },
+        )
+        return {
+            "ok": False,
+            "sent": False,
+            "retry": False,
+            "chat": debug.get("chat"),
+            "message": message,
+            "scoring": debug["scoring"],
+            "context": debug["context"],
+            "recent": debug["recent"],
+            "memory": memory,
+            "timeline": timeline,
+            "reply": "",
+            "llm": {},
+            "style_clone": {"ok": False, "applied": False, "reply": "", "reason": "memory_evidence_empty"},
+            "error": error,
+        }
     prompt = build_reply_prompt(message, debug["recent"], memory, debug["scoring"], timeline)
     result = request_llm(profile, prompt, build_agent_system_prompt(config))
-    fallback_used = False
-    if not result.get("ok"):
+    retry_used = False
+    if (not result.get("ok")) or llm_result_truncated(result):
         retry_profile = {
             **profile,
-            "max_tokens": 700 if is_memory_task_text(query) else 384,
+            "max_tokens": 520 if is_person_memory_task_text(query) else (900 if is_memory_task_text(query) else 384),
             "temperature": min(float(profile.get("temperature", 0.4) or 0.4), 0.5),
         }
-        retry_prompt = build_minimal_reply_prompt(message, debug["scoring"], timeline)
+        retry_prompt = (
+            build_compact_memory_retry_prompt(message, timeline)
+            if is_memory_task_text(query)
+            else build_minimal_reply_prompt(message, debug["scoring"], timeline)
+        )
         retry = request_llm(retry_profile, retry_prompt, build_agent_system_prompt(config))
         if retry.get("ok"):
             result = retry
-            fallback_used = True
+            retry_used = True
     if result.get("ok"):
         reply = (result.get("message") or "").strip()
-        if person_history_task_requested(query) and memory.get("person_history") and any(
-            phrase in reply for phrase in ("不知道", "没法", "无法", "没有上下文", "看不到", "不太清楚", "暂时不能")
-        ):
-            local_reply = local_person_history_reply(message, memory)
-            if local_reply:
-                reply = local_reply
-                fallback_used = True
         ok = bool(reply)
         error = None if ok else {"message": "empty reply"}
     else:
-        reply = local_fallback_reply(message, debug["scoring"], timeline, memory)
-        ok = True
+        reply = ""
+        ok = False
         error = result.get("error")
-        fallback_used = True
-    if message.get("reply_to_sender"):
+        system_log_from_message(
+            "llm",
+            "error",
+            "回复生成失败，已按要求不发送兜底内容",
+            message,
+            error=str(error or "LLM reply generation failed"),
+            details={
+                "stage": "preview_reply",
+                "scoring": debug.get("scoring"),
+                "llm": compact_llm_result(result),
+                "timeline_count": len(timeline),
+            },
+        )
+        retry_used = False
+    if result.get("ok") and not reply:
+        system_log_from_message(
+            "llm",
+            "error",
+            "模型返回空回复，已按要求不发送",
+            message,
+            error="empty reply",
+            details={"stage": "preview_reply", "llm": compact_llm_result(result), "scoring": debug.get("scoring")},
+        )
+    if ok and message.get("reply_mention_required"):
         reply = ensure_reply_mentions_sender(reply, message.get("reply_target_name") or "")
+    style_result = {"ok": True, "applied": False, "reply": reply, "reason": "skipped_empty_or_failed"}
+    if ok and reply:
+        style_result = rewrite_reply_with_style(reply, message, config)
+        if style_result.get("ok") and style_result.get("reply"):
+            reply = style_result.get("reply")
+            if message.get("reply_mention_required"):
+                reply = ensure_reply_mentions_sender(reply, message.get("reply_target_name") or "")
+        else:
+            style_result.setdefault("reply", reply)
+    else:
+        style_result.setdefault("reply", reply)
     return {
         "ok": ok,
         "sent": False,
-        "fallback": fallback_used,
+        "retry": retry_used,
         "chat": debug.get("chat"),
         "message": message,
         "scoring": debug["scoring"],
@@ -15897,6 +16356,7 @@ def preview_reply(payload: dict) -> dict:
         "timeline": timeline,
         "reply": reply,
         "llm": compact_llm_result(result),
+        "style_clone": style_result,
         "error": error,
     }
 
@@ -15953,53 +16413,40 @@ def semantic_extract_loop() -> None:
                         "last_skip_reason": "",
                     }
                 )
+                system_log_event("memory", "error", "自动记忆抽取失败", error=str(result.get("error") or result), details={"result": result})
         except Exception as exc:
             write_semantic_state({"ok": False, "running": False, "last_checked_at": now_iso(), "last_error": str(exc)})
+            system_log_event("memory", "error", "自动记忆抽取线程异常", error=str(exc))
             print(f"semantic extract error: {exc}", flush=True)
         time.sleep(5)
 
 
-def profile_rebuild_loop() -> None:
+def style_persona_refresh_loop() -> None:
     while True:
-        sleep_seconds = 30
         try:
             config = read_config()
-            settings = config.get("profile_rebuild") or {}
-            interval = clamp_int(settings.get("interval_seconds"), 43200, 3600, 604800)
-            sleep_seconds = min(300, max(30, interval // 24))
-            if PROFILE_REBUILD_LOCK.locked():
-                write_profile_rebuild_state({"running": True, "last_checked_at": now_iso(), "last_skip_reason": ""})
-                time.sleep(sleep_seconds)
+            settings = style_personas_settings(config)
+            interval_hours = settings.get("refresh_interval_hours", 12)
+            if not settings.get("auto_refresh_enabled", True):
+                time.sleep(300)
                 continue
-            if not settings.get("enabled", True):
-                write_profile_rebuild_state({"running": False, "last_checked_at": now_iso(), "last_skip_reason": "disabled"})
-                time.sleep(sleep_seconds)
-                continue
-            state = profile_rebuild_state()
-            last_success = float(state.get("last_success_epoch") or 0)
-            write_profile_rebuild_state({"last_checked_at": now_iso()})
-            if state.get("running") or PROFILE_REBUILD_LOCK.locked():
-                time.sleep(sleep_seconds)
-                continue
-            if last_success and last_success + interval > time.time():
-                remain = int(last_success + interval - time.time())
-                write_profile_rebuild_state({"running": False, "last_skip_reason": f"next_rebuild_in_{remain}s"})
-                time.sleep(sleep_seconds)
-                continue
-            result = rebuild_person_profiles(
-                {
-                    "chat": settings.get("chat_username") or "",
-                    "max_people_per_chat": settings.get("max_people_per_chat"),
-                    "min_messages_per_person": settings.get("min_messages_per_person"),
-                    "force": False,
-                }
-            )
-            if not result.get("ok"):
-                write_profile_rebuild_state({"running": False, "ok": False, "last_error": str(result.get("error") or result)})
+            selected = settings.get("selected_by_chat") or {}
+            now = datetime.now(DISPLAY_TZ)
+            for chat_username, person_key in list(selected.items()):
+                if style_personas_build_state(chat_username).get("running"):
+                    continue
+                payload = style_card_payload_for_persona(chat_username, person_key, "", config)
+                key = style_clone_key(chat_username, person_key)
+                card = (load_style_cards().get("cards") or {}).get(key)
+                updated = parse_iso_datetime(str((card or {}).get("updated_at") or ""))
+                if updated and (now - updated).total_seconds() < interval_hours * 3600:
+                    continue
+                generate_style_card(payload, force_llm=True)
+                time.sleep(2)
         except Exception as exc:
-            write_profile_rebuild_state({"running": False, "ok": False, "last_checked_at": now_iso(), "last_error": str(exc)})
-            print(f"profile rebuild error: {exc}", flush=True)
-        time.sleep(sleep_seconds)
+            system_log_event("system", "error", "人格自动刷新线程异常", error=str(exc))
+            print(f"style persona refresh error: {exc}", flush=True)
+        time.sleep(600)
 
 
 def auto_reply_loop() -> None:
@@ -16071,7 +16518,6 @@ def api_status(chat: str = "") -> dict:
         "memory": memory_status(),
         "semantic_memory": semantic_memory_preview(chat),
         "semantic_runs": semantic_runs(8),
-        "profile_rebuild": profile_rebuild_runs(8),
         "auto_reply": auto_reply_public_state(config),
         "login_guard": public_login_guard_state(config),
         "last_test": last_test,
@@ -16086,15 +16532,14 @@ def api_status_lite() -> dict:
         "config": public_config(config),
         "memory": memory_status(),
         "semantic_runs": semantic_runs(5),
-        "profile_rebuild": profile_rebuild_runs(5),
         "auto_reply": auto_reply_public_state(config),
         "login_guard": public_login_guard_state(config),
         "last_test": read_json(STATUS_FILE, {}),
     }
 
 
-def json_response(handler: BaseHTTPRequestHandler, payload, status: int = 200, *, max_text: int = 2000) -> None:
-    body = json.dumps(json_safe_payload(payload, max_text=max_text), ensure_ascii=False).encode("utf-8")
+def json_response(handler: BaseHTTPRequestHandler, payload, status: int = 200) -> None:
+    body = json.dumps(json_safe_payload(payload), ensure_ascii=False).encode("utf-8")
     handler.send_response(status)
     handler.send_header("Content-Type", "application/json; charset=utf-8")
     handler.send_header("Cache-Control", "no-store")
@@ -16194,17 +16639,6 @@ class Handler(BaseHTTPRequestHandler):
                 json_response(self, list_models(active_profile(config)))
             elif parsed.path == "/api/semantic-runs":
                 json_response(self, semantic_runs(clamp_int(query.get("limit", ["20"])[0], 20, 1, 100)))
-            elif parsed.path == "/api/memory/profile-rebuild-state":
-                json_response(self, profile_rebuild_runs(clamp_int(query.get("limit", ["10"])[0], 10, 1, 50)))
-            elif parsed.path == "/api/memory/relationship-graph":
-                json_response(
-                    self,
-                    relationship_graph_for_person(
-                        str(query.get("chat", [""])[0] or "").strip(),
-                        str(query.get("person", [""])[0] or "").strip(),
-                        clamp_int(query.get("limit", ["80"])[0], 80, 1, 300),
-                    ),
-                )
             elif parsed.path == "/api/memory/review":
                 json_response(self, memory_review_list(str(query.get("chat", [""])[0] or "").strip()))
             elif parsed.path == "/api/memory/databases":
@@ -16231,6 +16665,17 @@ class Handler(BaseHTTPRequestHandler):
                 json_response(self, chat_types())
             elif parsed.path == "/api/suite-status":
                 json_response(self, suite_status())
+            elif parsed.path == "/api/system-logs":
+                search_text = str((query.get("q") or query.get("query") or [""])[0] or "").strip()
+                json_response(
+                    self,
+                    system_logs_payload(
+                        clamp_int(query.get("limit", ["120"])[0], 120, 1, 500),
+                        str(query.get("category", [""])[0] or "").strip(),
+                        str(query.get("level", [""])[0] or "").strip(),
+                        search_text,
+                    ),
+                )
             elif parsed.path == "/api/reply/outbox":
                 json_response(self, reply_outbox_list(clamp_int(query.get("limit", ["30"])[0], 30, 1, 100)))
             elif parsed.path == "/api/reply/auto-state":
@@ -16238,7 +16683,11 @@ class Handler(BaseHTTPRequestHandler):
             elif parsed.path == "/api/login-guard/state":
                 json_response(self, {"ok": True, "login_guard": public_login_guard_state(read_config())})
             elif parsed.path == "/api/clawbot/status":
-                json_response(self, {"ok": True, "clawbot": clawbot_status()}, max_text=20000)
+                json_response(self, {"ok": True, "clawbot": clawbot_status()})
+            elif parsed.path == "/api/style-card":
+                json_response(self, style_card_api_payload(query))
+            elif parsed.path == "/api/style-personas":
+                json_response(self, style_personas_api_payload(query))
             elif parsed.path == "/api/chat-members":
                 json_response(
                     self,
@@ -16268,7 +16717,10 @@ class Handler(BaseHTTPRequestHandler):
                 serve_media(self, parsed.path)
             else:
                 serve_static(self, parsed.path)
+        except (BrokenPipeError, ConnectionResetError):
+            return
         except Exception as exc:
+            system_log_event("api", "error", f"GET {parsed.path} 失败", error=str(exc), details={"path": parsed.path, "query": query})
             json_response(self, {"ok": False, "error": str(exc)}, 500)
 
     def do_POST(self):  # noqa: N802
@@ -16278,6 +16730,13 @@ class Handler(BaseHTTPRequestHandler):
         try:
             payload = json.loads(body.decode("utf-8") or "{}")
         except json.JSONDecodeError as exc:
+            system_log_event(
+                "api",
+                "error",
+                f"POST {parsed.path} JSON 解析失败",
+                error=str(exc),
+                details={"path": parsed.path, "body_preview": body[:500].decode("utf-8", errors="replace")},
+            )
             json_response(self, {"ok": False, "error": f"invalid json: {exc}"}, 400)
             return
         try:
@@ -16302,11 +16761,37 @@ class Handler(BaseHTTPRequestHandler):
                         "checked_at": now_iso(),
                         "checked_epoch": time.time(),
                     }
+                if not result.get("ok"):
+                    system_log_event(
+                        "llm",
+                        "error",
+                        "手动模型测试失败",
+                        error=str(result.get("error") or "LLM test failed"),
+                        details={"profile_id": profile.get("id"), "model": profile.get("model"), "base_url": profile.get("base_url"), "llm": compact_llm_result(result)},
+                    )
                 json_response(self, result, 200 if result.get("ok") else 502)
             elif parsed.path == "/api/check-llm":
                 profile_id = payload.get("profile_id") or config.get("active_llm_profile_id")
                 profile = next((p for p in config.get("llm_profiles") or [] if p.get("id") == profile_id), active_profile(config))
                 json_response(self, run_health_check(profile, force=True))
+            elif parsed.path == "/api/style-card/rebuild":
+                result = rebuild_style_card_api(payload)
+                json_response(self, result, 200 if result.get("ok") else 400)
+            elif parsed.path == "/api/style-card/test-rewrite":
+                result = test_style_rewrite_api(payload)
+                json_response(self, result, 200 if result.get("ok") else 502)
+            elif parsed.path == "/api/style-personas/rebuild":
+                result = rebuild_style_personas_api(payload)
+                json_response(self, result, 200 if result.get("ok") else 400)
+            elif parsed.path == "/api/style-personas/select":
+                result = select_style_persona_api(payload)
+                json_response(self, result, 200 if result.get("ok") else 400)
+            elif parsed.path == "/api/style-personas/test-rewrite":
+                result = test_style_persona_rewrite_api(payload)
+                json_response(self, result, 200 if result.get("ok") else 502)
+            elif parsed.path == "/api/style-personas/evidence":
+                result = style_personas_evidence_api(payload)
+                json_response(self, result, 200 if result.get("ok") else 400)
             elif parsed.path == "/api/skills/image-understanding/models":
                 result = list_image_skill_models(payload)
                 json_response(self, result, 200 if result.get("ok") else 400)
@@ -16320,9 +16805,6 @@ class Handler(BaseHTTPRequestHandler):
                 json_response(self, result, 200 if result.get("ok") else 400)
             elif parsed.path == "/api/extract-memory":
                 json_response(self, extract_memory(payload), 200)
-            elif parsed.path == "/api/memory/rebuild-profiles":
-                result = start_profile_rebuild_async(payload) if payload.get("async") else rebuild_person_profiles(payload)
-                json_response(self, result, 200 if result.get("ok") else 409 if "already running" in str(result.get("error")) else 400)
             elif parsed.path == "/api/evaluate-talk":
                 json_response(self, evaluate_talk(payload), 200)
             elif parsed.path == "/api/debug-talk":
@@ -16401,9 +16883,6 @@ class Handler(BaseHTTPRequestHandler):
             elif parsed.path == "/api/login-guard/run-once":
                 result = login_guard_once(config, force_action=bool(payload.get("force_action")), force_notify=bool(payload.get("force_notify")))
                 json_response(self, result, 200 if result.get("ok") else 502)
-            elif parsed.path == "/api/login-guard/test-notify":
-                result = login_guard_test_notify(config)
-                json_response(self, result, 200 if result.get("ok") else 502)
             elif parsed.path == "/api/clawbot/start":
                 result = clawbot_start()
                 json_response(self, result, 200 if result.get("ok") else 502)
@@ -16447,7 +16926,10 @@ class Handler(BaseHTTPRequestHandler):
                 json_response(self, result, 200 if result.get("ok") else 400)
             else:
                 json_response(self, {"ok": False, "error": "not found"}, 404)
+        except (BrokenPipeError, ConnectionResetError):
+            return
         except Exception as exc:
+            system_log_event("api", "error", f"POST {parsed.path} 失败", error=str(exc), details={"path": parsed.path, "payload": payload})
             json_response(self, {"ok": False, "error": str(exc)}, 500)
 
 
@@ -16463,7 +16945,7 @@ def main(argv: list[str] | None = None) -> int:
     initialize_auto_reply_state()
     threading.Thread(target=health_loop, daemon=True, name="llm-health-check").start()
     threading.Thread(target=semantic_extract_loop, daemon=True, name="semantic-memory-extract").start()
-    threading.Thread(target=profile_rebuild_loop, daemon=True, name="profile-rebuild").start()
+    threading.Thread(target=style_persona_refresh_loop, daemon=True, name="style-persona-refresh").start()
     threading.Thread(target=image_auto_loop, daemon=True, name="image-auto-ingest").start()
     threading.Thread(target=auto_reply_loop, daemon=True, name="wechat-auto-reply").start()
     threading.Thread(target=login_guard_loop, daemon=True, name="wechat-login-guard").start()

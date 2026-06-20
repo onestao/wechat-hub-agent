@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>微信 Agent 控制台</title>
-    <link rel="stylesheet" href="/styles.css?v=20260618-rank-tiers" />
+    <link rel="stylesheet" href="/styles.css" />
   </head>
   <body>
     <main class="screen">
@@ -28,6 +28,7 @@
           <button type="button" data-view="memory">群记忆 <span id="navMemoryCount">--</span></button>
           <button type="button" data-view="database">数据库 <span id="navDatabaseCount">--</span></button>
           <button type="button" data-view="photos">照片库 <span id="navPhotoCount">--</span></button>
+          <button type="button" data-view="logs">日志 <span id="navLogCount">--</span></button>
           <button type="button" data-view="test">测试 <span></span></button>
         </nav>
 
@@ -220,7 +221,6 @@
                   </div>
                   <div class="button-row">
                     <button id="loginGuardRunBtn" class="btn" type="button">检查一次</button>
-                    <button id="loginGuardTestNotifyBtn" class="btn" type="button">发送测试通知</button>
                     <button id="saveLoginGuardBtn" class="btn primary" type="button">保存守护</button>
                   </div>
                 </div>
@@ -324,6 +324,7 @@
         </section>
 
         <section class="page" data-page="persona">
+          <section class="persona-layout">
           <section class="card panel">
             <div class="panel-head">
               <h3>人格设置</h3>
@@ -332,11 +333,54 @@
             <div class="switch-row">
               <label class="switch-label"><input id="agentEnabled" type="checkbox" /><span>启用 Agent 分析</span></label>
               <label class="switch-label"><input id="autoReplyEnabled" type="checkbox" /><span>允许自动回复判定</span></label>
+              <label class="switch-label"><input id="styleRewriteGlobalEnabled" type="checkbox" /><span>回复流程启用性格改写</span></label>
               <select id="replyMode"></select>
             </div>
             <label class="textarea-label"><span>机器人别名</span><textarea id="agentAliases" rows="3"></textarea></label>
             <label class="textarea-label"><span>人格提示词</span><textarea id="personality" rows="10"></textarea></label>
             <label class="textarea-label"><span>安全边界</span><textarea id="safetyPolicy" rows="4"></textarea></label>
+          </section>
+          <section class="card panel style-clone-panel">
+            <div class="panel-head">
+              <div>
+                <h3>Top10 人格蒸馏库</h3>
+                <p>按当前群排行榜 Top10 生成赛博人格档案，手动切换后回复会参考该成员历史原话极限贴脸改写。</p>
+              </div>
+              <div class="style-head-actions">
+                <select id="stylePersonaChat"></select>
+                <button id="refreshStylePersonasBtn" class="btn" type="button">刷新</button>
+                <button id="rebuildStylePersonasBtn" class="btn primary" type="button">批量构建 Top10</button>
+              </div>
+            </div>
+            <div class="style-clone-controls">
+              <label class="switch-label tight"><input id="stylePersonaEnabled" type="checkbox" /><span>启用当前群人格</span></label>
+              <label class="switch-label tight"><input id="stylePersonaRewriteEnabled" type="checkbox" /><span>启用 LLM 贴脸改写</span></label>
+              <label class="switch-label tight"><input id="stylePersonaAutoRefresh" type="checkbox" /><span>12 小时自动刷新</span></label>
+              <label class="switch-label tight"><input id="stylePersonaShowEvidence" type="checkbox" /><span>证据模式</span></label>
+              <label><span>贴脸强度</span><input id="stylePersonaStrength" type="range" min="0" max="1" step="0.05" /></label>
+              <label><span>最长字数</span><input id="stylePersonaMaxChars" type="number" min="40" max="1200" step="10" /></label>
+              <label><span>样本阈值</span><input id="stylePersonaMinMessages" type="number" min="20" max="2000" step="10" /></label>
+              <label><span>刷新间隔/小时</span><input id="stylePersonaRefreshHours" type="number" min="1" max="720" step="1" /></label>
+            </div>
+            <div id="styleCloneStatus" class="style-clone-status">等待加载人格卡</div>
+            <div id="stylePersonaTopList" class="style-persona-toplist"></div>
+            <div id="styleCloneCard" class="style-clone-card style-persona-detail"></div>
+            <div class="style-test-box persona-test-box">
+              <label class="textarea-label"><span>群友消息</span><textarea id="stylePersonaMessageInput" rows="3">这东西先别急着下结论，你怎么看？</textarea></label>
+              <label class="textarea-label"><span>原始回复</span><textarea id="stylePersonaReplyInput" rows="3">这个我看可以先跑两天看看，别急着下结论。</textarea></label>
+              <button id="stylePersonaEvidenceBtn" class="btn" type="button">检索原话</button>
+              <button id="testStylePersonaRewriteBtn" class="btn primary" type="button">测试贴脸改写</button>
+              <pre id="stylePersonaTestOutput" class="reply-preview compact"></pre>
+            </div>
+            <button id="rebuildStyleCardBtn" class="hidden" type="button">重建人格卡</button>
+            <label class="hidden"><input id="styleCloneEnabled" type="checkbox" /></label>
+            <label class="hidden"><input id="styleCloneRewriteEnabled" type="checkbox" /></label>
+            <input id="styleCloneStrength" class="hidden" type="range" min="0" max="1" step="0.05" />
+            <input id="styleCloneMaxChars" class="hidden" type="number" min="40" max="1200" step="10" />
+            <textarea id="styleRewriteInput" class="hidden"></textarea>
+            <button id="testStyleRewriteBtn" class="hidden" type="button">测试旧改写</button>
+            <pre id="styleRewriteOutput" class="hidden"></pre>
+          </section>
           </section>
         </section>
 
@@ -387,6 +431,29 @@
                 </div>
               </div>
               <div id="autoReplyStatus" class="auto-reply-status">等待自动接话状态</div>
+            </article>
+            <article class="card panel span-2 chat-reply-panel">
+              <div class="panel-head">
+                <div>
+                  <h3>单群接话策略</h3>
+                  <p>按群覆盖模式、阈值、斗图概率和随机延迟；未自定义的群继续沿用全局设置。</p>
+                </div>
+                <button id="saveChatReplyBtn" class="btn primary" type="button">保存单群策略</button>
+              </div>
+              <div class="chat-reply-grid">
+                <label class="span-2"><span>目标群</span><select id="chatReplySelect"></select></label>
+                <label class="switch-label"><input id="chatReplyEnabled" type="checkbox" /><span>当前群允许普通接话</span></label>
+                <label class="switch-label"><input id="chatReplyUseGlobal" type="checkbox" /><span>沿用全局策略</span></label>
+                <label><span>当前群模式</span><select id="chatReplyMode"></select></label>
+                <label><span>当前群阈值</span><input id="chatReplyThreshold" type="number" min="0" max="100" step="1" /></label>
+                <label class="switch-label"><input id="chatReplyMemeAuto" type="checkbox" /><span>当前群允许随机斗图</span></label>
+                <label><span>斗图概率 %</span><input id="chatReplyMemeProbability" type="number" min="0" max="100" step="1" /></label>
+                <label><span>切群延迟最小</span><input id="chatReplySwitchDelayMin" type="number" min="0" step="0.1" /></label>
+                <label><span>切群延迟最大</span><input id="chatReplySwitchDelayMax" type="number" min="0" step="0.1" /></label>
+                <label><span>发送延迟最小</span><input id="chatReplySendDelayMin" type="number" min="0" step="0.1" /></label>
+                <label><span>发送延迟最大</span><input id="chatReplySendDelayMax" type="number" min="0" step="0.1" /></label>
+              </div>
+              <div id="chatReplyEffective" class="chat-reply-effective">选择群后显示当前生效策略</div>
             </article>
             <article class="card panel">
               <div class="panel-head">
@@ -531,20 +598,15 @@
             <section class="memory-tab-page active" data-memory-page="people">
               <section class="memory-people-layout">
                 <article class="card panel memory-profile-wall">
-	                  <div class="panel-head">
-	                    <div>
-	                      <h3>人物画像</h3>
-	                      <p>每个群成员独立成卡，点击后查看性格、偏好、故事线和证据。</p>
-	                    </div>
-	                    <div class="memory-profile-actions">
-	                      <span id="profileRebuildState" class="pill">--</span>
-	                      <button id="rebuildProfilesBtn" class="btn primary" type="button">手动更新画像</button>
-	                      <input id="memoryPeopleSearch" class="search-input compact" placeholder="搜索成员、标签、画像" autocomplete="off" />
-	                    </div>
-	                  </div>
-	                  <div id="profileRebuildPanel" class="profile-rebuild-panel"></div>
-	                  <div id="memoryPeopleGrid" class="memory-profile-grid"></div>
-	                </article>
+                  <div class="panel-head">
+                    <div>
+                      <h3>人物画像</h3>
+                      <p>每个群成员独立成卡，点击后查看性格、偏好、故事线和证据。</p>
+                    </div>
+                    <input id="memoryPeopleSearch" class="search-input compact" placeholder="搜索成员、标签、画像" autocomplete="off" />
+                  </div>
+                  <div id="memoryPeopleGrid" class="memory-profile-grid"></div>
+                </article>
                 <aside class="card panel memory-profile-detail">
                   <div class="panel-head">
                     <div>
@@ -679,26 +741,6 @@
                   </div>
                   <div id="semanticRunList" class="run-list"></div>
                 </article>
-                <article class="card panel span-2">
-                  <div class="panel-head">
-                    <div>
-                      <h3>画像重建</h3>
-                      <p>从全历史消息、群昵称映射和互动证据重建人物画像与关系，默认每 12 小时刷新。</p>
-                    </div>
-                    <span id="profileRebuildSettingsState" class="pill">--</span>
-                  </div>
-                  <div class="extract-grid">
-                    <label class="switch-label"><input id="profileRebuildEnabled" type="checkbox" /><span>启用画像重建</span></label>
-                    <label><span>重建间隔 秒</span><input id="profileRebuildInterval" type="number" min="3600" step="3600" /></label>
-                    <label><span>每群最多成员</span><input id="profileRebuildMaxPeople" type="number" min="5" max="500" step="5" /></label>
-                    <label><span>最低发言数</span><input id="profileRebuildMinMessages" type="number" min="1" max="50" step="1" /></label>
-                    <label class="switch-label"><input id="profileRebuildUseLlm" type="checkbox" /><span>使用大模型画像</span></label>
-                    <label><span>LLM 最低发言数</span><input id="profileRebuildLlmMinMessages" type="number" min="1" max="100" step="1" /></label>
-                    <label><span>限定会话</span><select id="profileRebuildChat"></select></label>
-                    <button id="rebuildProfilesSettingsBtn" class="btn primary" type="button">手动更新画像</button>
-                  </div>
-                  <div id="profileRebuildSettingsPanel" class="profile-rebuild-panel"></div>
-                </article>
                 <article class="card panel span-2"><div class="panel-head"><h3>群摘要管理</h3></div><div id="summaryPreview" class="memory-list"></div></article>
                 <article class="card panel"><div class="panel-head"><h3>人物画像管理</h3></div><div id="peoplePreview" class="memory-list"></div></article>
                 <article class="card panel"><div class="panel-head"><h3>长期事实管理</h3></div><div id="factPreview" class="memory-list"></div></article>
@@ -725,13 +767,12 @@
               </div>
               <div class="database-hero">
                 <div><span>当前群组</span><strong id="databaseScopeName">--</strong></div>
-                <div><span>核心数据库容量</span><strong id="databaseTotalSize">--</strong></div>
-                <div><span>全部运行数据容量</span><strong id="databaseRuntimeSize">--</strong></div>
+                <div><span>数据库总容量</span><strong id="databaseTotalSize">--</strong></div>
                 <div><span>导入状态</span><strong id="databaseImportState">等待操作</strong></div>
               </div>
             </article>
             <article class="card panel span-2">
-              <div class="panel-head compact-head"><h3>数据库类型与容量</h3><span class="muted">文件大小实时计算，当前群容量为估算</span></div>
+              <div class="panel-head compact-head"><h3>数据库类型与容量</h3><span class="muted">原始库 + AI 记忆库</span></div>
               <div id="databaseDbGrid" class="database-db-grid"></div>
             </article>
             <article class="card panel">
@@ -795,6 +836,27 @@
           </section>
         </section>
 
+        <section class="page" data-page="logs">
+          <section class="logs-console">
+            <article id="systemLogCard" class="card system-log-card">
+              <div class="system-log-head">
+                <div>
+                  <label>系统日志</label>
+                  <strong id="systemLogHeadline">等待日志</strong>
+                </div>
+                <span id="systemLogUpdated" class="pill">--</span>
+              </div>
+              <div id="systemLogStats" class="system-log-stats"></div>
+              <label class="system-log-search">
+                <span>搜索</span>
+                <input id="systemLogSearch" class="search-input" placeholder="搜索错误、群名、消息、来源文本" autocomplete="off" />
+              </label>
+              <div id="systemLogFilters" class="system-log-filters"></div>
+              <div id="systemLogList" class="system-log-list"></div>
+            </article>
+          </section>
+        </section>
+
         <section class="page" data-page="test">
           <section class="card panel test-panel">
             <div class="panel-head">
@@ -811,6 +873,6 @@
         </section>
       </section>
     </main>
-    <script src="/app.js?v=20260618-rank-tiers"></script>
+    <script src="/app.js"></script>
   </body>
 </html>

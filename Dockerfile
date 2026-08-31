@@ -5,6 +5,10 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 
+ENV WECHAT_CORE_URL=http://wechat-core:8080 \
+    WECHAT_AGENT_DB=/data/wechat-agent.sqlite \
+    WECHAT_AGENT_CONSUMER_ID=wechat-agent
+
 RUN apt-get update \
     && apt-get install -y --no-install-recommends fonts-noto-cjk fontconfig \
     && rm -rf /var/lib/apt/lists/*
@@ -16,3 +20,11 @@ COPY web ./web
 COPY ai ./ai
 COPY status ./status
 COPY agent_console ./agent_console
+COPY agent_service ./agent_service
+
+RUN mkdir -p /data
+
+VOLUME ["/data"]
+EXPOSE 8091
+
+CMD ["python", "-m", "agent_service.app", "--host", "0.0.0.0", "--port", "8091"]

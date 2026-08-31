@@ -315,7 +315,21 @@ def load_helper_module(name: str, path: Path):
 
 
 WEB_API = load_helper_module("memory_web_api", ROOT / "web/app.py")
-STATUS_API = load_helper_module("suite_status_api", ROOT / "status/app.py")
+try:
+    STATUS_API = load_helper_module("suite_status_api", ROOT / "status/app.py")
+except (ImportError, OSError) as exc:
+    # The Agent service reuses the model/vision helpers from this module on
+    # non-Linux development hosts. status/app.py talks to the Unix Docker
+    # socket and is unrelated to AI execution, so keep that optional here
+    # instead of duplicating request_llm/request_vision_llm in Agent.
+    _status_import_error = str(exc)
+
+    class _UnavailableStatusAPI:
+        @staticmethod
+        def api_status() -> dict:
+            return {"ok": False, "error": f"suite status unavailable: {_status_import_error}"}
+
+    STATUS_API = _UnavailableStatusAPI()
 
 
 def now_iso() -> str:

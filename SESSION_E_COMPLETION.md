@@ -174,11 +174,11 @@ Passed:
 ```text
 python -m unittest discover -s agent_service/tests -v
 
-Ran 8 tests in 3.610s
+Ran 9 tests
 OK
 ```
 
-Coverage includes account-scoped memory, duplicate indexing, safe Templates, Monitor idempotency, summary/image adapter calls, Scheduler persistence, real in-process `stack/mock-core/app.py` HTTP poll/ack, two-account ingest, MCP tool calls, Core text send, and actual HTTP `POST /mcp` plus SSE `GET /mcp`.
+Coverage includes account-scoped memory, duplicate indexing, safe Templates, Monitor idempotency, summary/image adapter calls, Scheduler persistence, real in-process `stack/mock-core/app.py` HTTP poll/ack, two-account ingest, MCP tool calls, Core text send, actual HTTP `POST /mcp` plus SSE `GET /mcp`, and headless LLM environment override/fallback behavior.
 
 ### Real upstream-derived AI function import
 
@@ -192,6 +192,13 @@ skills 4
 ```
 
 This confirms the production adapter can load the actual reused functions; no rewritten production model client is substituted.
+
+Post-integration review also made the reused legacy AI configuration suitable
+for unattended containers. `WECHAT_AGENT_LEGACY_RUNTIME_DIR` can place the old
+`config.json`/state files on the Agent data volume, and optional
+`WECHAT_AGENT_LLM_*` environment variables can supply base URL/model/API key
+and numeric request settings on a fresh headless deployment. Unset or invalid
+numeric overrides retain the audited legacy profile instead of replacing it.
 
 ## Not tested / environment limitations
 

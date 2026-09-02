@@ -7,7 +7,8 @@ WORKDIR /app
 
 ENV WECHAT_CORE_URL=http://wechat-core:8080 \
     WECHAT_AGENT_DB=/data/wechat-agent.sqlite \
-    WECHAT_AGENT_CONSUMER_ID=wechat-agent
+    WECHAT_AGENT_CONSUMER_ID=wechat-agent \
+    WECHAT_AGENT_LEGACY_RUNTIME_DIR=/data/legacy-agent-console
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends fonts-noto-cjk fontconfig \

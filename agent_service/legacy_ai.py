@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import mimetypes
+import os
 import sys
 import tempfile
 import threading
@@ -17,6 +18,37 @@ LEGACY_CONSOLE_APP = ROOT / "agent_console" / "app.py"
 
 _MODULE = None
 _MODULE_LOCK = threading.Lock()
+
+
+def apply_llm_env(profile: dict[str, Any]) -> dict[str, Any]:
+    """Apply optional headless deployment overrides to a legacy model profile."""
+    output = dict(profile)
+    text_overrides = {
+        "WECHAT_AGENT_LLM_BASE_URL": "base_url",
+        "WECHAT_AGENT_LLM_MODEL": "model",
+        "WECHAT_AGENT_LLM_API_KEY": "api_key",
+    }
+    for env_name, key in text_overrides.items():
+        value = os.environ.get(env_name, "").strip()
+        if value:
+            output[key] = value
+
+    numeric_overrides = {
+        "WECHAT_AGENT_LLM_TEMPERATURE": ("temperature", float),
+        "WECHAT_AGENT_LLM_MAX_TOKENS": ("max_tokens", int),
+        "WECHAT_AGENT_LLM_TIMEOUT_SECONDS": ("timeout_seconds", int),
+    }
+    for env_name, (key, parser) in numeric_overrides.items():
+        value = os.environ.get(env_name, "").strip()
+        if not value:
+            continue
+        try:
+            output[key] = parser(value)
+        except ValueError:
+            # A malformed deployment override must not destroy a working
+            # persistent legacy profile.
+            continue
+    return output
 
 
 def _frontmatter(text: str) -> dict[str, str]:
@@ -104,7 +136,7 @@ class LegacyAIAdapter:
             return {"ok": False, "error": "no messages to summarize"}
         legacy = load_legacy_console()
         config = legacy.read_config()
-        profile = {**legacy.active_profile(config)}
+        profile = apply_llm_env({**legacy.active_profile(config)})
         profile["max_tokens"] = max(int(profile.get("max_tokens") or 512), 900)
         profile["temperature"] = min(float(profile.get("temperature") or 0.4), 0.45)
         transcript = []
@@ -141,9 +173,9 @@ class LegacyAIAdapter:
         skills = config.get("skills") if isinstance(config.get("skills"), dict) else {}
         settings = skills.get("image_understanding") if isinstance(skills.get("image_understanding"), dict) else {}
         if hasattr(legacy, "image_skill_profile"):
-            profile = legacy.image_skill_profile(config, settings)
+            profile = apply_llm_env(legacy.image_skill_profile(config, settings))
         else:
-            profile = {**legacy.active_profile(config)}
+            profile = apply_llm_env({**legacy.active_profile(config)})
         suffix = Path(filename or "image.jpg").suffix
         if not suffix:
             mime = str((message or {}).get("mime_type") or "")

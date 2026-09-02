@@ -109,6 +109,27 @@ WECHAT_AGENT_DB=runtime/agent-service/agent.sqlite \
 python -m agent_service.app --host 127.0.0.1 --port 8091
 ```
 
+The reused upstream LLM/vision configuration remains compatible with the old
+Console format.  Set `WECHAT_AGENT_LEGACY_RUNTIME_DIR` to move that state to a
+persistent location; the Agent Docker image defaults it to
+`/data/legacy-agent-console`, so `/data` persistence now covers both the new
+Agent database and the reused AI `config.json`/state files.
+
+For a headless first deployment, the adapter also accepts optional environment
+overrides without replacing the legacy config file:
+
+```text
+WECHAT_AGENT_LLM_BASE_URL
+WECHAT_AGENT_LLM_MODEL
+WECHAT_AGENT_LLM_API_KEY
+WECHAT_AGENT_LLM_TEMPERATURE
+WECHAT_AGENT_LLM_MAX_TOKENS
+WECHAT_AGENT_LLM_TIMEOUT_SECONDS
+```
+
+Unset variables leave the audited legacy profile unchanged. Keep API keys in
+the deployment environment or an ignored `.env`, not in source control.
+
 Useful endpoints:
 
 ```text

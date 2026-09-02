@@ -45,7 +45,9 @@ from ai_memory_core import search_chunks
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 BUILTIN_SKILLS_DIR = Path(__file__).resolve().parent / "builtin_skills"
-RUNTIME_DIR = ROOT / "runtime/agent-console"
+RUNTIME_DIR = Path(
+    os.environ.get("WECHAT_AGENT_LEGACY_RUNTIME_DIR", str(ROOT / "runtime/agent-console"))
+).expanduser()
 CONFIG_FILE = RUNTIME_DIR / "config.json"
 STATUS_FILE = RUNTIME_DIR / "status.json"
 SEMANTIC_STATE_FILE = RUNTIME_DIR / "semantic_extract_state.json"

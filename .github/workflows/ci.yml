@@ -14,8 +14,8 @@ jobs:
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
 
-      - name: Run agent tests
-        run: python3 -m unittest discover -s agent_service/tests -p 'test_*.py' -v
+      - name: Run agent unit tests (mock-core integration tests run in stack CI)
+        run: python3 -m unittest agent_service.tests.test_legacy_ai_env agent_service.tests.test_memory_monitor_scheduler -v
 
       - name: Compile-check all Python packages
         run: |

@@ -4,6 +4,7 @@ services:
     platform: ${WECHAT_SELKIES_PLATFORM:-}
     container_name: wechat-selkies
     restart: unless-stopped
+    pids_limit: 200
     cap_add:
       - SYS_PTRACE
     security_opt:
@@ -31,6 +32,7 @@ services:
     image: ${WECHAT_AGENT_IMAGE:-docker.io/xiaoguiwucan/linux-wechat-agent:latest}
     container_name: wechat-memory-sync
     restart: unless-stopped
+    pids_limit: 100
     depends_on:
       - wechat-selkies
     volumes:
@@ -66,6 +68,7 @@ services:
     image: ${WECHAT_AGENT_IMAGE:-docker.io/xiaoguiwucan/linux-wechat-agent:latest}
     container_name: wechat-ai-memory
     restart: unless-stopped
+    pids_limit: 100
     depends_on:
       - wechat-memory-sync
     ports:
@@ -94,6 +97,7 @@ services:
     image: ${WECHAT_AGENT_IMAGE:-docker.io/xiaoguiwucan/linux-wechat-agent:latest}
     container_name: wechat-agent-console
     restart: unless-stopped
+    pids_limit: 100
     depends_on:
       - wechat-ai-memory
     ports:

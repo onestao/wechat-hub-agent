@@ -15,14 +15,16 @@ from agent_service.service import AgentService, AgentSettings
 from agent_service.tests.helpers import FakeAI
 
 
+LOCAL_MOCK_APP = Path(__file__).resolve().parent / "mock_core.py"
 PROJECT_ROOT = Path(__file__).resolve().parents[4]
+STACK_MOCK_APP = PROJECT_ROOT / "stack" / "mock-core" / "app.py"
+MOCK_APP = LOCAL_MOCK_APP if LOCAL_MOCK_APP.is_file() else STACK_MOCK_APP
 
 
 def load_mock_core_module():
-    path = PROJECT_ROOT / "stack" / "mock-core" / "app.py"
-    spec = importlib.util.spec_from_file_location("wechat_hub_mock_core_for_agent_tests", path)
+    spec = importlib.util.spec_from_file_location("wechat_hub_mock_core_for_agent_tests", MOCK_APP)
     if spec is None or spec.loader is None:
-        raise RuntimeError(f"cannot load Mock Core: {path}")
+        raise RuntimeError(f"cannot load Mock Core: {MOCK_APP}")
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module

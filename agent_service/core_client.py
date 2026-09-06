@@ -164,6 +164,7 @@ class CoreClient:
         *,
         target_message_id: str = "",
         mention_member_ids: list[str] | None = None,
+        expected_wechat_identity_uuid: str = "",
         client_request_id: str = "",
         idempotency_key: str = "",
     ) -> dict[str, Any]:
@@ -172,6 +173,10 @@ class CoreClient:
             payload["target_message_id"] = target_message_id
         if mention_member_ids:
             payload["mention_member_ids"] = list(mention_member_ids)
+        # Identity v2 send gate: Core rejects the send with 409 when this
+        # intent disagrees with the slot's currently bound identity.
+        if expected_wechat_identity_uuid:
+            payload["expected_wechat_identity_uuid"] = str(expected_wechat_identity_uuid)
         if client_request_id:
             payload["client_request_id"] = client_request_id
         headers = {"Idempotency-Key": idempotency_key} if idempotency_key else None

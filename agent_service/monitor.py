@@ -14,6 +14,11 @@ def event_message(event: dict[str, Any]) -> dict[str, Any]:
     return message
 
 
+class IdentityBlocked(RuntimeError):
+    """Raised when a monitor must not execute for identity-safety reasons."""
+
+
+
 def monitor_matches(monitor: dict[str, Any], event: dict[str, Any]) -> bool:
     if not monitor.get("enabled"):
         return False
@@ -46,7 +51,20 @@ class MonitorEngine:
         self.memory = memory
         self.ai = ai
 
-    def process_event(self, event: dict[str, Any]) -> list[dict[str, Any]]:
+    def identity_view(self) -> dict[str, dict[str, Any]]:
+        """Current identity state per account, straight from Core.
+
+        Propagates Core failures so callers can redeliver instead of recording
+        a permanent fail-closed block for a transient outage.
+        """
+        accounts = self.core.list_accounts()
+        return {str(row.get("account_id") or ""): row for row in accounts if isinstance(row, dict)}
+
+    def process_event(
+        self,
+        event: dict[str, Any],
+        identity_view: dict[str, dict[str, Any]] | None = None,
+    ) -> list[dict[str, Any]]:
         results: list[dict[str, Any]] = []
         event_id = str(event.get("event_id") or "")
         for monitor in self.storage.list_monitors(enabled_only=True):
@@ -55,17 +73,78 @@ class MonitorEngine:
             action_key = f"{monitor['monitor_id']}:{event_id}:{monitor.get('action') or 'record'}"
             if self.storage.monitor_action_done(action_key):
                 continue
+            message = event_message(event)
+            account_id = str(message.get("account_id") or event.get("account_id") or "")
             try:
-                result = self._run_action(monitor, event)
+                identity, bound_identity = self._resolve_identity(
+                    monitor, account_id, identity_view=identity_view
+                )
+            except IdentityBlocked as exc:
+                # Identity v2 F7: mismatch/unresolved/scope problems are
+                # recorded as a failed run so the block state stays visible.
                 run = self.storage.record_monitor_run(
-                    monitor["monitor_id"], event_id, action_key, "success", result=result
+                    monitor["monitor_id"],
+                    event_id,
+                    action_key,
+                    "failed",
+                    error=str(exc),
+                    identity={"account_id": account_id, "instance_uuid": "", "wechat_identity_uuid": ""},
+                )
+                results.append(run)
+                continue
+            try:
+                result = self._run_action(monitor, event, identity)
+                run = self.storage.record_monitor_run(
+                    monitor["monitor_id"], event_id, action_key, "success", result=result, identity=identity
                 )
             except Exception as exc:  # persist action failure; event processing itself remains durable
                 run = self.storage.record_monitor_run(
-                    monitor["monitor_id"], event_id, action_key, "failed", error=str(exc)
+                    monitor["monitor_id"], event_id, action_key, "failed", error=str(exc), identity=identity
                 )
             results.append(run)
         return results
+
+    def _resolve_identity(
+        self,
+        monitor: dict[str, Any],
+        account_id: str,
+        *,
+        identity_view: dict[str, dict[str, Any]] | None,
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        """Fail-closed identity resolution for one monitor execution.
+
+        Returns (run-log identity stamp, bound identity used for execution).
+        Raises IdentityBlocked when the rule must not execute.
+        """
+        empty = {"account_id": account_id, "instance_uuid": "", "wechat_identity_uuid": ""}
+        if not str(monitor.get("account_id") or "").strip():
+            raise IdentityBlocked("execution blocked: monitor has no explicit account scope")
+        if identity_view is None:
+            identity_view = self.identity_view()
+        account = identity_view.get(account_id)
+        if not account:
+            raise IdentityBlocked(
+                f"execution blocked: account {account_id!r} has no resolvable identity binding (unresolved)"
+            )
+        state = str(account.get("identity_binding_state") or "")
+        instance_uuid = str(account.get("instance_uuid") or "")
+        bound_uuid = str(account.get("wechat_identity_uuid") or "")
+        if state != "bound" or not bound_uuid:
+            raise IdentityBlocked(
+                f"execution blocked: identity binding state is {state!r}; rules only run while bound"
+            )
+        expected = str(monitor.get("expected_wechat_identity_uuid") or "").strip()
+        if expected and expected != bound_uuid:
+            raise IdentityBlocked(
+                "execution blocked: identity binding changed since the rule was created "
+                f"(expected {expected!r}, currently bound {bound_uuid!r})"
+            )
+        identity = {
+            "account_id": account_id,
+            "instance_uuid": instance_uuid,
+            "wechat_identity_uuid": bound_uuid,
+        }
+        return identity, identity
 
     def _context(self, monitor: dict[str, Any], event: dict[str, Any]) -> dict[str, Any]:
         message = event_message(event)
@@ -93,7 +172,7 @@ class MonitorEngine:
             return render_template(str(template.get("body") or ""), context)
         return render_template(str(config.get("text") or config.get("body") or default), context)
 
-    def _run_action(self, monitor: dict[str, Any], event: dict[str, Any]) -> dict[str, Any]:
+    def _run_action(self, monitor: dict[str, Any], event: dict[str, Any], identity: dict[str, Any]) -> dict[str, Any]:
         action = str(monitor.get("action") or "record")
         context = self._context(monitor, event)
         message = context["message"]
@@ -128,6 +207,7 @@ class MonitorEngine:
                 context["chat_id"],
                 text,
                 target_message_id=str(config.get("reply_to_source") and message.get("message_id") or ""),
+                expected_wechat_identity_uuid=str(identity.get("wechat_identity_uuid") or ""),
                 idempotency_key=f"agent-monitor:{monitor['monitor_id']}:{event.get('event_id')}",
                 client_request_id=f"monitor:{monitor['monitor_id']}:{event.get('event_id')}",
             )

@@ -5,6 +5,7 @@ import json
 import tempfile
 import threading
 import unittest
+import urllib.error
 from pathlib import Path
 from urllib.request import Request, urlopen
 
@@ -127,6 +128,88 @@ class MockCoreMcpIntegrationTests(unittest.TestCase):
         )
         self.assertFalse(sent["result"]["isError"])
         self.assertEqual(len(self.core_state.sends), 1)
+
+    def test_http_crud_and_run_status_endpoints(self):
+        agent_server = create_agent_server("127.0.0.1", 0, self.service)
+        thread = threading.Thread(target=agent_server.serve_forever, daemon=True)
+        thread.start()
+        base = f"http://127.0.0.1:{agent_server.server_port}"
+
+        def request(path: str, method: str = "GET", payload: dict | None = None):
+            data = json.dumps(payload).encode("utf-8") if payload is not None else None
+            headers = {"Content-Type": "application/json"} if data else {}
+            req = Request(base + path, data=data, headers=headers, method=method)
+            try:
+                with urlopen(req, timeout=5) as response:
+                    return response.status, json.loads(response.read().decode("utf-8"))
+            except urllib.error.HTTPError as exc:
+                return exc.code, json.loads(exc.read().decode("utf-8") or "{}")
+
+        try:
+            status, created = request(
+                "/api/monitors",
+                method="POST",
+                payload={
+                    "monitor_id": "http-watch",
+                    "name": "HTTP watcher",
+                    "account_id": "account-alpha",
+                    "contains_text": "Hello",
+                    "action": "record",
+                },
+            )
+            self.assertEqual(status, 200)
+            self.assertEqual(created["monitor_id"], "http-watch")
+            self.assertEqual(created["account_id"], "account-alpha")
+
+            status, detail = request("/api/monitors/http-watch")
+            self.assertEqual(status, 200)
+            self.assertEqual(detail["monitor"]["monitor_id"], "http-watch")
+
+            status, rejected = request("/api/monitors", method="POST", payload={"name": "no scope"})
+            self.assertEqual(status, 400)
+            self.assertIn("account_id", str(rejected.get("error")))
+
+            self.service.process_events_once()
+            status, runs = request("/api/monitors/http-watch/runs")
+            self.assertEqual(status, 200)
+            self.assertEqual(runs["monitor"]["monitor_id"], "http-watch")
+            self.assertEqual(len(runs["runs"]), 1)
+            self.assertEqual(runs["runs"][0]["status"], "success")
+            self.assertEqual(runs["runs"][0]["result"]["identity"]["account_id"], "account-alpha")
+
+            status, schedule = request(
+                "/api/schedules",
+                method="POST",
+                payload={
+                    "schedule_id": "http-daily",
+                    "name": "HTTP daily note",
+                    "task_type": "record",
+                    "account_id": "account-alpha",
+                    "payload": {"body": "note"},
+                    "next_run_at": "2099-01-01T00:00:00+00:00",
+                },
+            )
+            self.assertEqual(status, 200)
+            self.assertEqual(schedule["schedule_id"], "http-daily")
+            status, runs = request("/api/schedules/http-daily/runs")
+            self.assertEqual(status, 200)
+            self.assertEqual(runs["schedule"]["schedule_id"], "http-daily")
+            self.assertEqual(runs["runs"], [])
+
+            status, deleted = request("/api/monitors/http-watch", method="DELETE")
+            self.assertEqual(status, 200)
+            self.assertTrue(deleted["ok"])
+            status, _ = request("/api/monitors/http-watch")
+            self.assertEqual(status, 404)
+
+            status, deleted = request("/api/schedules/http-daily", method="DELETE")
+            self.assertEqual(status, 200)
+            status, _ = request("/api/schedules/http-daily/runs")
+            self.assertEqual(status, 404)
+        finally:
+            agent_server.shutdown()
+            agent_server.server_close()
+            thread.join(timeout=2)
 
     def test_streamable_http_mcp_post_and_sse_get(self):
         agent_server = create_agent_server("127.0.0.1", 0, self.service)

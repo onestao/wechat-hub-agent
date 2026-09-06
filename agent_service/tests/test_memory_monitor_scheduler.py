@@ -70,6 +70,7 @@ class MemoryMonitorSchedulerTests(unittest.TestCase):
             {
                 "monitor_id": "deploy-record",
                 "name": "deployment watcher",
+                "account_id": "account-a",
                 "contains_text": "部署",
                 "action": "record",
                 "action_config": {"title": "部署提醒", "text": "{{message.author.display_name}}: {{message.text}}"},
@@ -90,6 +91,8 @@ class MemoryMonitorSchedulerTests(unittest.TestCase):
             {
                 "monitor_id": "deploy-reply",
                 "name": "deployment reply",
+                "account_id": "account-a",
+                "expected_wechat_identity_uuid": "identity-a-uuid",
                 "contains_text": "部署",
                 "action": "send_text",
                 "action_config": {"text": "收到 {{message.message_id}}", "reply_to_source": True},
@@ -101,6 +104,7 @@ class MemoryMonitorSchedulerTests(unittest.TestCase):
         self.assertEqual(second_send, [])
         self.assertEqual(len(self.core.sends), 1)
         self.assertEqual(self.core.sends[0]["target_message_id"], "msg-2")
+        self.assertEqual(self.core.sends[0]["expected_wechat_identity_uuid"], "identity-a-uuid")
         self.assertTrue(self.core.sends[0]["idempotency_key"].startswith("agent-monitor:"))
 
     def test_summary_and_image_actions_use_ai_adapter(self):
@@ -110,6 +114,7 @@ class MemoryMonitorSchedulerTests(unittest.TestCase):
             {
                 "monitor_id": "summary",
                 "name": "summary",
+                "account_id": "account-a",
                 "contains_text": "部署",
                 "action": "summary",
             }
@@ -144,6 +149,7 @@ class MemoryMonitorSchedulerTests(unittest.TestCase):
             {
                 "monitor_id": "vision",
                 "name": "vision",
+                "account_id": "account-a",
                 "message_type": "image",
                 "action": "image_understanding",
             }

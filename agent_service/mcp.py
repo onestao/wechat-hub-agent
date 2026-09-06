@@ -223,7 +223,7 @@ class MCPServer:
         )
         self._register(
             "monitors_upsert",
-            "Create/update an event monitor. Actions: record, send_text, summary, image_understanding.",
+            "Create/update an event monitor. Actions: record, send_text, summary, image_understanding. account_id is required; send_text also requires expected_wechat_identity_uuid.",
             {
                 "type": "object",
                 "additionalProperties": True,
@@ -251,7 +251,7 @@ class MCPServer:
         )
         self._register(
             "scheduler_upsert",
-            "Create/update a recurring Agent job. Minimum interval is 60 seconds.",
+            "Create/update a recurring Agent job. Minimum interval is 60 seconds. send_text requires account_id, chat_id and expected_wechat_identity_uuid; the live binding is re-validated before every run.",
             {
                 "type": "object",
                 "additionalProperties": True,

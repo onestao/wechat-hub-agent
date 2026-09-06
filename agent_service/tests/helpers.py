@@ -24,9 +24,22 @@ class FakeCore:
     def __init__(self):
         self.sends = []
         self.media = b"fake-image"
+        # Identity v2 account projection; tests mutate these rows to simulate
+        # binding changes and verify fail-closed behaviour.
+        self.accounts = [
+            {
+                "account_id": "account-a",
+                "instance_uuid": "instance-a-uuid",
+                "wechat_identity_uuid": "identity-a-uuid",
+                "identity_binding_state": "bound",
+            }
+        ]
 
     def ensure_contract(self, expected_major: int = 1):
         return {"ok": True, "service": "fake-core", "contract_version": expected_major}
+
+    def list_accounts(self):
+        return [dict(row) for row in self.accounts]
 
     def send_text(self, account_id: str, chat_id: str, text: str, **kwargs):
         item = {"account_id": account_id, "chat_id": chat_id, "text": text, **kwargs}

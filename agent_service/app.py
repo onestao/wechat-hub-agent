@@ -95,11 +95,57 @@ class AgentHandler(BaseHTTPRequestHandler):
             if path == "/api/monitors":
                 self._send_json(200, {"monitors": self.service.storage.list_monitors()})
                 return
+            monitors_prefix = "/api/monitors/"
+            if path.startswith(monitors_prefix):
+                suffix = unquote(path[len(monitors_prefix) :])
+                if suffix.endswith("/runs"):
+                    monitor_id = suffix[: -len("/runs")]
+                    monitor = self.service.storage.get_monitor(monitor_id)
+                    if not monitor:
+                        self._send_json(404, {"ok": False, "error": "monitor not found"})
+                        return
+                    self._send_json(
+                        200,
+                        {
+                            "monitor": monitor,
+                            "runs": self.service.storage.list_monitor_runs(monitor_id),
+                        },
+                    )
+                    return
+                monitor = self.service.storage.get_monitor(suffix)
+                if not monitor:
+                    self._send_json(404, {"ok": False, "error": "monitor not found"})
+                    return
+                self._send_json(200, {"monitor": monitor})
+                return
             if path == "/api/templates":
                 self._send_json(200, {"templates": self.service.storage.list_templates()})
                 return
             if path == "/api/schedules":
                 self._send_json(200, {"schedules": self.service.storage.list_schedules()})
+                return
+            schedules_prefix = "/api/schedules/"
+            if path.startswith(schedules_prefix):
+                suffix = unquote(path[len(schedules_prefix) :])
+                if suffix.endswith("/runs"):
+                    schedule_id = suffix[: -len("/runs")]
+                    schedule = self.service.storage.get_schedule(schedule_id)
+                    if not schedule:
+                        self._send_json(404, {"ok": False, "error": "schedule not found"})
+                        return
+                    self._send_json(
+                        200,
+                        {
+                            "schedule": schedule,
+                            "runs": self.service.storage.list_scheduler_runs(schedule_id),
+                        },
+                    )
+                    return
+                schedule = self.service.storage.get_schedule(suffix)
+                if not schedule:
+                    self._send_json(404, {"ok": False, "error": "schedule not found"})
+                    return
+                self._send_json(200, {"schedule": schedule})
                 return
             if path == "/api/memory/search":
                 self._send_json(
@@ -204,6 +250,30 @@ class AgentHandler(BaseHTTPRequestHandler):
                 self._send_json(200, {"ok": True, "record_id": record_id})
             else:
                 self._send_json(404, {"ok": False, "error": "record not found"})
+            return
+        monitors_prefix = "/api/monitors/"
+        if path.startswith(monitors_prefix):
+            monitor_id = unquote(path[len(monitors_prefix) :])
+            if monitor_id and "/" not in monitor_id and self.service.storage.delete_monitor(monitor_id):
+                self._send_json(200, {"ok": True, "monitor_id": monitor_id})
+            else:
+                self._send_json(404, {"ok": False, "error": "monitor not found"})
+            return
+        schedules_prefix = "/api/schedules/"
+        if path.startswith(schedules_prefix):
+            schedule_id = unquote(path[len(schedules_prefix) :])
+            if schedule_id and "/" not in schedule_id and self.service.storage.delete_schedule(schedule_id):
+                self._send_json(200, {"ok": True, "schedule_id": schedule_id})
+            else:
+                self._send_json(404, {"ok": False, "error": "schedule not found"})
+            return
+        templates_prefix = "/api/templates/"
+        if path.startswith(templates_prefix):
+            template_id = unquote(path[len(templates_prefix) :])
+            if template_id and "/" not in template_id and self.service.storage.delete_template(template_id):
+                self._send_json(200, {"ok": True, "template_id": template_id})
+            else:
+                self._send_json(404, {"ok": False, "error": "template not found"})
             return
         self._send_json(404, {"ok": False, "error": "not found"})
 

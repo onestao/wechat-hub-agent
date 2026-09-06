@@ -22,6 +22,10 @@ def parse_time(value: str) -> datetime:
     return parsed.astimezone(timezone.utc)
 
 
+class ScheduleIdentityBlocked(RuntimeError):
+    """Raised when a schedule must not execute for identity-safety reasons (F6)."""
+
+
 class SchedulerEngine:
     def __init__(
         self,
@@ -34,6 +38,63 @@ class SchedulerEngine:
         self.core = core
         self.memory = memory
         self.ai = ai
+
+    def resolve_identity(self, schedule: dict[str, Any]) -> dict[str, Any]:
+        """Re-validate the live identity binding before every execution.
+
+        The schedule pins ``instance_uuid`` + ``expected_wechat_identity_uuid``
+        at creation time.  Before each run (and therefore on every retry) the
+        binding is re-checked against Core; any drift fails closed so a job can
+        never silently send from a different WeChat identity.
+        """
+        account_id = str(schedule.get("account_id") or "")
+        expected = str(schedule.get("expected_wechat_identity_uuid") or "").strip()
+        expected_instance = str(schedule.get("instance_uuid") or "").strip()
+        try:
+            accounts = self.core.list_accounts()
+        except Exception as exc:
+            raise ScheduleIdentityBlocked(
+                f"execution blocked: identity binding could not be resolved ({exc})"
+            ) from exc
+        account = next(
+            (row for row in accounts if str(row.get("account_id") or "") == account_id), None
+        )
+        if expected:
+            if account is None:
+                raise ScheduleIdentityBlocked(
+                    f"execution blocked: account {account_id!r} no longer exists in Core"
+                )
+            state = str(account.get("identity_binding_state") or "")
+            bound = str(account.get("wechat_identity_uuid") or "").strip()
+            instance_uuid = str(account.get("instance_uuid") or "").strip()
+            if state != "bound" or not bound:
+                raise ScheduleIdentityBlocked(
+                    f"execution blocked: identity binding state is {state!r}; sending is blocked"
+                )
+            if expected_instance and instance_uuid and expected_instance != instance_uuid:
+                raise ScheduleIdentityBlocked(
+                    "execution blocked: runtime instance changed since the schedule was created "
+                    f"(expected {expected_instance!r}, current {instance_uuid!r})"
+                )
+            if bound != expected:
+                raise ScheduleIdentityBlocked(
+                    "execution blocked: identity binding changed since the schedule was created "
+                    f"(expected {expected!r}, currently bound {bound!r})"
+                )
+            return {
+                "account_id": account_id,
+                "instance_uuid": instance_uuid,
+                "wechat_identity_uuid": bound,
+            }
+        # Non-send tasks carry no identity risk; stamp the binding when it is
+        # resolvable so execution logs stay attributable.
+        if account:
+            return {
+                "account_id": account_id,
+                "instance_uuid": str(account.get("instance_uuid") or ""),
+                "wechat_identity_uuid": str(account.get("wechat_identity_uuid") or ""),
+            }
+        return {"account_id": account_id, "instance_uuid": "", "wechat_identity_uuid": ""}
 
     def run_due(self, *, limit: int = 50) -> list[dict[str, Any]]:
         results = []
@@ -77,6 +138,7 @@ class SchedulerEngine:
             text = render_template(text, context)
 
         if task_type == "record":
+            identity = self.resolve_identity(schedule)
             record = self.storage.create_record(
                 {
                     "account_id": schedule.get("account_id") or "",
@@ -88,25 +150,30 @@ class SchedulerEngine:
                     "data": {"schedule_id": schedule["schedule_id"], "due_at": due_at, "payload": payload},
                 }
             )
-            return {"task_type": task_type, "record": record}
+            return {"task_type": task_type, "record": record, "identity": identity}
 
         if task_type == "send_text":
             if not schedule.get("account_id") or not schedule.get("chat_id"):
                 raise RuntimeError("send_text schedule requires account_id and chat_id")
             if not text.strip():
                 raise RuntimeError("send_text schedule rendered empty text")
+            # F6: re-validate the live binding, then hand the expected identity
+            # to Core so the authoritative send gate double-checks it.
+            identity = self.resolve_identity(schedule)
             receipt = self.core.send_text(
                 str(schedule["account_id"]),
                 str(schedule["chat_id"]),
                 text,
+                expected_wechat_identity_uuid=str(identity.get("wechat_identity_uuid") or ""),
                 idempotency_key=f"agent-schedule:{schedule['schedule_id']}:{due_at}",
                 client_request_id=f"schedule:{schedule['schedule_id']}:{due_at}",
             )
-            return {"task_type": task_type, "receipt": receipt}
+            return {"task_type": task_type, "receipt": receipt, "identity": identity}
 
         if task_type == "summary":
             if not schedule.get("account_id") or not schedule.get("chat_id"):
                 raise RuntimeError("summary schedule requires account_id and chat_id")
+            identity = self.resolve_identity(schedule)
             recent = self.memory.recent(
                 str(schedule["account_id"]),
                 str(schedule["chat_id"]),
@@ -131,7 +198,7 @@ class SchedulerEngine:
                     "data": {"schedule_id": schedule["schedule_id"], "due_at": due_at, "llm": llm},
                 }
             )
-            return {"task_type": task_type, "record": record, "llm": llm}
+            return {"task_type": task_type, "record": record, "llm": llm, "identity": identity}
 
         raise RuntimeError(f"unsupported schedule task_type: {task_type}")
 

@@ -130,6 +130,7 @@ class AgentService:
             monitor_runs = 0
             ack_ids: list[str] = []
             last_cursor = cursor
+            identity_view: dict[str, dict[str, Any]] | None = None
             details: list[dict[str, Any]] = []
             for raw_event in events:
                 event = raw_event if isinstance(raw_event, dict) else {}
@@ -154,7 +155,11 @@ class AgentService:
                     memory_result = self.memory.ingest_message(event, message)
                     if memory_result.get("changed"):
                         indexed += 1
-                action_runs = self.monitor.process_event(event)
+                # Identity view is resolved once per batch (F7); execution
+                # failures inside monitors still record fail-closed runs.
+                if identity_view is None:
+                    identity_view = self.monitor.identity_view()
+                action_runs = self.monitor.process_event(event, identity_view=identity_view)
                 monitor_runs += len(action_runs)
                 self.storage.store_event(event)
                 # Cursor is advanced only after local durable processing for this

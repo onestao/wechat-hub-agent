@@ -117,6 +117,7 @@ class AgentStorage:
                     contains_text TEXT NOT NULL DEFAULT '',
                     action TEXT NOT NULL DEFAULT 'record',
                     action_config_json TEXT NOT NULL DEFAULT '{}',
+                    expected_wechat_identity_uuid TEXT NOT NULL DEFAULT '',
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
                 );
@@ -149,6 +150,8 @@ class AgentStorage:
                     interval_seconds INTEGER NOT NULL DEFAULT 3600,
                     next_run_at TEXT NOT NULL,
                     last_run_at TEXT NOT NULL DEFAULT '',
+                    instance_uuid TEXT NOT NULL DEFAULT '',
+                    expected_wechat_identity_uuid TEXT NOT NULL DEFAULT '',
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
                 );
@@ -166,7 +169,24 @@ class AgentStorage:
                 );
                 """
             )
+            self._additive_identity_columns(conn)
             self._ensure_default_templates(conn)
+
+    @staticmethod
+    def _additive_identity_columns(conn: sqlite3.Connection) -> None:
+        """Identity v2 (F6/F7) columns, added additively for existing databases.
+
+        Legacy rows keep '' meaning "no identity binding recorded"; execution
+        paths treat that as fail-closed instead of guessing an identity.
+        """
+        for table, column in (
+            ("monitors", "expected_wechat_identity_uuid"),
+            ("schedules", "instance_uuid"),
+            ("schedules", "expected_wechat_identity_uuid"),
+        ):
+            columns = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+            if column not in columns:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} TEXT NOT NULL DEFAULT ''")
 
     def _ensure_default_templates(self, conn: sqlite3.Connection) -> None:
         now = utc_now_iso()
@@ -362,7 +382,22 @@ class AgentStorage:
         item["action_config"] = json_loads(item.pop("action_config_json", "{}"), {})
         return item
 
+    @staticmethod
+    def _validate_monitor(payload: dict[str, Any]) -> None:
+        # Identity v2 F7: a rule must state its scope explicitly. An empty
+        # account scope would match every WeChat identity and is refused.
+        if not str(payload.get("account_id") or "").strip():
+            raise ValueError("monitor account_id is required: rules must be scoped to one WeChat slot")
+        if str(payload.get("action") or "record") == "send_text":
+            # F7: an auto-reply must never silently answer from a different
+            # identity, so the expected identity is part of the rule itself.
+            if not str(payload.get("expected_wechat_identity_uuid") or "").strip():
+                raise ValueError(
+                    "send_text monitor requires expected_wechat_identity_uuid bound to the scoped account"
+                )
+
     def upsert_monitor(self, payload: dict[str, Any]) -> dict[str, Any]:
+        self._validate_monitor(payload)
         monitor_id = str(payload.get("monitor_id") or f"mon-{uuid.uuid4().hex}")
         now = utc_now_iso()
         with self._lock, self.connect() as conn:
@@ -370,13 +405,15 @@ class AgentStorage:
                 """
                 INSERT INTO monitors (
                     monitor_id, name, enabled, event_type, account_id, chat_id,
-                    message_type, contains_text, action, action_config_json, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    message_type, contains_text, action, action_config_json,
+                    expected_wechat_identity_uuid, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(monitor_id) DO UPDATE SET
                     name=excluded.name, enabled=excluded.enabled, event_type=excluded.event_type,
                     account_id=excluded.account_id, chat_id=excluded.chat_id,
                     message_type=excluded.message_type, contains_text=excluded.contains_text,
                     action=excluded.action, action_config_json=excluded.action_config_json,
+                    expected_wechat_identity_uuid=excluded.expected_wechat_identity_uuid,
                     updated_at=excluded.updated_at
                 """,
                 (
@@ -390,6 +427,7 @@ class AgentStorage:
                     str(payload.get("contains_text") or ""),
                     str(payload.get("action") or "record"),
                     json_dumps(payload.get("action_config") or {}),
+                    str(payload.get("expected_wechat_identity_uuid") or ""),
                     now,
                     now,
                 ),
@@ -398,6 +436,16 @@ class AgentStorage:
         result = self._monitor_row(row)
         assert result is not None
         return result
+
+    def get_monitor(self, monitor_id: str) -> dict[str, Any] | None:
+        with self._lock, self.connect() as conn:
+            row = conn.execute("SELECT * FROM monitors WHERE monitor_id=?", (monitor_id,)).fetchone()
+        return self._monitor_row(row)
+
+    def delete_monitor(self, monitor_id: str) -> bool:
+        with self._lock, self.connect() as conn:
+            cursor = conn.execute("DELETE FROM monitors WHERE monitor_id=?", (monitor_id,))
+            return cursor.rowcount > 0
 
     def list_monitors(self, *, enabled_only: bool = False) -> list[dict[str, Any]]:
         where = " WHERE enabled=1" if enabled_only else ""
@@ -419,9 +467,15 @@ class AgentStorage:
         *,
         result: Any = None,
         error: str = "",
+        identity: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         run_id = f"mrun-{uuid.uuid4().hex}"
         now = utc_now_iso()
+        # F7: every execution log must be able to answer "which WeChat identity
+        # and slot produced this action".
+        merged_result: dict[str, Any] = dict(result or {})
+        if identity is not None:
+            merged_result["identity"] = dict(identity)
         with self._lock, self.connect() as conn:
             conn.execute(
                 """
@@ -429,12 +483,30 @@ class AgentStorage:
                     (run_id, monitor_id, event_id, action_key, status, result_json, error, created_at)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (run_id, monitor_id, event_id, action_key, status, json_dumps(result or {}), error, now),
+                (run_id, monitor_id, event_id, action_key, status, json_dumps(merged_result), error, now),
             )
             row = conn.execute("SELECT * FROM monitor_runs WHERE action_key=?", (action_key,)).fetchone()
         item = dict(row)
         item["result"] = json_loads(item.pop("result_json", "{}"), {})
         return item
+
+    def list_monitor_runs(self, monitor_id: str, *, limit: int = 20) -> list[dict[str, Any]]:
+        with self._lock, self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM monitor_runs
+                WHERE monitor_id=?
+                ORDER BY created_at DESC, run_id DESC
+                LIMIT ?
+                """,
+                (monitor_id, max(1, min(int(limit), 100))),
+            ).fetchall()
+        items = []
+        for row in rows:
+            item = dict(row)
+            item["result"] = json_loads(item.pop("result_json", "{}"), {})
+            items.append(item)
+        return items
 
     @staticmethod
     def _schedule_row(row: sqlite3.Row | None) -> dict[str, Any] | None:
@@ -445,7 +517,23 @@ class AgentStorage:
         item["payload"] = json_loads(item.pop("payload_json", "{}"), {})
         return item
 
+    @staticmethod
+    def _validate_schedule(payload: dict[str, Any]) -> None:
+        # Identity v2 F6: a scheduled send must be pinned to one WeChat slot
+        # and one expected identity at creation time; the scheduler re-checks
+        # the live binding before every execution and on every retry.
+        if str(payload.get("task_type") or "record") == "send_text":
+            if not str(payload.get("account_id") or "").strip():
+                raise ValueError("send_text schedule requires account_id")
+            if not str(payload.get("chat_id") or "").strip():
+                raise ValueError("send_text schedule requires chat_id")
+            if not str(payload.get("expected_wechat_identity_uuid") or "").strip():
+                raise ValueError(
+                    "send_text schedule requires expected_wechat_identity_uuid bound to the scoped account"
+                )
+
     def upsert_schedule(self, payload: dict[str, Any]) -> dict[str, Any]:
+        self._validate_schedule(payload)
         schedule_id = str(payload.get("schedule_id") or f"sch-{uuid.uuid4().hex}")
         now = utc_now_iso()
         next_run_at = str(payload.get("next_run_at") or now)
@@ -455,13 +543,17 @@ class AgentStorage:
                 """
                 INSERT INTO schedules (
                     schedule_id, name, enabled, task_type, account_id, chat_id, template_id,
-                    payload_json, interval_seconds, next_run_at, last_run_at, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '', ?, ?)
+                    payload_json, interval_seconds, next_run_at, last_run_at,
+                    instance_uuid, expected_wechat_identity_uuid, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '', ?, ?, ?, ?)
                 ON CONFLICT(schedule_id) DO UPDATE SET
                     name=excluded.name, enabled=excluded.enabled, task_type=excluded.task_type,
                     account_id=excluded.account_id, chat_id=excluded.chat_id, template_id=excluded.template_id,
                     payload_json=excluded.payload_json, interval_seconds=excluded.interval_seconds,
-                    next_run_at=excluded.next_run_at, updated_at=excluded.updated_at
+                    next_run_at=excluded.next_run_at,
+                    instance_uuid=excluded.instance_uuid,
+                    expected_wechat_identity_uuid=excluded.expected_wechat_identity_uuid,
+                    updated_at=excluded.updated_at
                 """,
                 (
                     schedule_id,
@@ -474,6 +566,8 @@ class AgentStorage:
                     json_dumps(payload.get("payload") or {}),
                     interval_seconds,
                     next_run_at,
+                    str(payload.get("instance_uuid") or ""),
+                    str(payload.get("expected_wechat_identity_uuid") or ""),
                     now,
                     now,
                 ),
@@ -482,6 +576,16 @@ class AgentStorage:
         result = self._schedule_row(row)
         assert result is not None
         return result
+
+    def get_schedule(self, schedule_id: str) -> dict[str, Any] | None:
+        with self._lock, self.connect() as conn:
+            row = conn.execute("SELECT * FROM schedules WHERE schedule_id=?", (schedule_id,)).fetchone()
+        return self._schedule_row(row)
+
+    def delete_schedule(self, schedule_id: str) -> bool:
+        with self._lock, self.connect() as conn:
+            cursor = conn.execute("DELETE FROM schedules WHERE schedule_id=?", (schedule_id,))
+            return cursor.rowcount > 0
 
     def list_schedules(self) -> list[dict[str, Any]]:
         with self._lock, self.connect() as conn:
@@ -538,6 +642,29 @@ class AgentStorage:
             "created_at": now,
             "next_run_at": next_run_at,
         }
+
+    def list_scheduler_runs(self, schedule_id: str, *, limit: int = 20) -> list[dict[str, Any]]:
+        with self._lock, self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM scheduler_runs
+                WHERE schedule_id=?
+                ORDER BY created_at DESC, run_id DESC
+                LIMIT ?
+                """,
+                (schedule_id, max(1, min(int(limit), 100))),
+            ).fetchall()
+        items = []
+        for row in rows:
+            item = dict(row)
+            item["result"] = json_loads(item.pop("result_json", "{}"), {})
+            items.append(item)
+        return items
+
+    def delete_template(self, template_id: str) -> bool:
+        with self._lock, self.connect() as conn:
+            cursor = conn.execute("DELETE FROM templates WHERE template_id=?", (template_id,))
+            return cursor.rowcount > 0
 
     def counts(self) -> dict[str, int]:
         tables = ["event_receipts", "records", "templates", "monitors", "monitor_runs", "schedules", "scheduler_runs"]

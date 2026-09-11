@@ -188,6 +188,19 @@ class AgentService:
             if events and next_cursor:
                 self.storage.set_meta("core_cursor", next_cursor)
                 last_cursor = next_cursor
+            has_more = bool(page.get("has_more"))
+            stream_head = page.get("stream_head_cursor")
+            checkpoint_cursor = int(last_cursor) if has_more else (int(stream_head) if stream_head is not None else int(last_cursor))
+            checkpoint_res = {}
+            try:
+                last_id = ack_ids[-1] if ack_ids else ""
+                checkpoint_res = self.core.checkpoint_events(
+                    self.settings.consumer_id,
+                    checkpoint_cursor,
+                    last_event_id=last_id,
+                )
+            except Exception:
+                pass
             result = {
                 "ok": True,
                 "core_health": health,
@@ -199,7 +212,8 @@ class AgentService:
                 "indexed_messages": indexed,
                 "monitor_runs": monitor_runs,
                 "ack": ack,
-                "has_more": bool(page.get("has_more")),
+                "checkpoint": checkpoint_res,
+                "has_more": has_more,
                 "elapsed_ms": round((time.monotonic() - started) * 1000),
                 "details": details,
             }

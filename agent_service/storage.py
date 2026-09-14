@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import json
 import sqlite3
 import threading
@@ -53,6 +54,21 @@ class AgentStorage:
         conn.execute("PRAGMA busy_timeout=20000")
         conn.execute("PRAGMA foreign_keys=ON")
         return conn
+
+    @contextlib.contextmanager
+    def session(self, *, immediate: bool = True):
+        with self._lock:
+            conn = self.connect()
+            try:
+                if immediate:
+                    conn.execute("BEGIN IMMEDIATE")
+                yield conn
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+            finally:
+                conn.close()
 
     def init_db(self) -> None:
         with self._lock, self.connect() as conn:
@@ -205,45 +221,55 @@ class AgentStorage:
                 (template_id, name, body, now, now),
             )
 
-    def get_meta(self, key: str, default: str = "") -> str:
-        with self._lock, self.connect() as conn:
+    def get_meta(self, key: str, default: str = "", *, conn: sqlite3.Connection | None = None) -> str:
+        if conn is not None:
             row = conn.execute("SELECT value FROM agent_meta WHERE key=?", (key,)).fetchone()
+            return str(row["value"]) if row else default
+        with self._lock, self.connect() as c:
+            row = c.execute("SELECT value FROM agent_meta WHERE key=?", (key,)).fetchone()
         return str(row["value"]) if row else default
 
-    def set_meta(self, key: str, value: Any) -> None:
+    def set_meta(self, key: str, value: Any, *, conn: sqlite3.Connection | None = None) -> None:
         now = utc_now_iso()
-        with self._lock, self.connect() as conn:
-            conn.execute(
-                """
-                INSERT INTO agent_meta (key, value, updated_at) VALUES (?, ?, ?)
-                ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at
-                """,
-                (key, str(value), now),
-            )
+        query = """
+        INSERT INTO agent_meta (key, value, updated_at) VALUES (?, ?, ?)
+        ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at
+        """
+        params = (key, str(value), now)
+        if conn is not None:
+            conn.execute(query, params)
+            return
+        with self._lock, self.connect() as c:
+            c.execute(query, params)
 
-    def event_seen(self, event_id: str) -> bool:
-        with self._lock, self.connect() as conn:
+    def event_seen(self, event_id: str, *, conn: sqlite3.Connection | None = None) -> bool:
+        if conn is not None:
             row = conn.execute("SELECT 1 FROM event_receipts WHERE event_id=?", (event_id,)).fetchone()
+            return bool(row)
+        with self._lock, self.connect() as c:
+            row = c.execute("SELECT 1 FROM event_receipts WHERE event_id=?", (event_id,)).fetchone()
         return bool(row)
 
-    def store_event(self, event: dict[str, Any]) -> None:
-        with self._lock, self.connect() as conn:
-            conn.execute(
-                """
-                INSERT OR IGNORE INTO event_receipts
-                    (event_id, cursor, account_id, event_type, occurred_at, payload_json, processed_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    str(event.get("event_id") or ""),
-                    str(event.get("cursor") or ""),
-                    str(event.get("account_id") or ""),
-                    str(event.get("event_type") or ""),
-                    str(event.get("occurred_at") or ""),
-                    json_dumps(event.get("payload") or {}),
-                    utc_now_iso(),
-                ),
-            )
+    def store_event(self, event: dict[str, Any], *, conn: sqlite3.Connection | None = None) -> None:
+        query = """
+        INSERT OR IGNORE INTO event_receipts
+            (event_id, cursor, account_id, event_type, occurred_at, payload_json, processed_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        """
+        params = (
+            str(event.get("event_id") or ""),
+            str(event.get("cursor") or ""),
+            str(event.get("account_id") or ""),
+            str(event.get("event_type") or ""),
+            str(event.get("occurred_at") or ""),
+            json_dumps(event.get("payload") or {}),
+            utc_now_iso(),
+        )
+        if conn is not None:
+            conn.execute(query, params)
+            return
+        with self._lock, self.connect() as c:
+            c.execute(query, params)
 
     @staticmethod
     def _record_row(row: sqlite3.Row | None) -> dict[str, Any] | None:
@@ -254,34 +280,33 @@ class AgentStorage:
         item["tags"] = json_loads(item.pop("tags_json", "[]"), [])
         return item
 
-    def create_record(self, payload: dict[str, Any]) -> dict[str, Any]:
+    def create_record(self, payload: dict[str, Any], *, conn: sqlite3.Connection | None = None) -> dict[str, Any]:
         now = utc_now_iso()
         record_id = str(payload.get("record_id") or f"rec-{uuid.uuid4().hex}")
         source_event_id = str(payload.get("source_event_id") or "")
         kind = str(payload.get("kind") or "note")[:80]
-        with self._lock, self.connect() as conn:
+        query = """
+        INSERT INTO records (
+            record_id, account_id, chat_id, kind, title, body,
+            data_json, tags_json, source_event_id, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """
+        params = (
+            record_id,
+            str(payload.get("account_id") or ""),
+            str(payload.get("chat_id") or ""),
+            kind,
+            str(payload.get("title") or "")[:500],
+            str(payload.get("body") or ""),
+            json_dumps(payload.get("data") or {}),
+            json_dumps(payload.get("tags") or []),
+            source_event_id,
+            now,
+            now,
+        )
+        if conn is not None:
             try:
-                conn.execute(
-                    """
-                    INSERT INTO records (
-                        record_id, account_id, chat_id, kind, title, body,
-                        data_json, tags_json, source_event_id, created_at, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        record_id,
-                        str(payload.get("account_id") or ""),
-                        str(payload.get("chat_id") or ""),
-                        kind,
-                        str(payload.get("title") or "")[:500],
-                        str(payload.get("body") or ""),
-                        json_dumps(payload.get("data") or {}),
-                        json_dumps(payload.get("tags") or []),
-                        source_event_id,
-                        now,
-                        now,
-                    ),
-                )
+                conn.execute(query, params)
             except sqlite3.IntegrityError:
                 if source_event_id:
                     row = conn.execute(
@@ -293,6 +318,24 @@ class AgentStorage:
                         return existing
                 raise
             row = conn.execute("SELECT * FROM records WHERE record_id=?", (record_id,)).fetchone()
+            result = self._record_row(row)
+            assert result is not None
+            return result
+
+        with self._lock, self.connect() as c:
+            try:
+                c.execute(query, params)
+            except sqlite3.IntegrityError:
+                if source_event_id:
+                    row = c.execute(
+                        "SELECT * FROM records WHERE source_event_id=? AND kind=?",
+                        (source_event_id, kind),
+                    ).fetchone()
+                    existing = self._record_row(row)
+                    if existing:
+                        return existing
+                raise
+            row = c.execute("SELECT * FROM records WHERE record_id=?", (record_id,)).fetchone()
         result = self._record_row(row)
         assert result is not None
         return result
@@ -363,9 +406,12 @@ class AgentStorage:
         assert result is not None
         return result
 
-    def get_template(self, template_id: str) -> dict[str, Any] | None:
-        with self._lock, self.connect() as conn:
+    def get_template(self, template_id: str, *, conn: sqlite3.Connection | None = None) -> dict[str, Any] | None:
+        if conn is not None:
             row = conn.execute("SELECT * FROM templates WHERE template_id=?", (template_id,)).fetchone()
+            return self._template_row(row)
+        with self._lock, self.connect() as c:
+            row = c.execute("SELECT * FROM templates WHERE template_id=?", (template_id,)).fetchone()
         return self._template_row(row)
 
     def list_templates(self) -> list[dict[str, Any]]:
@@ -447,15 +493,22 @@ class AgentStorage:
             cursor = conn.execute("DELETE FROM monitors WHERE monitor_id=?", (monitor_id,))
             return cursor.rowcount > 0
 
-    def list_monitors(self, *, enabled_only: bool = False) -> list[dict[str, Any]]:
+    def list_monitors(self, *, enabled_only: bool = False, conn: sqlite3.Connection | None = None) -> list[dict[str, Any]]:
         where = " WHERE enabled=1" if enabled_only else ""
-        with self._lock, self.connect() as conn:
-            rows = conn.execute(f"SELECT * FROM monitors{where} ORDER BY name, monitor_id").fetchall()
+        query = f"SELECT * FROM monitors{where} ORDER BY name, monitor_id"
+        if conn is not None:
+            rows = conn.execute(query).fetchall()
+            return [item for row in rows if (item := self._monitor_row(row)) is not None]
+        with self._lock, self.connect() as c:
+            rows = c.execute(query).fetchall()
         return [item for row in rows if (item := self._monitor_row(row)) is not None]
 
-    def monitor_action_done(self, action_key: str) -> bool:
-        with self._lock, self.connect() as conn:
+    def monitor_action_done(self, action_key: str, *, conn: sqlite3.Connection | None = None) -> bool:
+        if conn is not None:
             row = conn.execute("SELECT 1 FROM monitor_runs WHERE action_key=?", (action_key,)).fetchone()
+            return bool(row)
+        with self._lock, self.connect() as c:
+            row = c.execute("SELECT 1 FROM monitor_runs WHERE action_key=?", (action_key,)).fetchone()
         return bool(row)
 
     def record_monitor_run(
@@ -468,24 +521,28 @@ class AgentStorage:
         result: Any = None,
         error: str = "",
         identity: dict[str, Any] | None = None,
+        conn: sqlite3.Connection | None = None,
     ) -> dict[str, Any]:
         run_id = f"mrun-{uuid.uuid4().hex}"
         now = utc_now_iso()
-        # F7: every execution log must be able to answer "which WeChat identity
-        # and slot produced this action".
         merged_result: dict[str, Any] = dict(result or {})
         if identity is not None:
             merged_result["identity"] = dict(identity)
-        with self._lock, self.connect() as conn:
-            conn.execute(
-                """
-                INSERT OR IGNORE INTO monitor_runs
-                    (run_id, monitor_id, event_id, action_key, status, result_json, error, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (run_id, monitor_id, event_id, action_key, status, json_dumps(merged_result), error, now),
-            )
+        query = """
+        INSERT OR IGNORE INTO monitor_runs
+            (run_id, monitor_id, event_id, action_key, status, result_json, error, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """
+        params = (run_id, monitor_id, event_id, action_key, status, json_dumps(merged_result), error, now)
+        if conn is not None:
+            conn.execute(query, params)
             row = conn.execute("SELECT * FROM monitor_runs WHERE action_key=?", (action_key,)).fetchone()
+            item = dict(row)
+            item["result"] = json_loads(item.pop("result_json", "{}"), {})
+            return item
+        with self._lock, self.connect() as c:
+            c.execute(query, params)
+            row = c.execute("SELECT * FROM monitor_runs WHERE action_key=?", (action_key,)).fetchone()
         item = dict(row)
         item["result"] = json_loads(item.pop("result_json", "{}"), {})
         return item

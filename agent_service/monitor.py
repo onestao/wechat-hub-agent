@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from typing import Any
+import sqlite3
 
 from .core_client import CoreClient
 from .memory_index import EventMemoryIndex, message_text
@@ -51,6 +52,20 @@ class MonitorEngine:
         self.memory = memory
         self.ai = ai
 
+    def event_has_external_side_effect(
+        self,
+        event: dict[str, Any],
+        monitors: list[dict[str, Any]] | None = None,
+    ) -> bool:
+        if monitors is None:
+            monitors = self.storage.list_monitors(enabled_only=True)
+        for monitor in monitors:
+            if monitor_matches(monitor, event):
+                action = str(monitor.get("action") or "record")
+                if action != "record":
+                    return True
+        return False
+
     def identity_view(self) -> dict[str, dict[str, Any]]:
         """Current identity state per account, straight from Core.
 
@@ -64,14 +79,19 @@ class MonitorEngine:
         self,
         event: dict[str, Any],
         identity_view: dict[str, dict[str, Any]] | None = None,
+        monitors: list[dict[str, Any]] | None = None,
+        *,
+        conn: sqlite3.Connection | None = None,
     ) -> list[dict[str, Any]]:
         results: list[dict[str, Any]] = []
         event_id = str(event.get("event_id") or "")
-        for monitor in self.storage.list_monitors(enabled_only=True):
+        if monitors is None:
+            monitors = self.storage.list_monitors(enabled_only=True, conn=conn)
+        for monitor in monitors:
             if not monitor_matches(monitor, event):
                 continue
             action_key = f"{monitor['monitor_id']}:{event_id}:{monitor.get('action') or 'record'}"
-            if self.storage.monitor_action_done(action_key):
+            if self.storage.monitor_action_done(action_key, conn=conn):
                 continue
             message = event_message(event)
             account_id = str(message.get("account_id") or event.get("account_id") or "")
@@ -89,17 +109,18 @@ class MonitorEngine:
                     "failed",
                     error=str(exc),
                     identity={"account_id": account_id, "instance_uuid": "", "wechat_identity_uuid": ""},
+                    conn=conn,
                 )
                 results.append(run)
                 continue
             try:
-                result = self._run_action(monitor, event, identity)
+                result = self._run_action(monitor, event, identity, conn=conn)
                 run = self.storage.record_monitor_run(
-                    monitor["monitor_id"], event_id, action_key, "success", result=result, identity=identity
+                    monitor["monitor_id"], event_id, action_key, "success", result=result, identity=identity, conn=conn
                 )
             except Exception as exc:  # persist action failure; event processing itself remains durable
                 run = self.storage.record_monitor_run(
-                    monitor["monitor_id"], event_id, action_key, "failed", error=str(exc), identity=identity
+                    monitor["monitor_id"], event_id, action_key, "failed", error=str(exc), identity=identity, conn=conn
                 )
             results.append(run)
         return results
@@ -162,23 +183,31 @@ class MonitorEngine:
         context: dict[str, Any],
         *,
         default: str = "",
+        conn: sqlite3.Connection | None = None,
     ) -> str:
         config = monitor.get("action_config") if isinstance(monitor.get("action_config"), dict) else {}
         template_id = str(config.get("template_id") or "")
         if template_id:
-            template = self.storage.get_template(template_id)
+            template = self.storage.get_template(template_id, conn=conn)
             if not template or not template.get("enabled"):
                 raise RuntimeError(f"template not available: {template_id}")
             return render_template(str(template.get("body") or ""), context)
         return render_template(str(config.get("text") or config.get("body") or default), context)
 
-    def _run_action(self, monitor: dict[str, Any], event: dict[str, Any], identity: dict[str, Any]) -> dict[str, Any]:
+    def _run_action(
+        self,
+        monitor: dict[str, Any],
+        event: dict[str, Any],
+        identity: dict[str, Any],
+        *,
+        conn: sqlite3.Connection | None = None,
+    ) -> dict[str, Any]:
         action = str(monitor.get("action") or "record")
         context = self._context(monitor, event)
         message = context["message"]
         config = monitor.get("action_config") if isinstance(monitor.get("action_config"), dict) else {}
         if action == "record":
-            body = self._render_action_text(monitor, context, default="{{message.text}}")
+            body = self._render_action_text(monitor, context, default="{{message.text}}", conn=conn)
             if not body.strip():
                 body = message_text(message)
             title = render_template(str(config.get("title") or monitor.get("name") or "Monitor record"), context)
@@ -192,7 +221,8 @@ class MonitorEngine:
                     "tags": config.get("tags") or [],
                     "data": {"event": event, "monitor_id": monitor["monitor_id"]},
                     "source_event_id": str(event.get("event_id") or ""),
-                }
+                },
+                conn=conn,
             )
             return {"action": action, "record": record}
 

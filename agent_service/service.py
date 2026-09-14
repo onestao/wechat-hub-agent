@@ -110,6 +110,57 @@ class AgentService:
             },
         }
 
+    def _partition_events(
+        self,
+        events: list[dict[str, Any]],
+        monitors: list[dict[str, Any]],
+    ) -> list[tuple[bool, list[dict[str, Any]]]]:
+        segments: list[tuple[bool, list[dict[str, Any]]]] = []
+        for raw_event in events:
+            event = raw_event if isinstance(raw_event, dict) else {}
+            if self.monitor.event_has_external_side_effect(event, monitors=monitors):
+                segments.append((False, [event]))
+            else:
+                if segments and segments[-1][0]:
+                    segments[-1][1].append(event)
+                else:
+                    segments.append((True, [event]))
+        return segments
+
+    def _process_single_event(
+        self,
+        event: dict[str, Any],
+        last_cursor: str,
+        identity_view: dict[str, dict[str, Any]] | None,
+        monitors: list[dict[str, Any]],
+        conn: sqlite3.Connection | None = None,
+    ) -> tuple[bool, str, dict[str, Any], list[dict[str, Any]], str]:
+        event_id = str(event.get("event_id") or "")
+        event_cursor = str(event.get("cursor") or last_cursor)
+        if not event_id:
+            raise RuntimeError("Core returned event without event_id")
+        if self.storage.event_seen(event_id, conn=conn):
+            self.storage.set_meta("core_cursor", event_cursor, conn=conn)
+            return True, event_cursor, {}, [], event_id
+        message = None
+        payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
+        if event.get("event_type") in {"message.created", "message.updated"}:
+            candidate = payload.get("message")
+            if isinstance(candidate, dict):
+                message = candidate
+        memory_result: dict[str, Any] = {}
+        if message is not None:
+            memory_result = self.memory.ingest_message(event, message, conn=conn)
+        action_runs = self.monitor.process_event(
+            event,
+            identity_view=identity_view,
+            monitors=monitors,
+            conn=conn,
+        )
+        self.storage.store_event(event, conn=conn)
+        self.storage.set_meta("core_cursor", event_cursor, conn=conn)
+        return False, event_cursor, memory_result, action_runs, event_id
+
     def process_events_once(self) -> dict[str, Any]:
         if not self._poll_lock.acquire(blocking=False):
             return {"ok": False, "busy": True, "error": "event poll already running"}
@@ -130,67 +181,74 @@ class AgentService:
             monitor_runs = 0
             ack_ids: list[str] = []
             last_cursor = cursor
-            identity_view: dict[str, dict[str, Any]] | None = None
             details: list[dict[str, Any]] = []
-            for raw_event in events:
-                event = raw_event if isinstance(raw_event, dict) else {}
-                event_id = str(event.get("event_id") or "")
-                event_cursor = str(event.get("cursor") or last_cursor)
-                if not event_id:
-                    raise RuntimeError("Core returned event without event_id")
-                if self.storage.event_seen(event_id):
-                    duplicates += 1
-                    ack_ids.append(event_id)
-                    last_cursor = event_cursor
-                    self.storage.set_meta("core_cursor", last_cursor)
-                    continue
-                message = None
-                payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
-                if event.get("event_type") in {"message.created", "message.updated"}:
-                    candidate = payload.get("message")
-                    if isinstance(candidate, dict):
-                        message = candidate
-                memory_result: dict[str, Any] = {}
-                if message is not None:
-                    memory_result = self.memory.ingest_message(event, message)
-                    if memory_result.get("changed"):
-                        indexed += 1
-                # Identity view is resolved once per batch (F7); execution
-                # failures inside monitors still record fail-closed runs.
-                if identity_view is None:
-                    identity_view = self.monitor.identity_view()
-                action_runs = self.monitor.process_event(event, identity_view=identity_view)
-                monitor_runs += len(action_runs)
-                self.storage.store_event(event)
-                # Cursor is advanced only after local durable processing for this
-                # event has completed. At-least-once redelivery is therefore safe.
-                last_cursor = event_cursor
-                self.storage.set_meta("core_cursor", last_cursor)
-                ack_ids.append(event_id)
-                processed += 1
-                details.append(
-                    {
-                        "event_id": event_id,
-                        "event_type": event.get("event_type"),
-                        "memory": memory_result,
-                        "monitor_runs": action_runs,
-                    }
-                )
+
+            enabled_monitors = self.storage.list_monitors(enabled_only=True)
+            identity_view = self.monitor.identity_view() if events else None
+            segments = self._partition_events(events, enabled_monitors)
+            next_cursor = str(page.get("next_cursor") or "")
+
+            for seg_idx, (is_local, seg_events) in enumerate(segments):
+                is_last = (seg_idx == len(segments) - 1)
+                if is_local:
+                    with self.storage.session() as session:
+                        for evt in seg_events:
+                            is_dup, cur, mem, acts, eid = self._process_single_event(
+                                evt, last_cursor, identity_view, enabled_monitors, conn=session
+                            )
+                            last_cursor = cur
+                            ack_ids.append(eid)
+                            if is_dup:
+                                duplicates += 1
+                            else:
+                                processed += 1
+                                if mem.get("changed"):
+                                    indexed += 1
+                                monitor_runs += len(acts)
+                                details.append(
+                                    {
+                                        "event_id": eid,
+                                        "event_type": evt.get("event_type"),
+                                        "memory": mem,
+                                        "monitor_runs": acts,
+                                    }
+                                )
+                        if is_last and next_cursor:
+                            self.storage.set_meta("core_cursor", next_cursor, conn=session)
+                            last_cursor = next_cursor
+                else:
+                    evt = seg_events[0]
+                    is_dup, cur, mem, acts, eid = self._process_single_event(
+                        evt, last_cursor, identity_view, enabled_monitors, conn=None
+                    )
+                    last_cursor = cur
+                    ack_ids.append(eid)
+                    if is_dup:
+                        duplicates += 1
+                    else:
+                        processed += 1
+                        if mem.get("changed"):
+                            indexed += 1
+                        monitor_runs += len(acts)
+                        details.append(
+                            {
+                                "event_id": eid,
+                                "event_type": evt.get("event_type"),
+                                "memory": mem,
+                                "monitor_runs": acts,
+                            }
+                        )
+                    if is_last and next_cursor:
+                        self.storage.set_meta("core_cursor", next_cursor)
+                        last_cursor = next_cursor
+
             ack = self.core.ack_events(self.settings.consumer_id, ack_ids) if ack_ids else {
                 "consumer_id": self.settings.consumer_id,
                 "acked_event_ids": [],
                 "acked_count": 0,
             }
-            # A response cursor may encode a server-side position that is not
-            # derivable from an individual event. Adopt it only after all events
-            # in the page were processed and acknowledged locally.
-            next_cursor = str(page.get("next_cursor") or last_cursor)
-            if events and next_cursor:
-                self.storage.set_meta("core_cursor", next_cursor)
-                last_cursor = next_cursor
             has_more = bool(page.get("has_more"))
-            stream_head = page.get("stream_head_cursor")
-            checkpoint_cursor = int(last_cursor) if has_more else (int(stream_head) if stream_head is not None else int(last_cursor))
+            checkpoint_cursor = int(last_cursor)
             checkpoint_res = {}
             try:
                 last_id = ack_ids[-1] if ack_ids else ""

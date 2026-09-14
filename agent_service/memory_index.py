@@ -131,7 +131,80 @@ class EventMemoryIndex:
     def chunk_uid(account_id: str, message_id: str) -> str:
         return hashlib.sha256(f"{account_id}\x1f{message_id}".encode("utf-8")).hexdigest()
 
-    def ingest_message(self, event: dict[str, Any], message: dict[str, Any]) -> dict[str, Any]:
+    def _write_chunk_and_vector(
+        self,
+        conn: sqlite3.Connection,
+        chunk_uid: str,
+        account_id: str,
+        message_id: str,
+        chat_id: str,
+        direction: str,
+        message_type: str,
+        author_id: str,
+        author_name: str,
+        created_at: str,
+        content: str,
+        source: dict[str, Any],
+        content_hash: str,
+        indexed_at: str,
+        vector: list[float],
+        norm: float,
+    ) -> None:
+        conn.execute(
+            """
+            INSERT INTO event_memory_chunks (
+                chunk_uid, account_id, message_id, chat_id, direction, message_type,
+                author_id, author_name, created_at, created_ts, text, source_json,
+                content_sha256, indexed_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(chunk_uid) DO UPDATE SET
+                chat_id=excluded.chat_id, direction=excluded.direction,
+                message_type=excluded.message_type, author_id=excluded.author_id,
+                author_name=excluded.author_name, created_at=excluded.created_at,
+                created_ts=excluded.created_ts, text=excluded.text,
+                source_json=excluded.source_json, content_sha256=excluded.content_sha256,
+                indexed_at=excluded.indexed_at
+            """,
+            (
+                chunk_uid,
+                account_id,
+                message_id,
+                chat_id,
+                direction,
+                message_type,
+                author_id,
+                author_name,
+                created_at,
+                parse_rfc3339(created_at),
+                content,
+                json_dumps(source),
+                content_hash,
+                indexed_at,
+            ),
+        )
+        conn.execute(
+            """
+            INSERT INTO event_memory_vectors (chunk_uid, dim, norm, vector)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(chunk_uid) DO UPDATE SET
+                dim=excluded.dim, norm=excluded.norm, vector=excluded.vector
+            """,
+            (chunk_uid, self.vector_dim, norm, legacy_memory.pack_vector(vector)),
+        )
+        if self._ensure_fts(conn):
+            conn.execute("DELETE FROM event_memory_fts WHERE chunk_uid=?", (chunk_uid,))
+            conn.execute(
+                "INSERT INTO event_memory_fts (chunk_uid, account_id, chat_id, text) VALUES (?, ?, ?, ?)",
+                (chunk_uid, account_id, chat_id, content),
+            )
+
+    def ingest_message(
+        self,
+        event: dict[str, Any],
+        message: dict[str, Any],
+        *,
+        conn: sqlite3.Connection | None = None,
+    ) -> dict[str, Any]:
         account_id = str(message.get("account_id") or event.get("account_id") or "")
         message_id = str(message.get("message_id") or "")
         chat_id = str(message.get("chat_id") or "")
@@ -152,59 +225,35 @@ class EventMemoryIndex:
         created_at = str(message.get("created_at") or event.get("occurred_at") or "")
         vector, norm = legacy_memory.vector_for_text(content, self.vector_dim)
         indexed_at = utc_now_iso()
-        with self.storage._lock, self.storage.connect() as conn:  # noqa: SLF001
+        direction = str(message.get("direction") or "")
+        message_type = str(message.get("type") or "")
+        author_id = str(author.get("member_id") or "")
+        author_name = str(author.get("display_name") or "")
+
+        if conn is not None:
             previous = conn.execute(
                 "SELECT content_sha256 FROM event_memory_chunks WHERE chunk_uid=?", (chunk_uid,)
             ).fetchone()
             if previous and previous["content_sha256"] == content_hash:
                 return {"ok": True, "chunk_uid": chunk_uid, "changed": False}
-            conn.execute(
-                """
-                INSERT INTO event_memory_chunks (
-                    chunk_uid, account_id, message_id, chat_id, direction, message_type,
-                    author_id, author_name, created_at, created_ts, text, source_json,
-                    content_sha256, indexed_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(chunk_uid) DO UPDATE SET
-                    chat_id=excluded.chat_id, direction=excluded.direction,
-                    message_type=excluded.message_type, author_id=excluded.author_id,
-                    author_name=excluded.author_name, created_at=excluded.created_at,
-                    created_ts=excluded.created_ts, text=excluded.text,
-                    source_json=excluded.source_json, content_sha256=excluded.content_sha256,
-                    indexed_at=excluded.indexed_at
-                """,
-                (
-                    chunk_uid,
-                    account_id,
-                    message_id,
-                    chat_id,
-                    str(message.get("direction") or ""),
-                    str(message.get("type") or ""),
-                    str(author.get("member_id") or ""),
-                    str(author.get("display_name") or ""),
-                    created_at,
-                    parse_rfc3339(created_at),
-                    content,
-                    json_dumps(source),
-                    content_hash,
-                    indexed_at,
-                ),
+            self._write_chunk_and_vector(
+                conn, chunk_uid, account_id, message_id, chat_id, direction,
+                message_type, author_id, author_name, created_at, content, source,
+                content_hash, indexed_at, vector, norm,
             )
-            conn.execute(
-                """
-                INSERT INTO event_memory_vectors (chunk_uid, dim, norm, vector)
-                VALUES (?, ?, ?, ?)
-                ON CONFLICT(chunk_uid) DO UPDATE SET
-                    dim=excluded.dim, norm=excluded.norm, vector=excluded.vector
-                """,
-                (chunk_uid, self.vector_dim, norm, legacy_memory.pack_vector(vector)),
+            return {"ok": True, "chunk_uid": chunk_uid, "changed": True}
+
+        with self.storage._lock, self.storage.connect() as c:  # noqa: SLF001
+            previous = c.execute(
+                "SELECT content_sha256 FROM event_memory_chunks WHERE chunk_uid=?", (chunk_uid,)
+            ).fetchone()
+            if previous and previous["content_sha256"] == content_hash:
+                return {"ok": True, "chunk_uid": chunk_uid, "changed": False}
+            self._write_chunk_and_vector(
+                c, chunk_uid, account_id, message_id, chat_id, direction,
+                message_type, author_id, author_name, created_at, content, source,
+                content_hash, indexed_at, vector, norm,
             )
-            if self._ensure_fts(conn):
-                conn.execute("DELETE FROM event_memory_fts WHERE chunk_uid=?", (chunk_uid,))
-                conn.execute(
-                    "INSERT INTO event_memory_fts (chunk_uid, account_id, chat_id, text) VALUES (?, ?, ?, ?)",
-                    (chunk_uid, account_id, chat_id, content),
-                )
         return {"ok": True, "chunk_uid": chunk_uid, "changed": True}
 
     def _candidate_ids(

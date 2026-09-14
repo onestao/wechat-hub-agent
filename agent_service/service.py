@@ -41,7 +41,7 @@ class AgentSettings:
     consumer_id: str = "wechat-agent"
     poll_interval_seconds: float = 2.0
     poll_timeout_seconds: int = 0
-    poll_batch_size: int = 100
+    poll_batch_size: int = 200
     scheduler_interval_seconds: float = 5.0
     vector_dim: int = 384
 
@@ -58,7 +58,7 @@ class AgentSettings:
             consumer_id=os.environ.get("WECHAT_AGENT_CONSUMER_ID", "wechat-agent"),
             poll_interval_seconds=env_float("WECHAT_AGENT_POLL_INTERVAL", 2.0, 0.25, 300.0),
             poll_timeout_seconds=env_int("WECHAT_AGENT_POLL_TIMEOUT", 0, 0, 30),
-            poll_batch_size=env_int("WECHAT_AGENT_POLL_BATCH", 100, 1, 200),
+            poll_batch_size=env_int("WECHAT_AGENT_POLL_BATCH", 200, 1, 200),
             scheduler_interval_seconds=env_float("WECHAT_AGENT_SCHEDULER_INTERVAL", 5.0, 0.5, 300.0),
             vector_dim=env_int("WECHAT_AGENT_VECTOR_DIM", 384, 64, 4096),
         )
@@ -337,12 +337,44 @@ class AgentService:
         self._threads = []
 
     def _poll_loop(self) -> None:
+        last_cursor = None
         while not self._stop.is_set():
             result = self.process_events_once()
-            delay = self.settings.poll_interval_seconds
+            if self._stop.is_set():
+                break
+
             if not result.get("ok"):
-                delay = max(delay, 2.0)
-            self._stop.wait(delay)
+                delay = max(self.settings.poll_interval_seconds, 2.0)
+                self._stop.wait(delay)
+                continue
+
+            has_more = bool(result.get("has_more"))
+            current_cursor = str(result.get("cursor", ""))
+            events_count = int(result.get("events", 0))
+
+            if has_more:
+                progress = False
+                if last_cursor is not None:
+                    try:
+                        progress = int(current_cursor) > int(last_cursor) or events_count > 0
+                    except (ValueError, TypeError):
+                        progress = current_cursor != last_cursor or events_count > 0
+                else:
+                    progress = events_count > 0 or current_cursor != str(result.get("from_cursor", ""))
+
+                last_cursor = current_cursor
+
+                if progress:
+                    if self._stop.is_set():
+                        break
+                    continue
+                else:
+                    delay = max(self.settings.poll_interval_seconds, 1.0)
+                    self._stop.wait(delay)
+            else:
+                last_cursor = current_cursor
+                delay = self.settings.poll_interval_seconds
+                self._stop.wait(delay)
 
     def _scheduler_loop(self) -> None:
         while not self._stop.is_set():

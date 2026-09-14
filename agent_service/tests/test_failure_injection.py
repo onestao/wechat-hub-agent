@@ -1,4 +1,4 @@
-﻿"""Mandatory failure injection and fault boundary test suite for Agent RC.14 catch-up remediation.
+"""Mandatory failure injection and fault boundary test suite for Agent RC.14 catch-up remediation.
 
 Covers Taskbook Section 6:
 1. fault before first event write -> no local progress
@@ -386,6 +386,94 @@ class AgentCatchupFailureInjectionTests(unittest.TestCase):
         self.assertGreaterEqual(len(runs), 1)
         self.assertEqual(runs[0]["status"], "failed")
         self.assertIn("unbound", runs[0]["error"])
+
+    def test_11_poll_loop_backlog_has_more_no_sleep(self):
+        # Phase 1.5: backlog with has_more=True immediately continues without 2s sleep
+        evt1 = make_status_event("evt-bl-1", 1)
+        evt2 = make_status_event("evt-bl-2", 2)
+        self.core.pages = [
+            {"events": [evt1], "next_cursor": "1", "has_more": True},
+            {"events": [evt2], "next_cursor": "2", "has_more": True},
+            {"events": [], "next_cursor": "2", "has_more": False},
+        ]
+
+        wait_calls = []
+        real_wait = self.service._stop.wait
+        def spied_wait(timeout=None):
+            wait_calls.append(timeout)
+            # Stop after we observe the caught-up sleep
+            if timeout and timeout >= 1.0:
+                self.service._stop.set()
+                return True
+            return real_wait(timeout=0)
+
+        with patch.object(self.service._stop, "wait", side_effect=spied_wait):
+            self.service._poll_loop()
+
+        # Page 1 -> Page 2 had has_more=True with progress, so no sleep was called
+        # After Page 3, has_more=False, so normal sleep was called
+        self.assertEqual(self.service.storage.get_meta("core_cursor"), "2")
+        self.assertEqual(len(wait_calls), 1)
+        self.assertEqual(wait_calls[0], self.service.settings.poll_interval_seconds)
+
+    def test_12_poll_loop_caught_up_has_more_false_normal_sleep(self):
+        # Phase 1.5: caught up with has_more=False preserves normal poll_interval_seconds sleep
+        self.core.pages = [
+            {"events": [], "next_cursor": "0", "has_more": False},
+        ]
+
+        wait_calls = []
+        def spied_wait(timeout=None):
+            wait_calls.append(timeout)
+            self.service._stop.set()
+            return True
+
+        with patch.object(self.service._stop, "wait", side_effect=spied_wait):
+            self.service._poll_loop()
+
+        self.assertEqual(len(wait_calls), 1)
+        self.assertEqual(wait_calls[0], self.service.settings.poll_interval_seconds)
+
+    def test_13_poll_loop_error_bounded_backoff(self):
+        # Phase 1.5: poll error enforces bounded backoff (>= 2.0s)
+        self.core.poll_failure = RuntimeError("simulated core outage")
+
+        wait_calls = []
+        def spied_wait(timeout=None):
+            wait_calls.append(timeout)
+            self.service._stop.set()
+            return True
+
+        with patch.object(self.service._stop, "wait", side_effect=spied_wait):
+            self.service._poll_loop()
+
+        self.assertEqual(len(wait_calls), 1)
+        self.assertGreaterEqual(wait_calls[0], 2.0)
+
+    def test_14_poll_loop_anti_busy_spin_stalled_progress(self):
+        # Phase 1.5: has_more=True but no cursor or events progress enforces fail-safe backoff (not busy-spin)
+        self.core.pages = [
+            {"events": [], "next_cursor": "0", "has_more": True},
+        ]
+
+        wait_calls = []
+        def spied_wait(timeout=None):
+            wait_calls.append(timeout)
+            self.service._stop.set()
+            return True
+
+        with patch.object(self.service._stop, "wait", side_effect=spied_wait):
+            self.service._poll_loop()
+
+        self.assertEqual(len(wait_calls), 1)
+        self.assertGreaterEqual(wait_calls[0], 1.0)
+
+    def test_15_poll_loop_shutdown_responsiveness(self):
+        # Phase 1.5: setting _stop promptly exits loop
+        self.service._stop.set()
+        # Should return immediately without executing any poll calls
+        self.service._poll_loop()
+        self.assertEqual(len(self.core.poll_calls), 0)
 
 
 if __name__ == "__main__":

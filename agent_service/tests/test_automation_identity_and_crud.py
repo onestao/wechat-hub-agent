@@ -51,6 +51,7 @@ class MonitorIdentityTests(unittest.TestCase):
         self.engine = MonitorEngine(self.storage, self.core, None, FakeAI())
 
     def tearDown(self):
+        self.storage.close()
         self.tempdir.cleanup()
 
     def test_monitor_requires_explicit_account_scope(self):
@@ -147,6 +148,7 @@ class ScheduleIdentityTests(unittest.TestCase):
         self.engine = SchedulerEngine(self.storage, self.core, None, FakeAI())
 
     def tearDown(self):
+        self.storage.close()
         self.tempdir.cleanup()
 
     def make_schedule(self, schedule_id: str = "hourly-send") -> dict:
@@ -248,6 +250,7 @@ class AutomationCrudAndPersistenceTests(unittest.TestCase):
         self.db_path = Path(self.tempdir.name) / "agent.sqlite"
 
     def tearDown(self):
+        # Each test opens and explicitly closes its own AgentStorage handle.
         self.tempdir.cleanup()
 
     def test_rules_schedules_templates_and_runs_survive_restart(self):
@@ -280,15 +283,19 @@ class AutomationCrudAndPersistenceTests(unittest.TestCase):
         )
 
         reopened = AgentStorage(self.db_path)
-        self.assertEqual([m["monitor_id"] for m in reopened.list_monitors()], ["watcher"])
-        self.assertEqual([s["schedule_id"] for s in reopened.list_schedules()], ["hourly"])
-        template_ids = [t["template_id"] for t in reopened.list_templates()]
-        self.assertIn("tpl", template_ids)
-        self.assertIn("summary-record", template_ids)
-        self.assertEqual(len(reopened.list_monitor_runs("watcher")), 2)
-        self.assertEqual(
-            reopened.get_monitor("watcher")["expected_wechat_identity_uuid"], "identity-a-uuid"
-        )
+        try:
+            self.assertEqual([m["monitor_id"] for m in reopened.list_monitors()], ["watcher"])
+            self.assertEqual([s["schedule_id"] for s in reopened.list_schedules()], ["hourly"])
+            template_ids = [t["template_id"] for t in reopened.list_templates()]
+            self.assertIn("tpl", template_ids)
+            self.assertIn("summary-record", template_ids)
+            self.assertEqual(len(reopened.list_monitor_runs("watcher")), 2)
+            self.assertEqual(
+                reopened.get_monitor("watcher")["expected_wechat_identity_uuid"], "identity-a-uuid"
+            )
+        finally:
+            reopened.close()
+            storage.close()
 
     def test_delete_monitor_schedule_and_template(self):
         storage = AgentStorage(self.db_path)
@@ -325,6 +332,7 @@ class AutomationCrudAndPersistenceTests(unittest.TestCase):
         self.assertFalse(storage.delete_template("tpl"))
         self.assertFalse(storage.delete_monitor("watcher"))
         self.assertFalse(storage.delete_schedule("hourly"))
+        storage.close()
 
 
 if __name__ == "__main__":

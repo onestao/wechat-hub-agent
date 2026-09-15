@@ -9,6 +9,54 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from .crashpoint import crash_point, raise_fault
+
+
+class StorageError(RuntimeError):
+    """Base class for agent storage failures."""
+
+
+class StorageClosedError(StorageError):
+    """Raised when storage is used after an explicit shutdown.
+
+    Fail closed: after ``close()`` the process must not silently reopen a
+    database behind the operator's back.
+    """
+
+
+class StorageTransactionError(StorageError):
+    """Raised when a transaction boundary would be violated."""
+
+
+class StorageUnavailableError(StorageError):
+    """Raised when the writer connection became unusable.
+
+    The caller must treat all in-flight work as uncommitted, drop the writer
+    and reconcile before continuing. Never keep using an uncertain writer.
+    """
+
+
+#: sqlite3 error strings that mean "this connection can no longer be trusted".
+#: Anything matched here invalidates the writer instead of being retried on it.
+_CONNECTION_FATAL_MARKERS = (
+    "disk i/o error",
+    "database disk image is malformed",
+    "file is not a database",
+    "database or disk is full",
+    "unable to open database file",
+    "no such table",
+    "sqlite objects created in a thread can only be used in that same thread",
+)
+
+
+def _is_fatal_connection_error(exc: BaseException) -> bool:
+    if isinstance(exc, sqlite3.ProgrammingError):
+        return True
+    if isinstance(exc, (sqlite3.DatabaseError, sqlite3.OperationalError, sqlite3.InterfaceError)):
+        text = str(exc).lower()
+        return any(marker in text for marker in _CONNECTION_FATAL_MARKERS)
+    return False
+
 
 def utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
@@ -32,6 +80,11 @@ class ManagedConnection(sqlite3.Connection):
     connection open. That is easy to miss and prevents database cleanup on
     Windows. AgentStorage always treats a connection context as one unit of
     work, so closing on exit is the safer ownership rule here.
+
+    This type is used only for short-lived bootstrap/one-off connections
+    (``AgentStorage.connect``). The steady-state writer is a
+    :class:`WriterConnection`, which is owned by the storage object and must
+    NOT be closed by a context manager.
     """
 
     def __exit__(self, exc_type, exc_value, traceback):
@@ -41,37 +94,275 @@ class ManagedConnection(sqlite3.Connection):
             self.close()
 
 
+class WriterConnection(sqlite3.Connection):
+    """The single long-lived writer connection owned by AgentStorage.
+
+    Ownership rules (RC.14 V4 workstream A):
+
+    * One connection per :class:`AgentStorage`, created lazily and closed only
+      by an explicit ``close()``/``shutdown()``. It is never closed by a
+      context manager, so a batch no longer pays the "last close of a WAL
+      database" checkpoint + fsync + unlink cost on every batch.
+    * ``with conn:`` still commits on clean exit and rolls back on exception,
+      so a multi-statement unit of work stays atomic.
+    * When an explicit :meth:`AgentStorage.session` transaction is already
+      open (``_txn_depth > 0``) a nested ``with conn:`` block must NOT commit:
+      the outer explicit transaction owns the boundary. This is what keeps
+      "cursor advances only inside the same atomic boundary as its durable
+      writes" true no matter which helper is called in between.
+    * ``check_same_thread=False`` is set at connect time because the poll
+      worker and the scheduler worker are different threads. Concurrency is
+      governed by ``AgentStorage._lock`` (a re-entrant lock held for the whole
+      transaction), not by sqlite's thread check.
+    """
+
+    _txn_depth = 0
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        if getattr(self, "_txn_depth", 0) > 0:
+            # Inside an explicit AgentStorage.session() transaction: propagate
+            # the outcome, but never commit from a nested block.
+            return False
+        return super().__exit__(exc_type, exc_value, traceback)
+
+
 class AgentStorage:
+    """Single-connection SQLite owner for the agent's local durable state.
+
+    Invariants held by construction (RC.14 V4 workstream A):
+
+    * ``journal_mode = WAL`` and ``synchronous = FULL`` are set explicitly on
+      the writer connection instead of relying on process defaults.
+    * exactly one writer connection exists per storage object, so there is no
+      ungoverned multi-writer competition; every write in the process goes
+      through it under ``_lock``.
+    * transaction boundaries are explicit: ``session()`` issues
+      ``BEGIN IMMEDIATE``, then ``COMMIT`` or ``ROLLBACK``.
+    * the connection is closed by an explicit ``close()``/``shutdown()`` only.
+      Nothing depends on interpreter teardown.
+    """
+
     def __init__(self, path: str | Path):
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
+        self._writer: WriterConnection | None = None
+        self._closed = False
+        self._writer_generation = 0
+        self._writer_open_count = 0
+        self._writer_invalidations = 0
+        self._writer_failures = 0
+        self._stray_transaction_rollbacks = 0
         self.init_db()
 
+    # ------------------------------------------------------------------
+    # connection ownership
+    # ------------------------------------------------------------------
     def connect(self) -> sqlite3.Connection:
+        """Open a short-lived connection.
+
+        Bootstrap and one-off use only (schema init, tests, tooling). The
+        steady-state write path uses :meth:`writer` so that no batch pays a
+        connection open/close cycle.
+        """
         conn = sqlite3.connect(self.path, timeout=20, factory=ManagedConnection)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA busy_timeout=20000")
         conn.execute("PRAGMA foreign_keys=ON")
         return conn
 
+    def _open_writer(self) -> WriterConnection:
+        conn = sqlite3.connect(
+            self.path,
+            timeout=20,
+            factory=WriterConnection,
+            check_same_thread=False,
+        )
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA busy_timeout=20000")
+        conn.execute("PRAGMA foreign_keys=ON")
+        # Pin the durability contract explicitly rather than inheriting it.
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=FULL")
+        conn._txn_depth = 0
+        return conn
+
+    def writer(self) -> WriterConnection:
+        """Return the single long-lived writer connection, opening it lazily.
+
+        Callers must hold ``self._lock``. Raises :class:`StorageClosedError`
+        after an explicit shutdown, so a stopped process cannot silently
+        resume writing.
+        """
+        if self._closed:
+            raise StorageClosedError("agent storage is closed; refusing to reopen implicitly")
+        conn = self._writer
+        if conn is None:
+            conn = self._open_writer()
+            self._writer = conn
+            self._writer_generation += 1
+            self._writer_open_count += 1
+        return conn
+
+    def writer_stats(self) -> dict[str, Any]:
+        with self._lock:
+            return {
+                "writer_open_count": self._writer_open_count,
+                "writer_generation": self._writer_generation,
+                "writer_invalidations": self._writer_invalidations,
+                "writer_failures": self._writer_failures,
+                "stray_transaction_rollbacks": self._stray_transaction_rollbacks,
+                "writer_open": self._writer is not None,
+                "closed": self._closed,
+                "txn_depth": getattr(self._writer, "_txn_depth", 0) if self._writer else 0,
+            }
+
+    def invalidate_writer(self, reason: str = "") -> dict[str, Any]:
+        """Drop the writer connection so the next call reopens it.
+
+        Used on connection failure (C5) and by ``reconcile``. Safe to call
+        when no writer is open.
+        """
+        with self._lock:
+            conn, self._writer = self._writer, None
+            self._writer_generation += 1
+            if conn is None:
+                return {"ok": True, "dropped": False, "reason": reason}
+            try:
+                if conn.in_transaction:
+                    conn.rollback()
+            except sqlite3.Error:
+                pass
+            try:
+                conn.close()
+            except sqlite3.Error:
+                pass
+            self._writer_invalidations += 1
+            return {"ok": True, "dropped": True, "reason": reason}
+
+    def reconcile(self, *, deep: bool = False) -> dict[str, Any]:
+        """Reopen the writer and re-establish the durability contract.
+
+        Fail-closed recovery step after a connection failure: the uncertain
+        connection is discarded, a fresh one is opened, and the persisted
+        cursor plus receipt count are read back so the caller can decide where
+        to resume. ``deep=True`` additionally runs ``quick_check`` (expensive
+        on a production-size database, so it is opt-in).
+        """
+        with self._lock:
+            if self._closed:
+                raise StorageClosedError("agent storage is closed; reconcile refused")
+            dropped = self.invalidate_writer("reconcile")
+            conn = self.writer()
+            journal = str(conn.execute("PRAGMA journal_mode").fetchone()[0]).lower()
+            synchronous = int(conn.execute("PRAGMA synchronous").fetchone()[0])
+            cursor = self.get_meta("core_cursor", "0")
+            receipts = int(conn.execute("SELECT COUNT(*) FROM event_receipts").fetchone()[0])
+            result: dict[str, Any] = {
+                "ok": True,
+                "dropped": dropped.get("dropped", False),
+                "generation": self._writer_generation,
+                "journal_mode": journal,
+                "synchronous": synchronous,
+                "cursor": cursor,
+                "receipts": receipts,
+                "durability_contract_ok": journal == "wal" and synchronous == 2,
+            }
+            if deep:
+                result["quick_check"] = conn.execute("PRAGMA quick_check(1)").fetchone()[0]
+            return result
+
+    def close(self) -> dict[str, Any]:
+        """Explicit shutdown: flush the WAL, then close the writer.
+
+        Idempotent. Rolls back any transaction still open, checkpoints the WAL
+        into the main database (the durable flush) and closes the handle. After
+        this, :meth:`writer` raises instead of silently reopening.
+        """
+        with self._lock:
+            if self._closed:
+                return {"ok": True, "already_closed": True, "closed": False}
+            self._closed = True
+            conn, self._writer = self._writer, None
+            info: dict[str, Any] = {
+                "ok": True,
+                "already_closed": False,
+                "closed": False,
+                "open_transaction_rolled_back": False,
+                "wal_checkpoint": None,
+            }
+            if conn is None:
+                return info
+            try:
+                if conn.in_transaction:
+                    conn.rollback()
+                    info["open_transaction_rolled_back"] = True
+                try:
+                    info["wal_checkpoint"] = list(conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone())
+                except sqlite3.Error as exc:
+                    info["wal_checkpoint_error"] = str(exc)
+                conn.close()
+                info["closed"] = True
+            except sqlite3.Error as exc:
+                info["ok"] = False
+                info["error"] = str(exc)
+            return info
+
+    def shutdown(self) -> dict[str, Any]:
+        """Alias for :meth:`close` used by the service shutdown path."""
+        return self.close()
+
     @contextlib.contextmanager
     def session(self, *, immediate: bool = True):
+        """One explicit, atomic write transaction on the long-lived writer.
+
+        The cursor advance for a batch lives inside this same boundary, so a
+        cursor can never point past its durable receipts.
+        """
         with self._lock:
-            conn = self.connect()
+            conn = self.writer()
+            if getattr(conn, "_txn_depth", 0) > 0:
+                raise StorageTransactionError("nested AgentStorage.session() is not supported")
+            if conn.in_transaction:
+                # Defensive: a dangling implicit transaction would make
+                # BEGIN IMMEDIATE fail. Discard it rather than nesting.
+                conn.rollback()
+                self._stray_transaction_rollbacks += 1
             try:
                 if immediate:
                     conn.execute("BEGIN IMMEDIATE")
+                conn._txn_depth = 1
                 yield conn
+                raise_fault("fail_writer", "disk I/O error")
+                crash_point("before_commit")
                 conn.commit()
-            except Exception:
-                conn.rollback()
+                crash_point("after_commit")
+            except BaseException as exc:
+                self._writer_failures += 1 if _is_fatal_connection_error(exc) else 0
+                try:
+                    conn.rollback()
+                except sqlite3.Error:
+                    pass
+                if _is_fatal_connection_error(exc):
+                    self.invalidate_writer(f"session:{type(exc).__name__}")
+                    raise StorageUnavailableError(str(exc)) from exc
                 raise
+            finally:
+                conn._txn_depth = 0
+
+    def init_db(self) -> None:
+        with self._lock:
+            conn = self.connect()
+            try:
+                self._init_schema(conn)
             finally:
                 conn.close()
 
-    def init_db(self) -> None:
-        with self._lock, self.connect() as conn:
+    def _init_schema(self, conn: sqlite3.Connection) -> None:
+        # Schema DDL is idempotent (CREATE ... IF NOT EXISTS) and additive-only
+        # for identity v2. ``with conn:`` commits the DDL and the additive
+        # column/template statements in one unit before the handle is closed.
+        with conn:
             conn.executescript(
                 """
                 PRAGMA journal_mode=WAL;
@@ -225,7 +516,7 @@ class AgentStorage:
         if conn is not None:
             row = conn.execute("SELECT value FROM agent_meta WHERE key=?", (key,)).fetchone()
             return str(row["value"]) if row else default
-        with self._lock, self.connect() as c:
+        with self._lock, self.writer() as c:
             row = c.execute("SELECT value FROM agent_meta WHERE key=?", (key,)).fetchone()
         return str(row["value"]) if row else default
 
@@ -239,14 +530,14 @@ class AgentStorage:
         if conn is not None:
             conn.execute(query, params)
             return
-        with self._lock, self.connect() as c:
+        with self._lock, self.writer() as c:
             c.execute(query, params)
 
     def event_seen(self, event_id: str, *, conn: sqlite3.Connection | None = None) -> bool:
         if conn is not None:
             row = conn.execute("SELECT 1 FROM event_receipts WHERE event_id=?", (event_id,)).fetchone()
             return bool(row)
-        with self._lock, self.connect() as c:
+        with self._lock, self.writer() as c:
             row = c.execute("SELECT 1 FROM event_receipts WHERE event_id=?", (event_id,)).fetchone()
         return bool(row)
 
@@ -268,7 +559,7 @@ class AgentStorage:
         if conn is not None:
             conn.execute(query, params)
             return
-        with self._lock, self.connect() as c:
+        with self._lock, self.writer() as c:
             c.execute(query, params)
 
     @staticmethod
@@ -322,7 +613,7 @@ class AgentStorage:
             assert result is not None
             return result
 
-        with self._lock, self.connect() as c:
+        with self._lock, self.writer() as c:
             try:
                 c.execute(query, params)
             except sqlite3.IntegrityError:
@@ -366,14 +657,14 @@ class AgentStorage:
             params.extend([needle, needle])
         clause = " WHERE " + " AND ".join(where) if where else ""
         params.append(max(1, min(int(limit), 500)))
-        with self._lock, self.connect() as conn:
+        with self._lock, self.writer() as conn:
             rows = conn.execute(
                 f"SELECT * FROM records{clause} ORDER BY updated_at DESC LIMIT ?", tuple(params)
             ).fetchall()
         return [item for row in rows if (item := self._record_row(row)) is not None]
 
     def delete_record(self, record_id: str) -> bool:
-        with self._lock, self.connect() as conn:
+        with self._lock, self.writer() as conn:
             cursor = conn.execute("DELETE FROM records WHERE record_id=?", (record_id,))
             return cursor.rowcount > 0
 
@@ -391,7 +682,7 @@ class AgentStorage:
         body = str(payload.get("body") or "")
         enabled = 1 if payload.get("enabled", True) else 0
         now = utc_now_iso()
-        with self._lock, self.connect() as conn:
+        with self._lock, self.writer() as conn:
             conn.execute(
                 """
                 INSERT INTO templates (template_id, name, body, enabled, created_at, updated_at)
@@ -410,12 +701,12 @@ class AgentStorage:
         if conn is not None:
             row = conn.execute("SELECT * FROM templates WHERE template_id=?", (template_id,)).fetchone()
             return self._template_row(row)
-        with self._lock, self.connect() as c:
+        with self._lock, self.writer() as c:
             row = c.execute("SELECT * FROM templates WHERE template_id=?", (template_id,)).fetchone()
         return self._template_row(row)
 
     def list_templates(self) -> list[dict[str, Any]]:
-        with self._lock, self.connect() as conn:
+        with self._lock, self.writer() as conn:
             rows = conn.execute("SELECT * FROM templates ORDER BY name, template_id").fetchall()
         return [item for row in rows if (item := self._template_row(row)) is not None]
 
@@ -446,7 +737,7 @@ class AgentStorage:
         self._validate_monitor(payload)
         monitor_id = str(payload.get("monitor_id") or f"mon-{uuid.uuid4().hex}")
         now = utc_now_iso()
-        with self._lock, self.connect() as conn:
+        with self._lock, self.writer() as conn:
             conn.execute(
                 """
                 INSERT INTO monitors (
@@ -484,12 +775,12 @@ class AgentStorage:
         return result
 
     def get_monitor(self, monitor_id: str) -> dict[str, Any] | None:
-        with self._lock, self.connect() as conn:
+        with self._lock, self.writer() as conn:
             row = conn.execute("SELECT * FROM monitors WHERE monitor_id=?", (monitor_id,)).fetchone()
         return self._monitor_row(row)
 
     def delete_monitor(self, monitor_id: str) -> bool:
-        with self._lock, self.connect() as conn:
+        with self._lock, self.writer() as conn:
             cursor = conn.execute("DELETE FROM monitors WHERE monitor_id=?", (monitor_id,))
             return cursor.rowcount > 0
 
@@ -499,7 +790,7 @@ class AgentStorage:
         if conn is not None:
             rows = conn.execute(query).fetchall()
             return [item for row in rows if (item := self._monitor_row(row)) is not None]
-        with self._lock, self.connect() as c:
+        with self._lock, self.writer() as c:
             rows = c.execute(query).fetchall()
         return [item for row in rows if (item := self._monitor_row(row)) is not None]
 
@@ -507,7 +798,7 @@ class AgentStorage:
         if conn is not None:
             row = conn.execute("SELECT 1 FROM monitor_runs WHERE action_key=?", (action_key,)).fetchone()
             return bool(row)
-        with self._lock, self.connect() as c:
+        with self._lock, self.writer() as c:
             row = c.execute("SELECT 1 FROM monitor_runs WHERE action_key=?", (action_key,)).fetchone()
         return bool(row)
 
@@ -540,7 +831,7 @@ class AgentStorage:
             item = dict(row)
             item["result"] = json_loads(item.pop("result_json", "{}"), {})
             return item
-        with self._lock, self.connect() as c:
+        with self._lock, self.writer() as c:
             c.execute(query, params)
             row = c.execute("SELECT * FROM monitor_runs WHERE action_key=?", (action_key,)).fetchone()
         item = dict(row)
@@ -548,7 +839,7 @@ class AgentStorage:
         return item
 
     def list_monitor_runs(self, monitor_id: str, *, limit: int = 20) -> list[dict[str, Any]]:
-        with self._lock, self.connect() as conn:
+        with self._lock, self.writer() as conn:
             rows = conn.execute(
                 """
                 SELECT * FROM monitor_runs
@@ -595,7 +886,7 @@ class AgentStorage:
         now = utc_now_iso()
         next_run_at = str(payload.get("next_run_at") or now)
         interval_seconds = max(60, int(payload.get("interval_seconds") or 3600))
-        with self._lock, self.connect() as conn:
+        with self._lock, self.writer() as conn:
             conn.execute(
                 """
                 INSERT INTO schedules (
@@ -635,23 +926,23 @@ class AgentStorage:
         return result
 
     def get_schedule(self, schedule_id: str) -> dict[str, Any] | None:
-        with self._lock, self.connect() as conn:
+        with self._lock, self.writer() as conn:
             row = conn.execute("SELECT * FROM schedules WHERE schedule_id=?", (schedule_id,)).fetchone()
         return self._schedule_row(row)
 
     def delete_schedule(self, schedule_id: str) -> bool:
-        with self._lock, self.connect() as conn:
+        with self._lock, self.writer() as conn:
             cursor = conn.execute("DELETE FROM schedules WHERE schedule_id=?", (schedule_id,))
             return cursor.rowcount > 0
 
     def list_schedules(self) -> list[dict[str, Any]]:
-        with self._lock, self.connect() as conn:
+        with self._lock, self.writer() as conn:
             rows = conn.execute("SELECT * FROM schedules ORDER BY next_run_at, name").fetchall()
         return [item for row in rows if (item := self._schedule_row(row)) is not None]
 
     def due_schedules(self, now: str | None = None, limit: int = 50) -> list[dict[str, Any]]:
         now = now or utc_now_iso()
-        with self._lock, self.connect() as conn:
+        with self._lock, self.writer() as conn:
             rows = conn.execute(
                 """
                 SELECT * FROM schedules
@@ -674,7 +965,7 @@ class AgentStorage:
     ) -> dict[str, Any]:
         run_id = f"srun-{uuid.uuid4().hex}"
         now = utc_now_iso()
-        with self._lock, self.connect() as conn:
+        with self._lock, self.writer() as conn:
             conn.execute(
                 """
                 INSERT INTO scheduler_runs (run_id, schedule_id, status, result_json, error, created_at)
@@ -701,7 +992,7 @@ class AgentStorage:
         }
 
     def list_scheduler_runs(self, schedule_id: str, *, limit: int = 20) -> list[dict[str, Any]]:
-        with self._lock, self.connect() as conn:
+        with self._lock, self.writer() as conn:
             rows = conn.execute(
                 """
                 SELECT * FROM scheduler_runs
@@ -719,12 +1010,12 @@ class AgentStorage:
         return items
 
     def delete_template(self, template_id: str) -> bool:
-        with self._lock, self.connect() as conn:
+        with self._lock, self.writer() as conn:
             cursor = conn.execute("DELETE FROM templates WHERE template_id=?", (template_id,))
             return cursor.rowcount > 0
 
     def counts(self) -> dict[str, int]:
         tables = ["event_receipts", "records", "templates", "monitors", "monitor_runs", "schedules", "scheduler_runs"]
-        with self._lock, self.connect() as conn:
+        with self._lock, self.writer() as conn:
             return {table: int(conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]) for table in tables}
 

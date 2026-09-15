@@ -133,7 +133,9 @@ class AgentCatchupFailureInjectionTests(unittest.TestCase):
         self.service = AgentService(self.settings, core=self.core, ai=self.ai)
 
     def tearDown(self):
-        self.service.stop_workers()
+        # V4 lifecycle: the long-lived writer holds the file handle until an
+        # explicit shutdown, so close it before removing the temp directory.
+        self.service.shutdown()
         self.tempdir.cleanup()
 
     def test_1_fault_before_first_event_write(self):

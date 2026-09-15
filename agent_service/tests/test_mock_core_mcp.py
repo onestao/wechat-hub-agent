@@ -52,6 +52,7 @@ class MockCoreMcpIntegrationTests(unittest.TestCase):
         self.service = AgentService(settings, core=CoreClient(settings.core_url), ai=FakeAI())
 
     def tearDown(self):
+        self.service.shutdown()
         self.core_server.shutdown()
         self.core_server.server_close()
         self.core_thread.join(timeout=2)

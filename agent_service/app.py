@@ -310,7 +310,7 @@ def main(argv: list[str] | None = None) -> int:
         consumer_id=args.consumer_id,
         poll_interval_seconds=max(0.25, args.poll_interval),
         poll_timeout_seconds=max(0, min(args.poll_timeout, 30)),
-        poll_batch_size=max(1, min(args.poll_batch, 200)),
+        poll_batch_size=max(1, min(args.poll_batch, 400)),
         scheduler_interval_seconds=max(0.5, args.scheduler_interval),
         vector_dim=max(64, min(args.vector_dim, 4096)),
     )
@@ -318,6 +318,8 @@ def main(argv: list[str] | None = None) -> int:
     if args.once:
         result = service.run_once()
         print(json.dumps(result, ensure_ascii=False, indent=2), flush=True)
+        shutdown = service.shutdown()
+        print(json.dumps({"shutdown": shutdown}, ensure_ascii=False), flush=True)
         return 0 if result.get("poll", {}).get("ok") else 1
 
     server = create_server(args.host, args.port, service)
@@ -348,7 +350,7 @@ def main(argv: list[str] | None = None) -> int:
     except KeyboardInterrupt:
         pass
     finally:
-        service.stop_workers()
+        service.shutdown()
         server.server_close()
     return 0
 

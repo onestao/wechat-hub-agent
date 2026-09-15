@@ -8,14 +8,30 @@ from pathlib import Path
 from typing import Any
 
 from .core_client import CoreApiError, CoreClient
+from .crashpoint import crash_point, pacing_delay_seconds
 from .legacy_ai import LegacyAIAdapter
 from .memory_index import EventMemoryIndex
 from .monitor import MonitorEngine
 from .scheduler import SchedulerEngine
-from .storage import AgentStorage, utc_now_iso
+from .storage import AgentStorage, StorageError, utc_now_iso
 
 
 ROOT = Path(__file__).resolve().parents[1]
+
+#: Core's frozen V1 contract hard-caps ``limit`` on ``/v1/events/poll`` at 200
+#: (``bounded_int(..., high=200)`` in the Core app). A local atomic batch larger
+#: than this is therefore assembled from several polls. This constant is the
+#: contract limit, not a tuning knob, and must not be raised without a Core
+#: change (which RC.14 V4 explicitly forbids).
+CORE_POLL_HARD_LIMIT = 200
+
+
+class ShutdownDuringBatch(RuntimeError):
+    """Raised inside a local atomic batch when a graceful stop was requested.
+
+    Escaping the batch's ``storage.session()`` block rolls the transaction
+    back, so the cursor stays on the last complete durable boundary.
+    """
 
 
 def env_int(name: str, default: int, minimum: int, maximum: int) -> int:
@@ -41,7 +57,7 @@ class AgentSettings:
     consumer_id: str = "wechat-agent"
     poll_interval_seconds: float = 2.0
     poll_timeout_seconds: int = 0
-    poll_batch_size: int = 200
+    poll_batch_size: int = 400
     scheduler_interval_seconds: float = 5.0
     vector_dim: int = 384
     core_commit_batch_threshold: int = 600
@@ -60,7 +76,7 @@ class AgentSettings:
             consumer_id=os.environ.get("WECHAT_AGENT_CONSUMER_ID", "wechat-agent"),
             poll_interval_seconds=env_float("WECHAT_AGENT_POLL_INTERVAL", 2.0, 0.25, 300.0),
             poll_timeout_seconds=env_int("WECHAT_AGENT_POLL_TIMEOUT", 0, 0, 30),
-            poll_batch_size=env_int("WECHAT_AGENT_POLL_BATCH", 200, 1, 200),
+            poll_batch_size=env_int("WECHAT_AGENT_POLL_BATCH", 400, 1, 400),
             scheduler_interval_seconds=env_float("WECHAT_AGENT_SCHEDULER_INTERVAL", 5.0, 0.5, 300.0),
             vector_dim=env_int("WECHAT_AGENT_VECTOR_DIM", 384, 64, 4096),
             core_commit_batch_threshold=env_int("WECHAT_AGENT_CORE_COMMIT_BATCH_THRESHOLD", 600, 1, 5000),
@@ -134,6 +150,44 @@ class AgentService:
                     segments.append((True, [event]))
         return segments
 
+    def _fetch_events(self, cursor: str) -> dict[str, Any]:
+        """Assemble one local atomic batch from one or more Core polls.
+
+        V4 raises the local atomic batch to 400 events. Because Core's poll
+        contract stops at 200 events per call, the batch is filled by
+        ``ceil(batch / 200)`` consecutive polls. Those polls are pure reads:
+        nothing is written locally and no cursor moves until the whole set is
+        committed inside a single local transaction.
+        """
+        target = max(1, int(self.settings.poll_batch_size))
+        events: list[dict[str, Any]] = []
+        next_cursor = cursor
+        has_more = False
+        polls = 0
+        while len(events) < target:
+            want = min(CORE_POLL_HARD_LIMIT, target - len(events))
+            page = self.core.poll_events(
+                after=next_cursor,
+                limit=want,
+                consumer_id=self.settings.consumer_id,
+                timeout=self.settings.poll_timeout_seconds,
+            )
+            polls += 1
+            batch = list(page.get("events") or [])
+            events.extend(batch)
+            page_next = str(page.get("next_cursor") or "")
+            if page_next:
+                next_cursor = page_next
+            has_more = bool(page.get("has_more"))
+            if not batch or not has_more:
+                # Short page or stream drained: the batch is whatever we have.
+                break
+            if len(events) >= target:
+                break
+            if self._stop.is_set():
+                break
+        return {"events": events, "next_cursor": next_cursor, "has_more": has_more, "polls": polls}
+
     def _process_single_event(
         self,
         event: dict[str, Any],
@@ -178,12 +232,7 @@ class AgentService:
         try:
             health = self.core.ensure_contract(1)
             cursor = self.storage.get_meta("core_cursor", "0") or "0"
-            page = self.core.poll_events(
-                after=cursor,
-                limit=self.settings.poll_batch_size,
-                consumer_id=self.settings.consumer_id,
-                timeout=self.settings.poll_timeout_seconds,
-            )
+            page = self._fetch_events(cursor)
             events = list(page.get("events") or [])
             processed = 0
             duplicates = 0
@@ -216,6 +265,16 @@ class AgentService:
                 if is_local:
                     with self.storage.session() as session:
                         for evt in seg_events:
+                            if self._stop.is_set():
+                                # Graceful stop requested mid-batch (C4): leave
+                                # the transaction so it rolls back. The cursor
+                                # never advances past durable receipts.
+                                raise ShutdownDuringBatch(
+                                    "stop requested inside local atomic batch"
+                                )
+                            delay = pacing_delay_seconds()
+                            if delay:
+                                time.sleep(delay)
                             is_dup, cur, mem, acts, eid = self._process_single_event(
                                 evt, last_cursor, identity_view, enabled_monitors, conn=session, in_batch=True
                             )
@@ -285,6 +344,9 @@ class AgentService:
             }
 
             if should_commit_core:
+                # C3: local state is already durable at this point; the Core
+                # checkpoint has not been issued yet.
+                crash_point("after_local_commit_before_core")
                 ids_to_flush = list(self._pending_ack_ids)
                 last_id = ids_to_flush[-1] if ids_to_flush else ""
                 if hasattr(self.core, "commit_events"):
@@ -323,6 +385,8 @@ class AgentService:
                 "from_cursor": cursor,
                 "cursor": last_cursor,
                 "events": len(events),
+                "core_polls": page.get("polls"),
+                "local_batch_target": self.settings.poll_batch_size,
                 "processed": processed,
                 "duplicates": duplicates,
                 "indexed_messages": indexed,
@@ -332,6 +396,34 @@ class AgentService:
                 "has_more": has_more,
                 "elapsed_ms": round((time.monotonic() - started) * 1000),
                 "details": details,
+            }
+            self._last_poll = result
+            return result
+        except ShutdownDuringBatch as exc:
+            # C4: the incomplete transaction rolled back inside session(); the
+            # cursor and the pending ack list still describe the last complete
+            # durable boundary. Report it as a clean, expected stop.
+            durable_cursor = self.storage.get_meta("core_cursor", "0") or "0"
+            result = {
+                "ok": False,
+                "error": str(exc),
+                "error_code": "shutdown_during_batch",
+                "rolled_back": True,
+                "from_cursor": durable_cursor,
+                "cursor": durable_cursor,
+                "events": 0,
+                "processed": 0,
+                "duplicates": 0,
+                "ack": {
+                    "consumer_id": self.settings.consumer_id,
+                    "acked_event_ids": [],
+                    "acked_count": 0,
+                    "pending_count": len(self._pending_ack_ids),
+                },
+                "checkpoint": {},
+                "has_more": False,
+                "elapsed_ms": round((time.monotonic() - started) * 1000),
+                "details": [],
             }
             self._last_poll = result
             return result
@@ -422,6 +514,14 @@ class AgentService:
             self._last_core_checkpoint_cursor = checkpoint_cursor
             return {"ok": True, "flushed": len(ids_to_flush), "result": res}
 
+    def request_stop(self) -> None:
+        """Idempotent graceful-stop request (also used by the SIGTERM handler).
+
+        Setting the flag is enough for the poll worker: a batch in flight
+        observes it between events and rolls back.
+        """
+        self._stop.set()
+
     def stop_workers(self) -> None:
         self._stop.set()
         for thread in self._threads:
@@ -432,6 +532,19 @@ class AgentService:
             self.flush_core_progress()
         except Exception:
             pass
+
+    def shutdown(self) -> dict[str, Any]:
+        """Explicit graceful shutdown: stop workers, flush Core, close storage.
+
+        Storage is closed explicitly rather than at interpreter teardown, so
+        the WAL is checkpointed and the file handle released deterministically.
+        """
+        self.stop_workers()
+        try:
+            storage_info = self.storage.close()
+        except StorageError as exc:
+            storage_info = {"ok": False, "error": str(exc)}
+        return {"ok": bool(storage_info.get("ok", False)), "storage": storage_info}
 
     def _poll_loop(self) -> None:
         last_cursor = None

@@ -57,7 +57,7 @@ class EventMemoryIndex:
         self.init_db()
 
     def init_db(self) -> None:
-        with self.storage._lock, self.storage.connect() as conn:  # noqa: SLF001 - shared DB owner
+        with self.storage._lock, self.storage.writer() as conn:  # noqa: SLF001 - shared DB owner
             conn.executescript(
                 """
                 CREATE TABLE IF NOT EXISTS event_memory_chunks (
@@ -243,7 +243,7 @@ class EventMemoryIndex:
             )
             return {"ok": True, "chunk_uid": chunk_uid, "changed": True}
 
-        with self.storage._lock, self.storage.connect() as c:  # noqa: SLF001
+        with self.storage._lock, self.storage.writer() as c:  # noqa: SLF001
             previous = c.execute(
                 "SELECT content_sha256 FROM event_memory_chunks WHERE chunk_uid=?", (chunk_uid,)
             ).fetchone()
@@ -336,7 +336,7 @@ class EventMemoryIndex:
         query_vector, _ = legacy_memory.vector_for_text(query, self.vector_dim)
         query_terms = legacy_memory.terms_for_text(query)
         now_ts = int(time.time())
-        with self.storage._lock, self.storage.connect() as conn:  # noqa: SLF001
+        with self.storage._lock, self.storage.writer() as conn:  # noqa: SLF001
             candidates = self._candidate_ids(conn, query, account_id, chat_id)
             if not candidates:
                 return {"query": query, "results": []}
@@ -394,7 +394,7 @@ class EventMemoryIndex:
     def recent(self, account_id: str, chat_id: str, limit: int = 20) -> list[dict[str, Any]]:
         if not account_id or not chat_id:
             return []
-        with self.storage._lock, self.storage.connect() as conn:  # noqa: SLF001
+        with self.storage._lock, self.storage.writer() as conn:  # noqa: SLF001
             rows = conn.execute(
                 """
                 SELECT * FROM event_memory_chunks
@@ -454,6 +454,6 @@ class EventMemoryIndex:
         }
 
     def count(self) -> int:
-        with self.storage._lock, self.storage.connect() as conn:  # noqa: SLF001
+        with self.storage._lock, self.storage.writer() as conn:  # noqa: SLF001
             return int(conn.execute("SELECT COUNT(*) FROM event_memory_chunks").fetchone()[0])
 

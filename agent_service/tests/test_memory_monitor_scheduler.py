@@ -22,6 +22,7 @@ class MemoryMonitorSchedulerTests(unittest.TestCase):
         self.ai = FakeAI()
 
     def tearDown(self):
+        self.storage.close()
         self.tempdir.cleanup()
 
     @staticmethod

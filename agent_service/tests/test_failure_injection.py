@@ -126,6 +126,7 @@ class AgentCatchupFailureInjectionTests(unittest.TestCase):
             db_path=self.db_path,
             consumer_id="wechat-agent",
             poll_batch_size=100,
+            core_commit_batch_threshold=1,
         )
         self.core = MockCoreService()
         self.ai = FakeAI()

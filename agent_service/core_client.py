@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import time
 from dataclasses import dataclass
 from typing import Any
 from urllib.error import HTTPError, URLError
@@ -27,11 +28,18 @@ class CoreResponse:
 class CoreClient:
     """Small stdlib client for the frozen WeChat Core V1 contract."""
 
-    def __init__(self, base_url: str, timeout: float = 20.0):
+    def __init__(self, base_url: str, timeout: float = 20.0, *, contract_ttl: float = 60.0):
         self.base_url = str(base_url or "").rstrip("/")
         if not self.base_url.startswith(("http://", "https://")):
             raise ValueError("core base_url must use http:// or https://")
         self.timeout = max(1.0, float(timeout))
+        self.contract_ttl = max(1.0, float(contract_ttl))
+        self._cached_contract: dict[str, Any] | None = None
+        self._contract_cached_at: float = 0.0
+
+    def invalidate_contract_cache(self) -> None:
+        self._cached_contract = None
+        self._contract_cached_at = 0.0
 
     def _request(
         self,
@@ -49,7 +57,7 @@ class CoreClient:
             if encoded:
                 url = f"{url}?{encoded}"
         body = None
-        request_headers = {"Accept": "application/json"}
+        request_headers = {"Accept": "application/json", "Connection": "keep-alive"}
         if headers:
             request_headers.update(headers)
         if payload is not None:
@@ -66,6 +74,7 @@ class CoreClient:
                     decoded = json.loads(raw.decode("utf-8") or "{}")
                 return CoreResponse(int(response.status), decoded, response_headers)
         except HTTPError as exc:
+            self.invalidate_contract_cache()
             raw = exc.read()
             try:
                 data = json.loads(raw.decode("utf-8") or "{}")
@@ -81,23 +90,31 @@ class CoreClient:
                 ) from exc
             raise CoreApiError(exc.code, "http_error", str(exc.reason), {}) from exc
         except (URLError, TimeoutError, OSError) as exc:
+            self.invalidate_contract_cache()
             raise CoreApiError(0, "core_unavailable", str(exc), {}) from exc
         except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            self.invalidate_contract_cache()
             raise CoreApiError(0, "invalid_core_response", str(exc), {}) from exc
 
     def health(self) -> dict[str, Any]:
         return dict(self._request("GET", "/health").body)
 
-    def ensure_contract(self, expected_major: int = 1) -> dict[str, Any]:
+    def ensure_contract(self, expected_major: int = 1, *, force: bool = False) -> dict[str, Any]:
+        now = time.monotonic()
+        if not force and self._cached_contract is not None and (now - self._contract_cached_at < self.contract_ttl):
+            return self._cached_contract
         health = self.health()
         version = health.get("contract_version")
         if version != expected_major:
+            self.invalidate_contract_cache()
             raise CoreApiError(
                 0,
                 "unsupported_contract",
                 f"wechat-agent requires Core contract_version {expected_major}, got {version!r}",
                 {"expected": expected_major, "actual": version},
             )
+        self._cached_contract = health
+        self._contract_cached_at = now
         return health
 
     def list_accounts(self) -> list[dict[str, Any]]:
@@ -170,6 +187,58 @@ class CoreClient:
                 payload=payload,
             ).body
         )
+
+    def commit_events(
+        self,
+        consumer_id: str,
+        processed_through_cursor: int,
+        event_ids: list[str],
+        *,
+        last_event_id: str = "",
+        subscription_account_id: str = "",
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "consumer_id": consumer_id,
+            "processed_through_cursor": int(processed_through_cursor),
+            "event_ids": event_ids,
+        }
+        if last_event_id:
+            payload["last_event_id"] = last_event_id
+        if subscription_account_id:
+            payload["subscription_account_id"] = subscription_account_id
+
+        try:
+            return dict(
+                self._request(
+                    "POST",
+                    "/v1/events/commit",
+                    payload=payload,
+                ).body
+            )
+        except CoreApiError as exc:
+            if exc.status in (404, 405):
+                ack_res = self.ack_events(consumer_id, event_ids) if event_ids else {
+                    "consumer_id": consumer_id,
+                    "acked_event_ids": [],
+                    "acked_count": 0,
+                }
+                cp_res = {}
+                try:
+                    cp_res = self.checkpoint_events(
+                        consumer_id,
+                        processed_through_cursor,
+                        last_event_id=last_event_id,
+                        subscription_account_id=subscription_account_id,
+                    )
+                except Exception:
+                    pass
+                return {
+                    "consumer_id": consumer_id,
+                    "acked_count": ack_res.get("acked_count", len(event_ids)),
+                    "checkpoint": cp_res,
+                    "mode": "fallback_2phase",
+                }
+            raise
 
     def get_media(self, account_id: str, media_id: str) -> CoreResponse:
         return self._request(

@@ -1,7 +1,8 @@
 from __future__ import annotations
 
-from typing import Any
 import sqlite3
+import time
+from typing import Any
 
 from .core_client import CoreClient
 from .memory_index import EventMemoryIndex, message_text
@@ -46,11 +47,20 @@ class MonitorEngine:
         core: CoreClient,
         memory: EventMemoryIndex,
         ai: Any,
+        *,
+        identity_ttl: float = 60.0,
     ):
         self.storage = storage
         self.core = core
         self.memory = memory
         self.ai = ai
+        self.identity_ttl = max(1.0, float(identity_ttl))
+        self._cached_identity_view: dict[str, dict[str, Any]] | None = None
+        self._identity_cached_at: float = 0.0
+
+    def invalidate_identity_cache(self) -> None:
+        self._cached_identity_view = None
+        self._identity_cached_at = 0.0
 
     def event_has_external_side_effect(
         self,
@@ -66,14 +76,20 @@ class MonitorEngine:
                     return True
         return False
 
-    def identity_view(self) -> dict[str, dict[str, Any]]:
-        """Current identity state per account, straight from Core.
+    def identity_view(self, *, force: bool = False) -> dict[str, dict[str, Any]]:
+        """Current identity state per account, straight from Core or cached within TTL.
 
         Propagates Core failures so callers can redeliver instead of recording
         a permanent fail-closed block for a transient outage.
         """
+        now = time.monotonic()
+        if not force and self._cached_identity_view is not None and (now - self._identity_cached_at < self.identity_ttl):
+            return self._cached_identity_view
         accounts = self.core.list_accounts()
-        return {str(row.get("account_id") or ""): row for row in accounts if isinstance(row, dict)}
+        mapping = {str(row.get("account_id") or ""): row for row in accounts if isinstance(row, dict)}
+        self._cached_identity_view = mapping
+        self._identity_cached_at = now
+        return mapping
 
     def process_event(
         self,
@@ -140,9 +156,13 @@ class MonitorEngine:
         empty = {"account_id": account_id, "instance_uuid": "", "wechat_identity_uuid": ""}
         if not str(monitor.get("account_id") or "").strip():
             raise IdentityBlocked("execution blocked: monitor has no explicit account scope")
-        if identity_view is None:
-            identity_view = self.identity_view()
+        is_external = str(monitor.get("action") or "record") != "record"
+        if is_external or identity_view is None:
+            identity_view = self.identity_view(force=is_external)
         account = identity_view.get(account_id)
+        if not account and self._cached_identity_view is not None and not is_external:
+            identity_view = self.identity_view(force=True)
+            account = identity_view.get(account_id)
         if not account:
             raise IdentityBlocked(
                 f"execution blocked: account {account_id!r} has no resolvable identity binding (unresolved)"

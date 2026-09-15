@@ -242,8 +242,7 @@ class CrashMatrixSubprocessTests(unittest.TestCase):
         return env
 
     def _cmd(self, *, mode: str = "once", mix: str = "status", events: int = 400,
-             batch: int = 400, recover: bool = False, external: bool = False,
-             ready_file: Path | None = None) -> list[str]:
+             batch: int = 400, recover: bool = False, external: bool = False) -> list[str]:
         cmd = [
             sys.executable, "-m", "agent_service.tests.crash_runner",
             "--db", str(self.db), "--state", str(self.state), "--out", str(self.out),
@@ -254,8 +253,6 @@ class CrashMatrixSubprocessTests(unittest.TestCase):
             cmd.append("--recover-on-failure")
         if external:
             cmd.append("--external-monitor")
-        if ready_file is not None:
-            cmd += ["--ready-file", str(ready_file)]
         return cmd
 
     def _run(self, *, timeout: int = 300, pacing_ms: int = 0, **kwargs) -> tuple[int, str, str]:
@@ -374,23 +371,40 @@ class CrashMatrixSubprocessTests(unittest.TestCase):
     # -- C4 (POSIX only: Windows cannot deliver a catchable SIGTERM) -------
     @unittest.skipIf(os.name == "nt", "SIGTERM is not catchable on Windows")
     def test_c4_sigterm_during_batch_exits_clean(self):
-        ready = self.dir / "ready"
-        proc = subprocess.Popen(
-            self._cmd(mode="serve", ready_file=ready),
-            env=self._env("", pacing_ms=20), cwd=str(REPO_ROOT),
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-        )
-        try:
-            deadline = time.time() + 30
-            while not ready.exists() and time.time() < deadline:
-                time.sleep(0.05)
-            self.assertTrue(ready.exists(), "serve mode never became ready")
-            time.sleep(2.0)  # inside the first paced batch
-            proc.send_signal(signal.SIGTERM)
-            out, err = proc.communicate(timeout=60)
-        finally:
-            if proc.poll() is None:
-                proc.kill()
+        out_path = self.dir / "serve.out"
+        err_path = self.dir / "serve.err"
+        # stdout/stderr go to files, not pipes: readiness has to be observed
+        # while the process is still running, and a pipe would only be readable
+        # after it exits.
+        with out_path.open("w+", encoding="utf-8") as out_f, err_path.open("w+", encoding="utf-8") as err_f:
+            proc = subprocess.Popen(
+                self._cmd(mode="serve"),
+                env=self._env("", pacing_ms=20), cwd=str(REPO_ROOT),
+                stdout=out_f, stderr=err_f, text=True,
+            )
+            try:
+                # Readiness barrier: the real entrypoint prints its banner
+                # immediately after signal.signal(SIGTERM, ...). Any earlier
+                # marker (a pre-main ready file, or an HTTP probe that has to
+                # wait for the storage lock) would race that installation and
+                # make this test fail with an unexplained -15.
+                deadline = time.time() + 60
+                while time.time() < deadline:
+                    if "WeChat Agent listening" in out_path.read_text(encoding="utf-8", errors="replace"):
+                        break
+                    time.sleep(0.1)
+                else:
+                    self.fail("entrypoint never reported listening")
+                time.sleep(2.0)  # inside the first paced batch (~8 s at 20 ms/event)
+                proc.send_signal(signal.SIGTERM)
+                proc.wait(timeout=60)
+            finally:
+                if proc.poll() is None:
+                    proc.kill()
+                    proc.wait(timeout=30)
+        out = out_path.read_text(encoding="utf-8", errors="replace")
+        err = err_path.read_text(encoding="utf-8", errors="replace")
+        self.assertIn("WeChat Agent listening", out, f"stdout={out}\nstderr={err}")
         self.assertEqual(proc.returncode, 0, f"stdout={out}\nstderr={err}")
 
         state = self._db_state()

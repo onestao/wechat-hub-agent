@@ -17,34 +17,12 @@ from agent_service.tests.helpers import FakeAI
 
 
 LOCAL_MOCK_APP = Path(__file__).resolve().parent / "mock_core.py"
-
-
-def _find_project_root() -> Path | None:
-    """Locate the deploy-repo root without assuming a checkout depth.
-
-    This used to be a fixed ``parents[4]`` lookup, which raised ``IndexError``
-    whenever the tree was shallower than five levels — e.g. the runtime image,
-    where the package lives at ``/app/agent_service/tests/``. CI checks out at
-    ``/home/runner/work/<repo>/<repo>`` and the workstation worktree sits under
-    ``work/<name>/``, so both used to work by accident. Walk upwards looking for
-    a marker instead.
-    """
-    for parent in Path(__file__).resolve().parents:
-        if (parent / "stack" / "mock-core" / "app.py").is_file():
-            return parent
-        if (parent / ".git").exists():
-            return parent
-    return None
-
-
-PROJECT_ROOT = _find_project_root()
-STACK_MOCK_APP = (PROJECT_ROOT / "stack" / "mock-core" / "app.py") if PROJECT_ROOT else None
+PROJECT_ROOT = Path(__file__).resolve().parents[4]
+STACK_MOCK_APP = PROJECT_ROOT / "stack" / "mock-core" / "app.py"
 MOCK_APP = LOCAL_MOCK_APP if LOCAL_MOCK_APP.is_file() else STACK_MOCK_APP
 
 
 def load_mock_core_module():
-    if MOCK_APP is None or not Path(MOCK_APP).is_file():
-        raise RuntimeError(f"cannot locate Mock Core app (PROJECT_ROOT={PROJECT_ROOT})")
     spec = importlib.util.spec_from_file_location("wechat_hub_mock_core_for_agent_tests", MOCK_APP)
     if spec is None or spec.loader is None:
         raise RuntimeError(f"cannot load Mock Core: {MOCK_APP}")

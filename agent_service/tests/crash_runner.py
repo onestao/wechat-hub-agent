@@ -31,7 +31,6 @@ import argparse
 import json
 import os
 import signal
-import socket
 import sys
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -335,36 +334,9 @@ def run_once_mode(args, core: MockCore, base: str) -> dict[str, Any]:
     return evidence
 
 
-def _free_port() -> int:
-    """Reserve an ephemeral port so the served port is known and loggable."""
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        sock.bind(("127.0.0.1", 0))
-        return int(sock.getsockname()[1])
-
-
 def run_serve_mode(args, core: MockCore, base: str) -> dict[str, Any]:
-    """Run the real entrypoint so the real SIGTERM handler is exercised.
-
-    There is deliberately **no readiness marker written before** ``main()``.
-    ``agent_service.app.main()`` installs its SIGTERM handler only after
-    ``create_server()`` and ``start_workers()``, and that setup performs a Core
-    round trip, so a marker written before ``main()`` races the handler
-    installation: a signal arriving in that window terminates the process with
-    the default disposition (returncode ``-15``) instead of exercising the
-    graceful-stop path.
-
-    An HTTP readiness probe is equally wrong: ``/health`` calls
-    ``service.status()`` -> ``storage.counts()``, which blocks on the storage
-    lock for the whole duration of an in-flight paced batch, so the probe would
-    only answer *after* the batch it is supposed to interrupt.
-
-    The crash-matrix test therefore waits for the entrypoint's own
-    ``WeChat Agent listening`` banner, which ``app.main()`` prints immediately
-    after ``signal.signal(SIGTERM, ...)``.
-    """
     from agent_service import app as app_module
 
-    port = int(args.port) or _free_port()
     argv = [
         "--db", args.db,
         "--core-url", base,
@@ -372,11 +344,12 @@ def run_serve_mode(args, core: MockCore, base: str) -> dict[str, Any]:
         "--poll-batch", str(args.batch),
         "--poll-interval", "0.25",
         "--host", "127.0.0.1",
-        "--port", str(port),
+        "--port", str(args.port),
     ]
+    if args.ready_file:
+        Path(args.ready_file).write_text("ready\n", encoding="utf-8")
     code = app_module.main(argv)
     return {"mode": "serve", "armed_point": args.armed_point, "exit_code": code,
-            "served_port": port,
             "core_state_cursor": core.state["cursor"], "core_polls": core.polls,
             "core_commits": core.commits, "send_blocked": core.send_blocked}
 
@@ -396,6 +369,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--max-batches", type=int, default=10)
     parser.add_argument("--recover-on-failure", action="store_true")
     parser.add_argument("--external-monitor", action="store_true")
+    parser.add_argument("--ready-file", default="")
     parser.add_argument("--port", type=int, default=0)
     args = parser.parse_args(argv)
 

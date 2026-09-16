@@ -57,6 +57,12 @@ class MonitorEngine:
         self.identity_ttl = max(1.0, float(identity_ttl))
         self._cached_identity_view: dict[str, dict[str, Any]] | None = None
         self._identity_cached_at: float = 0.0
+        # V5-1 instrumentation: the catch-up path must be provably unable to
+        # bypass the TTL cache, so the number of Core identity fetches is
+        # counted and reported per batch by the offline harness.
+        self.identity_fetch_count = 0
+        self.identity_cache_hit_count = 0
+        self.identity_unresolved_count = 0
 
     def invalidate_identity_cache(self) -> None:
         self._cached_identity_view = None
@@ -76,20 +82,31 @@ class MonitorEngine:
                     return True
         return False
 
+    def _refresh_identity_view(self, now: float | None = None) -> dict[str, dict[str, Any]]:
+        """Fetch the identity view from Core and (re)start the TTL window."""
+        accounts = self.core.list_accounts()
+        mapping = {str(row.get("account_id") or ""): row for row in accounts if isinstance(row, dict)}
+        self._cached_identity_view = mapping
+        self._identity_cached_at = time.monotonic() if now is None else now
+        self.identity_fetch_count += 1
+        return mapping
+
     def identity_view(self, *, force: bool = False) -> dict[str, dict[str, Any]]:
         """Current identity state per account, straight from Core or cached within TTL.
 
         Propagates Core failures so callers can redeliver instead of recording
         a permanent fail-closed block for a transient outage.
+
+        V5-1: this method (and only this method) decides when Core is asked for
+        identities. ``force=True`` is reserved for callers that explicitly need
+        a fresh read (external/side-effecting rules and admin paths); the
+        catch-up path calls it without ``force`` and is therefore TTL-bounded.
         """
         now = time.monotonic()
         if not force and self._cached_identity_view is not None and (now - self._identity_cached_at < self.identity_ttl):
+            self.identity_cache_hit_count += 1
             return self._cached_identity_view
-        accounts = self.core.list_accounts()
-        mapping = {str(row.get("account_id") or ""): row for row in accounts if isinstance(row, dict)}
-        self._cached_identity_view = mapping
-        self._identity_cached_at = now
-        return mapping
+        return self._refresh_identity_view(now)
 
     def process_event(
         self,
@@ -158,12 +175,18 @@ class MonitorEngine:
             raise IdentityBlocked("execution blocked: monitor has no explicit account scope")
         is_external = str(monitor.get("action") or "record") != "record"
         if is_external or identity_view is None:
+            # External (side-effecting) rules may force a fresh read; the
+            # catch-up path must not (V5-1).
             identity_view = self.identity_view(force=is_external)
         account = identity_view.get(account_id)
-        if not account and self._cached_identity_view is not None and not is_external:
-            identity_view = self.identity_view(force=True)
-            account = identity_view.get(account_id)
         if not account:
+            # V5-1: a cache miss inside the TTL window is a genuine unresolved
+            # binding, not a reason to bypass the TTL. The previous behaviour
+            # called identity_view(force=True) here, which turned every miss
+            # into an extra full GET /v1/accounts. Recovery is now bounded and
+            # explicit: TTL expiry, or invalidate_identity_cache() on an
+            # account lifecycle event. Failing closed is unchanged.
+            self.identity_unresolved_count += 1
             raise IdentityBlocked(
                 f"execution blocked: account {account_id!r} has no resolvable identity binding (unresolved)"
             )

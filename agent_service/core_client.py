@@ -36,10 +36,29 @@ class CoreClient:
         self.contract_ttl = max(1.0, float(contract_ttl))
         self._cached_contract: dict[str, Any] | None = None
         self._contract_cached_at: float = 0.0
+        # V5-2 capability discovery. ``None`` means "not probed yet in this
+        # process"; once the Core answers 404/405 for /v1/events/commit it is
+        # pinned to False and never probed again until the capability cache is
+        # invalidated (contract change) or the process restarts.
+        self._event_commit_supported: bool | None = None
+        self.event_commit_probe_count = 0
 
-    def invalidate_contract_cache(self) -> None:
+    def _clear_contract_cache(self) -> None:
+        """Drop only the contract cache (used by transient transport failures)."""
         self._cached_contract = None
         self._contract_cached_at = 0.0
+
+    def invalidate_event_commit_capability(self) -> None:
+        self._event_commit_supported = None
+
+    def invalidate_contract_cache(self) -> None:
+        """Contract change: the negotiated capabilities are stale too."""
+        self._clear_contract_cache()
+        self.invalidate_event_commit_capability()
+
+    @property
+    def event_commit_endpoint_supported(self) -> bool | None:
+        return self._event_commit_supported
 
     def _request(
         self,
@@ -74,7 +93,7 @@ class CoreClient:
                     decoded = json.loads(raw.decode("utf-8") or "{}")
                 return CoreResponse(int(response.status), decoded, response_headers)
         except HTTPError as exc:
-            self.invalidate_contract_cache()
+            self._clear_contract_cache()
             raw = exc.read()
             try:
                 data = json.loads(raw.decode("utf-8") or "{}")
@@ -90,10 +109,10 @@ class CoreClient:
                 ) from exc
             raise CoreApiError(exc.code, "http_error", str(exc.reason), {}) from exc
         except (URLError, TimeoutError, OSError) as exc:
-            self.invalidate_contract_cache()
+            self._clear_contract_cache()
             raise CoreApiError(0, "core_unavailable", str(exc), {}) from exc
         except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-            self.invalidate_contract_cache()
+            self._clear_contract_cache()
             raise CoreApiError(0, "invalid_core_response", str(exc), {}) from exc
 
     def health(self) -> dict[str, Any]:
@@ -188,6 +207,39 @@ class CoreClient:
             ).body
         )
 
+    def _two_phase_commit(
+        self,
+        consumer_id: str,
+        processed_through_cursor: int,
+        event_ids: list[str],
+        *,
+        last_event_id: str = "",
+        subscription_account_id: str = "",
+    ) -> dict[str, Any]:
+        """Canonical ack + checkpoint commit used when /v1/events/commit is absent."""
+        ack_res = self.ack_events(consumer_id, event_ids) if event_ids else {
+            "consumer_id": consumer_id,
+            "acked_event_ids": [],
+            "acked_count": 0,
+        }
+        cp_res = {}
+        try:
+            cp_res = self.checkpoint_events(
+                consumer_id,
+                processed_through_cursor,
+                last_event_id=last_event_id,
+                subscription_account_id=subscription_account_id,
+            )
+        except Exception:
+            pass
+        return {
+            "consumer_id": consumer_id,
+            "acked_count": ack_res.get("acked_count", len(event_ids)),
+            "checkpoint": cp_res,
+            "mode": "fallback_2phase",
+            "commit_endpoint_supported": False,
+        }
+
     def commit_events(
         self,
         consumer_id: str,
@@ -207,38 +259,36 @@ class CoreClient:
         if subscription_account_id:
             payload["subscription_account_id"] = subscription_account_id
 
-        try:
-            return dict(
-                self._request(
-                    "POST",
-                    "/v1/events/commit",
-                    payload=payload,
-                ).body
-            )
-        except CoreApiError as exc:
-            if exc.status in (404, 405):
-                ack_res = self.ack_events(consumer_id, event_ids) if event_ids else {
-                    "consumer_id": consumer_id,
-                    "acked_event_ids": [],
-                    "acked_count": 0,
-                }
-                cp_res = {}
-                try:
-                    cp_res = self.checkpoint_events(
-                        consumer_id,
-                        processed_through_cursor,
-                        last_event_id=last_event_id,
-                        subscription_account_id=subscription_account_id,
-                    )
-                except Exception:
-                    pass
-                return {
-                    "consumer_id": consumer_id,
-                    "acked_count": ack_res.get("acked_count", len(event_ids)),
-                    "checkpoint": cp_res,
-                    "mode": "fallback_2phase",
-                }
-            raise
+        # V5-2 capability discovery. A Core that does not implement
+        # /v1/events/commit is a *known* capability state, not a per-batch
+        # event: probe once, cache the answer, then go straight to the
+        # canonical ack + checkpoint path on every later batch.
+        if self._event_commit_supported is not False:
+            self.event_commit_probe_count += 1
+            try:
+                response = self._request("POST", "/v1/events/commit", payload=payload)
+                self._event_commit_supported = True
+                result = dict(response.body)
+                result.setdefault("commit_endpoint_supported", True)
+                return result
+            except CoreApiError as exc:
+                if exc.status not in (404, 405):
+                    raise
+                self._event_commit_supported = False
+                return self._two_phase_commit(
+                    consumer_id,
+                    processed_through_cursor,
+                    event_ids,
+                    last_event_id=last_event_id,
+                    subscription_account_id=subscription_account_id,
+                )
+        return self._two_phase_commit(
+            consumer_id,
+            processed_through_cursor,
+            event_ids,
+            last_event_id=last_event_id,
+            subscription_account_id=subscription_account_id,
+        )
 
     def get_media(self, account_id: str, media_id: str) -> CoreResponse:
         return self._request(

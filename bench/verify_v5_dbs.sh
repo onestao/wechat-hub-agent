@@ -23,14 +23,14 @@ SCAN_ARMS=${SCAN_ARMS:-"A1-run3 B1-run3 C1-run3"}
 say() { echo "$(date -u +%FT%TZ) $*" | tee -a "$OUT"; }
 : > "$OUT"
 
-run_one() { # $1=dbpath $2=image $3=scan?
-  local DB=$1 IMG=$2 SCAN=$3 EXTRA=""
+run_one() { # $1=dbpath $2=image $3=scan? $4=label
+  local DB=$1 IMG=$2 SCAN=$3 LBL=$4 EXTRA=""
   [ "$SCAN" = scan ] && EXTRA="--scan"
   local DIR
   DIR=$(dirname "$DB")
-  say "VERIFY_START db=$DB scan=$SCAN image=$IMG"
+  say "VERIFY_START arm=$LBL scan=$SCAN image=$IMG"
   docker run --rm -v "$DIR:/data" -v "$ROOT/work:/work" --entrypoint /usr/local/bin/python "$IMG" \
-    /work/db_verify.py /data/db.sqlite $EXTRA 2>&1 | tee -a "$OUT"
+    /work/db_verify.py /data/db.sqlite --label "$LBL" $EXTRA 2>&1 | tee -a "$OUT"
   say "VERIFY_RC=$?"
 }
 
@@ -46,12 +46,12 @@ for ARM in A1-run1 A1-run2 A1-run3 B1-run1 B1-run2 B1-run3 C1-run1 C1-run2 C1-ru
     DB=$FROOT/bench/$ARM/db.sqlite
     case "$ARM" in A1-*|A2-*) IMG=$V4_IMAGE ;; *) IMG=$V5_IMAGE ;; esac
     case " $SCAN_ARMS " in *" $ARM "*) SCAN=scan ;; *) SCAN=fast ;; esac
-    run_one "$DB" "$IMG" "$SCAN"
+    run_one "$DB" "$IMG" "$SCAN" "$ARM"
   fi
   if [ -f "$DROOT/bench-direct/$ARM/db.sqlite" ]; then
     DB=$DROOT/bench-direct/$ARM/db.sqlite
     case " $SCAN_ARMS " in *" $ARM "*) SCAN=scan ;; *) SCAN=fast ;; esac
-    run_one "$DB" "$V5_IMAGE" "$SCAN"
+    run_one "$DB" "$V5_IMAGE" "$SCAN" "$ARM"
   fi
 done
 

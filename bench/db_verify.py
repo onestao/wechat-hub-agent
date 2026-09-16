@@ -9,7 +9,11 @@ array the scan can take minutes:
           (header + pragma only, no scan)
   scan  - quick_check + foreign_key_check (full read of the DB)
 
-Usage: python db_verify.py <db path> [--scan]
+Usage: python db_verify.py <db path> [--label NAME] [--scan]
+
+NOTE: the DB is always mounted at /data inside the container, so the arm name
+cannot be derived from the path - it must be passed explicitly with --label.
+(Earlier revisions used basename(dirname(path)), which always printed "data".)
 """
 from __future__ import annotations
 
@@ -22,7 +26,11 @@ import time
 def main() -> int:
     path = sys.argv[1]
     do_scan = "--scan" in sys.argv
-    label = os.path.basename(os.path.dirname(path))
+    label = "unknown"
+    if "--label" in sys.argv:
+        label = sys.argv[sys.argv.index("--label") + 1]
+    else:
+        label = os.path.basename(os.path.dirname(path))
 
     sizes = {}
     for suffix in ("", "-wal", "-shm", "-journal"):

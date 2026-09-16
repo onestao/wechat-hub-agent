@@ -1,19 +1,26 @@
 #!/bin/bash
-# RC.14 Agent V5 - offline benchmark matrix.
+# RC.14 Agent V5 - offline benchmark matrix (v2, order-balanced).
 #
-#   Set 1 "sealed"   : mock Core byte-faithful to the Phase-5 harness
-#                      (/v1/events/commit -> 200, no injected latency).
-#                      Fidelity control: must reproduce the Phase-5 numbers.
-#   Set 2 "faithful" : production-shaped mock Core (/v1/events/commit -> 404)
-#                      with the Phase-5 measured live Core p50 latency injected
-#                      per endpoint. This is the production-representative set.
+# Revision notes vs v1:
+#   * v1 ran A,B,C in a fixed order inside every round AND ran
+#     --post-reopen-integrity inside every arm. On the degraded array that
+#     scan took 4.6 s / 178.9 s on the FUSE path and did not finish in 12 min
+#     on the direct path, so it (a) dominated arm wall time and (b) perturbed
+#     the arm that followed it. Integrity is now a separate pass
+#     (bench/verify_v5_dbs.sh) over the DBs the arms leave behind.
+#   * v1's fixed A,B,C order cannot separate an arm effect from a position
+#     effect. v2 uses a Latin square so each arm occupies each position once:
+#         round 1: A B C     round 2: B C A     round 3: C A B
 #
-#   A = V4 image + /mnt/user   (FUSE shfs)
-#   B = V5 image + /mnt/user   (FUSE shfs)
-#   C = V5 image + /mnt/disk3  (direct XFS, same physical disk)
+# Sets:
+#   sealed   - byte-faithful Phase-5 mock (/v1/events/commit -> 200). Fidelity control.
+#   faithful - production-shaped mock (/v1/events/commit -> 404) + measured live
+#              Core p50 latency per endpoint. Production-representative control plane.
 #
-# 3 interleaved rounds per set. Same sealed workload, same base clone, same
-# batch 400, WAL + synchronous=FULL, mock Core only.
+# Arms:
+#   A = V4 image + /mnt/user  (FUSE shfs)
+#   B = V5 image + /mnt/user  (FUSE shfs)
+#   C = V5 image + /mnt/disk3 (direct XFS, same physical disk)
 #
 # Never touches the production Agent/Core, their DB/WAL/SHM, or the production
 # consumer id. Every arm writes to its own throwaway clone.
@@ -60,8 +67,19 @@ run_arm() { # $1=label $2=image $3=fuse|direct $4=core_mode $5=extra
     --db /data/db.sqlite --workload "$WORKLOAD" \
     --out "/work/bench-$L.jsonl" --variant "$L" \
     --consumer-id "v5bench-$L" --batch "$BATCH" --events "$EVENTS" \
-    --core-mode "$CM" --instrument --post-reopen-integrity $EXTRA >> "$LOG" 2>&1
+    --core-mode "$CM" --instrument $EXTRA >> "$LOG" 2>&1
   say "ARM_RC=$? label=$L array_after=[$(arr)] final_bytes=$(stat -c %s "$TGT/db.sqlite" 2>/dev/null)"
+}
+
+# $1 = round index, $2 = A|B|C, $3 = set name (1=sealed, 2=faithful), $4 = extra
+run_slot() {
+  local I=$1 W=$2 SET=$3 EXTRA=$4 CM
+  if [ "$SET" = 1 ]; then CM=sealed; else CM=faithful; fi
+  case "$W" in
+    A) run_arm "A$SET-run$I" "$V4_IMAGE" fuse   "$CM" "$EXTRA" ;;
+    B) run_arm "B$SET-run$I" "$V5_IMAGE" fuse   "$CM" "$EXTRA" ;;
+    C) run_arm "C$SET-run$I" "$V5_IMAGE" direct "$CM" "$EXTRA" ;;
+  esac
 }
 
 say "MATRIX_START ts=$TS events=$EVENTS batch=$BATCH snapshot=$SNAP"
@@ -72,23 +90,30 @@ say "V5_IMAGE=$V5_IMAGE"
 say "ARRAY_FULL=[$(arr)] mdNumDisabled=$(grep -m1 mdNumDisabled= /proc/mdstat) mdNumInvalid=$(grep -m1 mdNumInvalid= /proc/mdstat)"
 say "PROD_AGENT_DB_SHA256_BEFORE=$(sha256sum /mnt/disk3/appdata/wechat-hub-f-live/agent-data/wechat-agent.sqlite | cut -d' ' -f1)"
 
+# Latin square: each arm occupies each position exactly once.
 for i in 1 2 3; do
-  say "ROUND=$i"
-  run_arm "A1-run$i" "$V4_IMAGE" fuse sealed ""
-  run_arm "B1-run$i" "$V5_IMAGE" fuse sealed ""
-  run_arm "C1-run$i" "$V5_IMAGE" direct sealed ""
-  if [ "$i" = 1 ]; then
-    run_arm "A2-run$i" "$V4_IMAGE" fuse faithful "--replay-check"
-    run_arm "B2-run$i" "$V5_IMAGE" fuse faithful "--replay-check"
-    run_arm "C2-run$i" "$V5_IMAGE" direct faithful "--replay-check"
-  else
-    run_arm "A2-run$i" "$V4_IMAGE" fuse faithful ""
-    run_arm "B2-run$i" "$V5_IMAGE" fuse faithful ""
-    run_arm "C2-run$i" "$V5_IMAGE" direct faithful ""
-  fi
+  case "$i" in
+    1) ORDER="A B C" ;;
+    2) ORDER="B C A" ;;
+    3) ORDER="C A B" ;;
+  esac
+  say "ROUND=$i ORDER=$ORDER set=sealed"
+  for W in $ORDER; do run_slot "$i" "$W" 1 ""; done
 done
 
-# V5-1 defect reproduction: an account absent from /v1/accounts on an event type
+for i in 1 2 3; do
+  case "$i" in
+    1) ORDER="A B C" ;;
+    2) ORDER="B C A" ;;
+    3) ORDER="C A B" ;;
+  esac
+  say "ROUND=$i ORDER=$ORDER set=faithful"
+  for W in $ORDER; do
+    if [ "$i" = 1 ] && [ "$W" = A ]; then run_slot "$i" "$W" 2 "--replay-check"; else run_slot "$i" "$W" 2 ""; fi
+  done
+done
+
+# V5-1 defect reproduction: an account absent from /v1/accounts, on an event type
 # the clone's only enabled monitor matches. V4 forces a Core fetch per event;
 # V5 is TTL-bounded. Labelled as a defect probe, not a production measurement.
 say "DEFECT_PROBE_START"

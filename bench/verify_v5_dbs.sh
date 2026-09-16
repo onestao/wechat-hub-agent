@@ -18,7 +18,7 @@ OUT=$ROOT/verify.log
 
 # SCAN_ARMS: the subset that gets the full scan. One per (image, path) cell,
 # taken from the last round so the DB is a fully-written production-size clone.
-SCAN_ARMS=${SCAN_ARMS:-"A1-run3 B1-run3 C1-run3"}
+SCAN_ARMS=${SCAN_ARMS:-"B1-run3"}
 
 say() { echo "$(date -u +%FT%TZ) $*" | tee -a "$OUT"; }
 : > "$OUT"
@@ -40,18 +40,34 @@ cp -f /root/rc14-v5/repo/bench/db_verify.py "$ROOT/work/db_verify.py"
 say "VERIFY_PASS_START root=$ROOT"
 say "ARRAY=[$(grep -E 'mdResync(Action|Pos)=' /proc/mdstat | tr '\n' ' ')]"
 
+# Phase 1: cheap header readout for EVERY arm. This must not be blocked by a
+# slow scan, so it runs first and in its own pass.
+say "PHASE1_FAST_ALL"
 for ARM in A1-run1 A1-run2 A1-run3 B1-run1 B1-run2 B1-run3 C1-run1 C1-run2 C1-run3 \
-           A2-run1 A2-run2 A2-run3 B2-run1 B2-run2 B2-run3 C2-run1 C2-run2 C2-run3; do
+           A2-run1 A2-run2 A2-run3 B2-run1 B2-run2 B2-run3 C2-run1 C2-run2 C2-run3 \
+           D4-v4 D5-v5; do
   if [ -f "$FROOT/bench/$ARM/db.sqlite" ]; then
-    DB=$FROOT/bench/$ARM/db.sqlite
-    case "$ARM" in A1-*|A2-*) IMG=$V4_IMAGE ;; *) IMG=$V5_IMAGE ;; esac
-    case " $SCAN_ARMS " in *" $ARM "*) SCAN=scan ;; *) SCAN=fast ;; esac
-    run_one "$DB" "$IMG" "$SCAN" "$ARM"
+    case "$ARM" in A1-*|A2-*|D4-*) IMG=$V4_IMAGE ;; *) IMG=$V5_IMAGE ;; esac
+    run_one "$FROOT/bench/$ARM/db.sqlite" "$IMG" fast "$ARM"
   fi
   if [ -f "$DROOT/bench-direct/$ARM/db.sqlite" ]; then
-    DB=$DROOT/bench-direct/$ARM/db.sqlite
-    case " $SCAN_ARMS " in *" $ARM "*) SCAN=scan ;; *) SCAN=fast ;; esac
-    run_one "$DB" "$V5_IMAGE" "$SCAN" "$ARM"
+    run_one "$DROOT/bench-direct/$ARM/db.sqlite" "$V5_IMAGE" fast "$ARM"
+  fi
+done
+say "PHASE1_DONE"
+
+# Phase 2: full scan (quick_check + foreign_key_check) for the bounded subset.
+# On this degraded array one 850 MB scan takes minutes and the direct path is
+# far slower than the FUSE path, so the subset is deliberately small and the
+# scan timings are kept as a result in their own right.
+say "PHASE2_SCAN SUBSET=$SCAN_ARMS"
+for ARM in $SCAN_ARMS; do
+  if [ -f "$FROOT/bench/$ARM/db.sqlite" ]; then
+    case "$ARM" in A1-*|A2-*|D4-*) IMG=$V4_IMAGE ;; *) IMG=$V5_IMAGE ;; esac
+    run_one "$FROOT/bench/$ARM/db.sqlite" "$IMG" scan "$ARM"
+  fi
+  if [ -f "$DROOT/bench-direct/$ARM/db.sqlite" ]; then
+    run_one "$DROOT/bench-direct/$ARM/db.sqlite" "$V5_IMAGE" scan "$ARM"
   fi
 done
 

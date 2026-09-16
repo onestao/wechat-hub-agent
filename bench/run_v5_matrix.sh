@@ -25,7 +25,8 @@ FROOT=/mnt/user/appdata/wechat-hub-f-live/test/rc14-agent-v5-$TS
 DROOT=/mnt/disk3/appdata/wechat-hub-f-live/test/rc14-agent-v5-$TS
 BASE=/mnt/disk3/appdata/wechat-hub-f-live/test/rc14-agent-phase5-20260916T094055Z
 SNAP=$BASE/clone/base.sqlite
-WORKLOAD=$BASE/work/workload-forward.jsonl
+HOSTWORKLOAD=$BASE/work/workload-forward.jsonl
+WORKLOAD=/work/workload-forward.jsonl
 H=replay_harness_v5.py
 
 V4_IMAGE=ghcr.io/onestao/wechat-hub-agent@sha256:c93007426738733c3bb9c3021e43edfd724c7c5455a2b7cf7a7b9101733f463a
@@ -38,6 +39,7 @@ DONE=$ROOT/matrix.done
 
 mkdir -p "$ROOT/work" "$ROOT/bench" "$DROOT/bench-direct"
 cp -f /root/rc14-v5/repo/bench/$H "$ROOT/work/$H"
+cp -f "$HOSTWORKLOAD" "$ROOT/work/workload-forward.jsonl"
 : > "$LOG"
 rm -f "$DONE"
 
@@ -63,7 +65,7 @@ run_arm() { # $1=label $2=image $3=fuse|direct $4=core_mode $5=extra
 }
 
 say "MATRIX_START ts=$TS events=$EVENTS batch=$BATCH snapshot=$SNAP"
-say "SNAPSHOT_SHA=$(sha256sum "$SNAP" | cut -d' ' -f1) WORKLOAD_SHA=$(sha256sum "$WORKLOAD" | cut -d' ' -f1)"
+say "SNAPSHOT_SHA=$(sha256sum "$SNAP" | cut -d' ' -f1) WORKLOAD_SHA=$(sha256sum "$ROOT/work/workload-forward.jsonl" | cut -d' ' -f1)"
 say "HARNESS_SHA=$(sha256sum "$ROOT/work/$H" | cut -d' ' -f1)"
 say "V4_IMAGE=$V4_IMAGE"
 say "V5_IMAGE=$V5_IMAGE"
